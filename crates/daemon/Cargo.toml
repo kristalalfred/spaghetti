@@ -1,0 +1,25 @@
+[package]
+name = "spaghettid"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "spaghettid"
+path = "src/main.rs"
+
+[dependencies]
+spaghetti-common = { path = "../common" }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+coreaudio-sys = { version = "0.2", features = ["core_audio", "audio_toolbox"] }
+core-foundation-sys = "0.8"
+core-foundation = "0.10"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1"
+libc = "0.2"
+
+[build-dependencies]
+cc = "1"

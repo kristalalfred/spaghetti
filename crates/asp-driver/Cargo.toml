@@ -1,0 +1,12 @@
+[package]
+name = "spaghetti-asp"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+spaghetti-common = { path = "../common" }
+coreaudio-sys = { version = "0.2", features = ["core_audio", "audio_server_plugin"] }
+core-foundation-sys = "0.8"
