@@ -1,11 +1,30 @@
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Result as IoResult, Write};
 
+/// How a tap affects its source process's audio output.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TapMode {
+    /// Source continues playing; the tap is a parallel copy.
+    #[default]
+    Mirror,
+    /// Source output is silenced while the tap is active; audio only flows via the route.
+    MuteSourceWhenTapped,
+}
+
+impl TapMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            TapMode::Mirror => "mirror",
+            TapMode::MuteSourceWhenTapped => "muted",
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
     Status,
     ListApps,
-    CreateTap { pid: u32 },
+    CreateTap { pid: u32, #[serde(default)] mode: TapMode },
     DestroyTap { tap_id: u32 },
     ListTaps,
     CreateRoute { tap_id: u32, device_uid: String, volume: f32 },
@@ -16,6 +35,7 @@ pub enum Request {
     DestroyDevice { device_uid: String },
     ListDevices,
     GetActivity,
+    ListSystemDevices,
     Shutdown,
 }
 
@@ -32,6 +52,7 @@ pub enum Response {
     DeviceCreated { device_uid: String },
     Devices(Vec<DeviceInfo>),
     Activity(ActivityInfo),
+    SystemDevices(Vec<SystemDeviceInfo>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -52,6 +73,8 @@ pub struct TapInfo {
     pub tap_id: u32,
     pub pid: u32,
     pub app_name: String,
+    #[serde(default)]
+    pub mode: TapMode,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -82,6 +105,17 @@ pub struct DeviceInfo {
     pub uid: String,
     pub name: String,
     pub channels: u32,
+}
+
+/// A CoreAudio device as seen by the system — not necessarily daemon-managed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemDeviceInfo {
+    pub uid: String,
+    pub name: String,
+    /// Output channel count (0 for input-only devices).
+    pub channels: u32,
+    /// False when the device has no output streams.
+    pub is_output: bool,
 }
 
 /// Socket path for daemon IPC.
