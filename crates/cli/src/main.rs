@@ -3,7 +3,8 @@ mod daemon_mgmt;
 
 use clap::{Parser, Subcommand};
 use spaghetti_common::ipc_protocol::{
-    ActivityInfo, AppInfo, DeviceInfo, Request, Response, RouteInfo, TapInfo,
+    ActivityInfo, AppInfo, DeviceInfo, Request, Response, RouteInfo, SystemDeviceInfo, TapInfo,
+    TapMode,
 };
 use std::io::{IsTerminal, Write};
 
@@ -62,6 +63,9 @@ enum Command {
     Tap {
         /// Process ID or app name to tap
         target: String,
+        /// Silence the source while the tap is active (redirect mode)
+        #[arg(short, long)]
+        mute: bool,
     },
     /// Remove a tap
     Untap {
@@ -102,6 +106,8 @@ enum Command {
     },
     /// Stream live driver activity (frames/s, peak dB)
     Monitor,
+    /// List all CoreAudio output devices visible to the system
+    SystemDevices,
     /// Shut down the daemon
     Shutdown,
     /// Manage the background daemon (macOS LaunchAgent)
@@ -158,7 +164,7 @@ fn print_apps(apps: &[AppInfo]) {
         println!("No audio apps detected.");
         return;
     }
-    println!("{:<8} {}", "PID", "NAME");
+    println!("{:<8} NAME", "PID");
     println!("{}", "-".repeat(40));
     for app in apps {
         println!("{:<8} {}", app.pid, app.name);
@@ -170,10 +176,10 @@ fn print_taps(taps: &[TapInfo]) {
         println!("No active taps.");
         return;
     }
-    println!("{:<6} {:<8} {}", "ID", "PID", "APP NAME");
-    println!("{}", "-".repeat(40));
+    println!("{:<6} {:<8} {:<8} APP NAME", "ID", "PID", "MODE");
+    println!("{}", "-".repeat(50));
     for tap in taps {
-        println!("{:<6} {:<8} {}", tap.tap_id, tap.pid, tap.app_name);
+        println!("{:<6} {:<8} {:<8} {}", tap.tap_id, tap.pid, tap.mode.label(), tap.app_name);
     }
 }
 
@@ -182,7 +188,7 @@ fn print_routes(routes: &[RouteInfo]) {
         println!("No active routes.");
         return;
     }
-    println!("{:<6} {:<6} {:<30} {}", "ID", "TAP", "DEVICE", "VOLUME");
+    println!("{:<6} {:<6} {:<30} VOLUME", "ID", "TAP", "DEVICE");
     println!("{}", "-".repeat(55));
     for route in routes {
         println!(
@@ -192,12 +198,25 @@ fn print_routes(routes: &[RouteInfo]) {
     }
 }
 
+fn print_system_devices(devices: &[SystemDeviceInfo]) {
+    if devices.is_empty() {
+        println!("No audio devices found.");
+        return;
+    }
+    println!("{:<40} {:<24} {:<8} TYPE", "UID", "NAME", "CHANNELS");
+    println!("{}", "-".repeat(80));
+    for d in devices {
+        let kind = if d.is_output { "output" } else { "input" };
+        println!("{:<40} {:<24} {:<8} {}", d.uid, d.name, d.channels, kind);
+    }
+}
+
 fn print_devices(devices: &[DeviceInfo]) {
     if devices.is_empty() {
         println!("No virtual devices.");
         return;
     }
-    println!("{:<40} {:<24} {}", "UID", "NAME", "CHANNELS");
+    println!("{:<40} {:<24} CHANNELS", "UID", "NAME");
     println!("{}", "-".repeat(70));
     for d in devices {
         println!("{:<40} {:<24} {}", d.uid, d.name, d.channels);
@@ -337,7 +356,9 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Command::Tap { target } => {
+        Command::Tap { target, mute } => {
+            let mode = if mute { TapMode::MuteSourceWhenTapped } else { TapMode::Mirror };
+
             // Try parsing as PID first; fall back to name lookup.
             let pid = if let Ok(pid) = target.parse::<u32>() {
                 pid
@@ -369,11 +390,7 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            // Need a fresh stream after the ListApps round-trip consumed it.
-            // (A single Unix socket stream is half-duplex per request here.)
-            // Re-use the same stream for the first case; open a new one for
-            // the name-lookup path.
-            let response = client::send_request(&mut stream, &Request::CreateTap { pid })?;
+            let response = client::send_request(&mut stream, &Request::CreateTap { pid, mode })?;
             match response {
                 Response::TapCreated { tap_id } => println!("Tap created: id={tap_id}"),
                 Response::Error { message } => {
@@ -527,6 +544,19 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         },
+
+        Command::SystemDevices => {
+            let response =
+                client::send_request(&mut stream, &Request::ListSystemDevices)?;
+            match response {
+                Response::SystemDevices(devices) => print_system_devices(&devices),
+                Response::Error { message } => {
+                    print_error(&message);
+                    std::process::exit(1);
+                }
+                _ => print_error("unexpected response from daemon"),
+            }
+        }
 
         Command::Monitor => {
             // Monitor owns its own connection lifecycle and loops until Ctrl-C,
