@@ -6,9 +6,10 @@ use core_foundation_sys::string::{CFStringCreateWithCString, CFStringRef, kCFStr
 use coreaudio_sys::{
     AudioObjectID, AudioObjectPropertyAddress, AudioServerPlugInClientInfo,
     AudioServerPlugInHostInterface, AudioServerPlugInIOCycleInfo, AudioStreamBasicDescription,
-    AudioValueRange, CFDictionaryRef, CFUUIDBytes, OSStatus, kAudioDeviceClassID,
-    kAudioDevicePropertyAvailableNominalSampleRates, kAudioDevicePropertyClockDomain,
-    kAudioDevicePropertyDeviceCanBeDefaultDevice,
+    AudioValueRange, CFDictionaryRef, CFUUIDBytes, OSStatus, kAudioBooleanControlClassID,
+    kAudioBooleanControlPropertyValue, kAudioControlPropertyElement, kAudioControlPropertyScope,
+    kAudioDeviceClassID, kAudioDevicePropertyAvailableNominalSampleRates,
+    kAudioDevicePropertyClockDomain, kAudioDevicePropertyDeviceCanBeDefaultDevice,
     kAudioDevicePropertyDeviceCanBeDefaultSystemDevice, kAudioDevicePropertyDeviceIsAlive,
     kAudioDevicePropertyDeviceIsRunning, kAudioDevicePropertyDeviceUID, kAudioDevicePropertyIcon,
     kAudioDevicePropertyLatency, kAudioDevicePropertyModelUID,
@@ -18,10 +19,15 @@ use coreaudio_sys::{
     kAudioDevicePropertyZeroTimeStampPeriod, kAudioDeviceTransportTypeVirtual,
     kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked, kAudioFormatFlagsNativeEndian,
     kAudioFormatLinearPCM, kAudioHardwareBadObjectError, kAudioHardwareNoError,
-    kAudioHardwareUnknownPropertyError, kAudioObjectClassID, kAudioObjectPropertyBaseClass,
-    kAudioObjectPropertyClass, kAudioObjectPropertyManufacturer, kAudioObjectPropertyName,
-    kAudioObjectPropertyOwnedObjects, kAudioObjectPropertyOwner, kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput, kAudioPlugInClassID,
+    kAudioHardwareUnknownPropertyError, kAudioLevelControlClassID,
+    kAudioLevelControlPropertyConvertDecibelsToScalar,
+    kAudioLevelControlPropertyConvertScalarToDecibels, kAudioLevelControlPropertyDecibelRange,
+    kAudioLevelControlPropertyDecibelValue, kAudioLevelControlPropertyScalarValue,
+    kAudioObjectClassID, kAudioObjectPropertyBaseClass, kAudioObjectPropertyClass,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyManufacturer, kAudioObjectPropertyName,
+    kAudioMuteControlClassID, kAudioObjectPropertyOwnedObjects, kAudioObjectPropertyOwner,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
+    kAudioObjectPropertyScopeOutput, kAudioPlugInClassID,
     kAudioPlugInPropertyDeviceList, kAudioPlugInPropertyResourceBundle,
     kAudioPlugInPropertyTranslateUIDToDevice, kAudioServerPlugInIOOperationReadInput,
     kAudioServerPlugInIOOperationWriteMix, kAudioStreamClassID,
@@ -29,11 +35,12 @@ use coreaudio_sys::{
     kAudioStreamPropertyDirection, kAudioStreamPropertyIsActive, kAudioStreamPropertyLatency,
     kAudioStreamPropertyPhysicalFormat, kAudioStreamPropertyStartingChannel,
     kAudioStreamPropertyTerminalType, kAudioStreamPropertyVirtualFormat,
-    kAudioStreamTerminalTypeLine, kAudioStreamTerminalTypeMicrophone,
+    kAudioStreamTerminalTypeLine, kAudioStreamTerminalTypeMicrophone, kAudioVolumeControlClassID,
 };
 
 use crate::iface::{DRIVER_INTERFACE_UUID, DRIVER_REF, DriverRef};
 use crate::log;
+use spaghetti_common::activity::{ACTIVITY_SHM_NAME, ActivityRegion};
 use spaghetti_common::audio_types::{
     BYTES_PER_FRAME, BYTES_PER_SAMPLE, CHANNELS, RING_BUFFER_FRAMES, SAMPLE_RATE,
 };
@@ -46,6 +53,12 @@ const OBJECT_ID_PLUGIN: u32 = 1; // kAudioObjectPlugInObject
 const OBJECT_ID_DEVICE: u32 = 2;
 const OBJECT_ID_STREAM_INPUT: u32 = 3;
 const OBJECT_ID_STREAM_OUTPUT: u32 = 4;
+const OBJECT_ID_VOLUME_CONTROL: u32 = 5;
+const OBJECT_ID_MUTE_CONTROL: u32 = 6;
+
+/// Minimum dB floor for scalar↔dB conversion. `20*log10(1e-5) ≈ -100 dB`, which
+/// is below our exposed range of -96..0.
+const DB_MIN_SCALAR: f32 = 1e-5;
 
 // kAudioDevicePropertyControlList ('ctrl') — not exported by coreaudio-sys
 const K_AUDIO_DEVICE_PROPERTY_CONTROL_LIST: u32 = 0x6374_726c;
@@ -132,6 +145,15 @@ static RING_BUFFER: [AtomicU32; RING_BUFFER_FRAMES * NUM_CHANNELS] = {
     [ZERO; RING_BUFFER_FRAMES * NUM_CHANNELS]
 };
 
+/// Output volume scalar, stored as f32 bits. Default: unity (1.0).
+static VOLUME_SCALAR: AtomicU32 = AtomicU32::new(0x3f80_0000); // 1.0_f32.to_bits()
+/// Output mute state (0 = unmuted, 1 = muted).
+static MUTE: AtomicU32 = AtomicU32::new(0);
+
+/// Pointer to the mmap-ed activity region shared with the daemon. Null until
+/// `initialize` sets it up; access is guarded by a null check.
+static ACTIVITY_PTR: AtomicPtr<ActivityRegion> = AtomicPtr::new(std::ptr::null_mut());
+
 const UNSUPPORTED: OSStatus = 0x756E_6F70u32 as OSStatus; // 'unop' = kAudioHardwareUnsupportedOperationError
 
 use crate::uuid_eq;
@@ -162,6 +184,26 @@ unsafe fn write_f64(out: *mut c_void, out_size: *mut u32, val: f64) -> OSStatus 
         *out_size = 8;
     }
     kAudioHardwareNoError as OSStatus
+}
+
+/// Write a f32 value to the output buffer.
+unsafe fn write_f32(out: *mut c_void, out_size: *mut u32, val: f32) -> OSStatus {
+    unsafe {
+        *(out as *mut f32) = val;
+        *out_size = 4;
+    }
+    kAudioHardwareNoError as OSStatus
+}
+
+/// Convert a linear [0, 1] scalar to dB. Floors below `DB_MIN_SCALAR` to keep
+/// the range finite (log10(0) = -inf).
+fn scalar_to_db(scalar: f32) -> f32 {
+    20.0 * scalar.max(DB_MIN_SCALAR).log10()
+}
+
+/// Inverse of `scalar_to_db`.
+fn db_to_scalar(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
 }
 
 /// Write a CFStringRef to the output buffer, retaining it for the caller.
@@ -239,8 +281,92 @@ pub unsafe extern "C" fn initialize(
     // Save the host interface pointer for LATER use
     DRIVER.host.store(host as *mut _, Ordering::SeqCst);
 
+    // Map the shared-memory activity region. Failure is non-fatal — the driver
+    // still services audio, the daemon just won't see activity.
+    init_activity_region();
+
     log("initialize: returning noErr");
     0 // noErr
+}
+
+/// Open, size, and mmap the activity shared-memory region. Publishes the result
+/// via `ACTIVITY_PTR`. All failure paths log and leave the pointer null so the
+/// IO callback skips activity updates.
+fn init_activity_region() {
+    use std::ffi::CString;
+
+    let name = match CString::new(ACTIVITY_SHM_NAME) {
+        Ok(n) => n,
+        Err(e) => {
+            log(&format!("activity: bad shm name: {e}"));
+            return;
+        }
+    };
+
+    let size = std::mem::size_of::<ActivityRegion>();
+
+    unsafe {
+        // Always unlink any stale region from a previous load so we can
+        // recreate it with the correct permissions. Any existing mmap the
+        // daemon holds onto will keep the old inode alive until its next
+        // GetActivity poll, at which point the lazy-open logic in the daemon
+        // will re-attach to the new region.
+        libc::shm_unlink(name.as_ptr());
+
+        log(&format!(
+            "activity: uid={} gid={}",
+            libc::geteuid(),
+            libc::getegid()
+        ));
+
+        let fd = libc::shm_open(
+            name.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+            0o666 as libc::c_uint,
+        );
+        if fd < 0 {
+            let err = *libc::__error();
+            log(&format!("activity: shm_open failed: errno={err}"));
+            return;
+        }
+
+        // Force 0o666 regardless of process umask.
+        if libc::fchmod(fd, 0o666) != 0 {
+            let err = *libc::__error();
+            log(&format!("activity: fchmod failed (non-fatal): errno={err}"));
+        }
+
+        if libc::ftruncate(fd, size as libc::off_t) != 0 {
+            let err = *libc::__error();
+            log(&format!("activity: ftruncate failed: errno={err}"));
+            libc::close(fd);
+            return;
+        }
+
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        );
+        // The fd can be closed now; the mapping keeps the region alive.
+        libc::close(fd);
+
+        if ptr == libc::MAP_FAILED {
+            let err = *libc::__error();
+            log(&format!("activity: mmap failed: errno={err}"));
+            return;
+        }
+
+        // Zero-initialize the region on first map. Writing through the mapped
+        // pointer is fine — a second driver instance would just overwrite with
+        // the same zeros.
+        std::ptr::write(ptr as *mut ActivityRegion, ActivityRegion::new());
+        ACTIVITY_PTR.store(ptr as *mut ActivityRegion, Ordering::Release);
+        log(&format!("activity: mapped region at {ptr:p}"));
+    }
 }
 
 pub unsafe extern "C" fn create_device(
@@ -350,6 +476,30 @@ fn property_known(object_id: u32, selector: u32, _scope: u32) -> bool {
                 || x == kAudioStreamPropertyAvailableVirtualFormats as u32
                 || x == kAudioStreamPropertyAvailablePhysicalFormats as u32
         ),
+        OBJECT_ID_VOLUME_CONTROL => matches!(
+            selector,
+            x if x == kAudioObjectPropertyBaseClass as u32
+                || x == kAudioObjectPropertyClass as u32
+                || x == kAudioObjectPropertyOwner as u32
+                || x == kAudioObjectPropertyName as u32
+                || x == kAudioObjectPropertyOwnedObjects as u32
+                || x == kAudioControlPropertyScope as u32
+                || x == kAudioLevelControlPropertyScalarValue as u32
+                || x == kAudioLevelControlPropertyDecibelValue as u32
+                || x == kAudioLevelControlPropertyDecibelRange as u32
+                || x == kAudioLevelControlPropertyConvertScalarToDecibels as u32
+                || x == kAudioLevelControlPropertyConvertDecibelsToScalar as u32
+        ) || selector == kAudioControlPropertyElement as u32,
+        OBJECT_ID_MUTE_CONTROL => matches!(
+            selector,
+            x if x == kAudioObjectPropertyBaseClass as u32
+                || x == kAudioObjectPropertyClass as u32
+                || x == kAudioObjectPropertyOwner as u32
+                || x == kAudioObjectPropertyName as u32
+                || x == kAudioObjectPropertyOwnedObjects as u32
+                || x == kAudioControlPropertyScope as u32
+                || x == kAudioBooleanControlPropertyValue as u32
+        ) || selector == kAudioControlPropertyElement as u32,
         _ => false,
     }
 }
@@ -384,7 +534,17 @@ pub unsafe extern "C" fn is_property_settable(
     if !property_known(object_id, addr.mSelector, addr.mScope) {
         return kAudioHardwareUnknownPropertyError as OSStatus;
     }
-    unsafe { *out_settable = 0 }; // everything read-only for now
+    let settable = match (object_id, addr.mSelector) {
+        (OBJECT_ID_VOLUME_CONTROL, s)
+            if s == kAudioLevelControlPropertyScalarValue as u32
+                || s == kAudioLevelControlPropertyDecibelValue as u32 =>
+        {
+            1
+        }
+        (OBJECT_ID_MUTE_CONTROL, s) if s == kAudioBooleanControlPropertyValue as u32 => 1,
+        _ => 0,
+    };
+    unsafe { *out_settable = settable };
     kAudioHardwareNoError as OSStatus
 }
 
@@ -405,6 +565,8 @@ pub unsafe extern "C" fn get_property_data_size(
         OBJECT_ID_PLUGIN => plugin_data_size(sel),
         OBJECT_ID_DEVICE => device_data_size(sel, scope),
         OBJECT_ID_STREAM_INPUT | OBJECT_ID_STREAM_OUTPUT => stream_data_size(sel),
+        OBJECT_ID_VOLUME_CONTROL => volume_control_data_size(sel),
+        OBJECT_ID_MUTE_CONTROL => mute_control_data_size(sel),
         _ => {
             log(&format!(
                 "get_property_data_size: object={object_id} selector={sel:#010x} -> kAudioHardwareBadObjectError"
@@ -473,7 +635,7 @@ fn device_data_size(sel: u32, scope: u32) -> u32 {
                 4 // one stream ID
             }
         }
-        x if x == kAudioObjectPropertyOwnedObjects as u32 => 8, // two streams
+        x if x == kAudioObjectPropertyOwnedObjects as u32 => 16, // two streams + two controls
         x if x == kAudioDevicePropertyNominalSampleRate as u32 => 8,
         x if x == kAudioDevicePropertyAvailableNominalSampleRates as u32 => {
             std::mem::size_of::<AudioValueRange>() as u32
@@ -483,8 +645,8 @@ fn device_data_size(sel: u32, scope: u32) -> u32 {
         x if x == kAudioDevicePropertySafetyOffset as u32 => 4,
         x if x == kAudioDevicePropertyIcon as u32 => 0, // we don't support this
         x if x == K_AUDIO_DEVICE_PROPERTY_IS_HIDDEN => 4,
-        // Empty list — known property, zero-byte payload (sentinel u32::MAX).
-        x if x == K_AUDIO_DEVICE_PROPERTY_CONTROL_LIST => u32::MAX,
+        // Two controls: volume + mute.
+        x if x == K_AUDIO_DEVICE_PROPERTY_CONTROL_LIST => 8,
         _ => 0,
     }
 }
@@ -509,6 +671,40 @@ fn stream_data_size(sel: u32) -> u32 {
         {
             std::mem::size_of::<AudioStreamRangedDescription>() as u32
         }
+        _ => 0,
+    }
+}
+
+fn volume_control_data_size(sel: u32) -> u32 {
+    match sel {
+        x if x == kAudioObjectPropertyBaseClass as u32 => 4,
+        x if x == kAudioObjectPropertyClass as u32 => 4,
+        x if x == kAudioObjectPropertyOwner as u32 => 4,
+        x if x == kAudioObjectPropertyName as u32 => std::mem::size_of::<CFStringRef>() as u32,
+        x if x == kAudioObjectPropertyOwnedObjects as u32 => u32::MAX, // empty
+        x if x == kAudioControlPropertyScope as u32 => 4,
+        x if x == kAudioControlPropertyElement as u32 => 4,
+        x if x == kAudioLevelControlPropertyScalarValue as u32 => 4,
+        x if x == kAudioLevelControlPropertyDecibelValue as u32 => 4,
+        x if x == kAudioLevelControlPropertyDecibelRange as u32 => {
+            std::mem::size_of::<AudioValueRange>() as u32
+        }
+        x if x == kAudioLevelControlPropertyConvertScalarToDecibels as u32 => 4,
+        x if x == kAudioLevelControlPropertyConvertDecibelsToScalar as u32 => 4,
+        _ => 0,
+    }
+}
+
+fn mute_control_data_size(sel: u32) -> u32 {
+    match sel {
+        x if x == kAudioObjectPropertyBaseClass as u32 => 4,
+        x if x == kAudioObjectPropertyClass as u32 => 4,
+        x if x == kAudioObjectPropertyOwner as u32 => 4,
+        x if x == kAudioObjectPropertyName as u32 => std::mem::size_of::<CFStringRef>() as u32,
+        x if x == kAudioObjectPropertyOwnedObjects as u32 => u32::MAX, // empty
+        x if x == kAudioControlPropertyScope as u32 => 4,
+        x if x == kAudioControlPropertyElement as u32 => 4,
+        x if x == kAudioBooleanControlPropertyValue as u32 => 4,
         _ => 0,
     }
 }
@@ -548,6 +744,12 @@ pub unsafe extern "C" fn get_property_data(
         },
         OBJECT_ID_STREAM_OUTPUT => unsafe {
             get_stream_property(sel, object_id, out_data_size, out_data)
+        },
+        OBJECT_ID_VOLUME_CONTROL => unsafe {
+            get_volume_control_property(sel, out_data_size, out_data)
+        },
+        OBJECT_ID_MUTE_CONTROL => unsafe {
+            get_mute_control_property(sel, out_data_size, out_data)
         },
         _ => kAudioHardwareBadObjectError as OSStatus,
     };
@@ -676,9 +878,14 @@ unsafe fn get_device_property(
             kAudioHardwareNoError as OSStatus
         },
         x if x == kAudioObjectPropertyOwnedObjects as u32 => unsafe {
-            let ids = [OBJECT_ID_STREAM_INPUT, OBJECT_ID_STREAM_OUTPUT];
-            std::ptr::copy_nonoverlapping(ids.as_ptr(), out as *mut u32, 2);
-            *out_size = 8;
+            let ids = [
+                OBJECT_ID_STREAM_INPUT,
+                OBJECT_ID_STREAM_OUTPUT,
+                OBJECT_ID_VOLUME_CONTROL,
+                OBJECT_ID_MUTE_CONTROL,
+            ];
+            std::ptr::copy_nonoverlapping(ids.as_ptr(), out as *mut u32, 4);
+            *out_size = 16;
             kAudioHardwareNoError as OSStatus
         },
         x if x == kAudioDevicePropertyNominalSampleRate as u32 => unsafe {
@@ -710,9 +917,11 @@ unsafe fn get_device_property(
         x if x == kAudioDevicePropertyIcon as u32 => kAudioHardwareUnknownPropertyError as OSStatus,
         // Not hidden — coreaudiod queries this directly without checking has_property.
         x if x == K_AUDIO_DEVICE_PROPERTY_IS_HIDDEN => unsafe { write_u32(out, out_size, 0) },
-        // Empty control list.
+        // Volume + mute controls.
         x if x == K_AUDIO_DEVICE_PROPERTY_CONTROL_LIST => unsafe {
-            *out_size = 0;
+            let ids = [OBJECT_ID_VOLUME_CONTROL, OBJECT_ID_MUTE_CONTROL];
+            std::ptr::copy_nonoverlapping(ids.as_ptr(), out as *mut u32, 2);
+            *out_size = 8;
             kAudioHardwareNoError as OSStatus
         },
         _ => kAudioHardwareUnknownPropertyError as OSStatus,
@@ -791,17 +1000,199 @@ unsafe fn get_stream_property(
     }
 }
 
+unsafe fn get_volume_control_property(
+    sel: u32,
+    out_size: *mut u32,
+    out: *mut c_void,
+) -> OSStatus {
+    match sel {
+        // Immediate parent class: kAudioVolumeControlClassID ⊂ kAudioLevelControlClassID.
+        x if x == kAudioObjectPropertyBaseClass as u32 => unsafe {
+            write_u32(out, out_size, kAudioLevelControlClassID as u32)
+        },
+        // System Settings filters on this exact class to show a volume slider.
+        x if x == kAudioObjectPropertyClass as u32 => unsafe {
+            write_u32(out, out_size, kAudioVolumeControlClassID as u32)
+        },
+        x if x == kAudioObjectPropertyOwner as u32 => unsafe {
+            write_u32(out, out_size, OBJECT_ID_DEVICE)
+        },
+        x if x == kAudioObjectPropertyName as u32 => unsafe {
+            write_cfstr(out, out_size, "Spaghetti Output Volume")
+        },
+        x if x == kAudioObjectPropertyOwnedObjects as u32 => unsafe {
+            *out_size = 0;
+            kAudioHardwareNoError as OSStatus
+        },
+        x if x == kAudioControlPropertyScope as u32 => unsafe {
+            write_u32(out, out_size, kAudioObjectPropertyScopeOutput as u32)
+        },
+        x if x == kAudioControlPropertyElement as u32 => unsafe {
+            write_u32(out, out_size, kAudioObjectPropertyElementMain as u32)
+        },
+        x if x == kAudioLevelControlPropertyScalarValue as u32 => unsafe {
+            write_f32(
+                out,
+                out_size,
+                f32::from_bits(VOLUME_SCALAR.load(Ordering::Relaxed)),
+            )
+        },
+        x if x == kAudioLevelControlPropertyDecibelValue as u32 => unsafe {
+            let scalar = f32::from_bits(VOLUME_SCALAR.load(Ordering::Relaxed));
+            write_f32(out, out_size, scalar_to_db(scalar))
+        },
+        x if x == kAudioLevelControlPropertyDecibelRange as u32 => unsafe {
+            let range = AudioValueRange {
+                mMinimum: -96.0,
+                mMaximum: 0.0,
+            };
+            std::ptr::copy_nonoverlapping(
+                &range as *const AudioValueRange,
+                out as *mut AudioValueRange,
+                1,
+            );
+            *out_size = std::mem::size_of::<AudioValueRange>() as u32;
+            kAudioHardwareNoError as OSStatus
+        },
+        // Input: scalar in *out, output: dB in *out (in-place conversion).
+        x if x == kAudioLevelControlPropertyConvertScalarToDecibels as u32 => unsafe {
+            let scalar = *(out as *const f32);
+            write_f32(out, out_size, scalar_to_db(scalar.clamp(0.0, 1.0)))
+        },
+        // Input: dB in *out, output: scalar in *out.
+        x if x == kAudioLevelControlPropertyConvertDecibelsToScalar as u32 => unsafe {
+            let db = *(out as *const f32);
+            write_f32(out, out_size, db_to_scalar(db).clamp(0.0, 1.0))
+        },
+        _ => kAudioHardwareUnknownPropertyError as OSStatus,
+    }
+}
+
+unsafe fn get_mute_control_property(
+    sel: u32,
+    out_size: *mut u32,
+    out: *mut c_void,
+) -> OSStatus {
+    match sel {
+        // Immediate parent class: kAudioMuteControlClassID ⊂ kAudioBooleanControlClassID.
+        x if x == kAudioObjectPropertyBaseClass as u32 => unsafe {
+            write_u32(out, out_size, kAudioBooleanControlClassID as u32)
+        },
+        // System Settings filters on this exact class to show a mute toggle.
+        x if x == kAudioObjectPropertyClass as u32 => unsafe {
+            write_u32(out, out_size, kAudioMuteControlClassID as u32)
+        },
+        x if x == kAudioObjectPropertyOwner as u32 => unsafe {
+            write_u32(out, out_size, OBJECT_ID_DEVICE)
+        },
+        x if x == kAudioObjectPropertyName as u32 => unsafe {
+            write_cfstr(out, out_size, "Spaghetti Output Mute")
+        },
+        x if x == kAudioObjectPropertyOwnedObjects as u32 => unsafe {
+            *out_size = 0;
+            kAudioHardwareNoError as OSStatus
+        },
+        x if x == kAudioControlPropertyScope as u32 => unsafe {
+            write_u32(out, out_size, kAudioObjectPropertyScopeOutput as u32)
+        },
+        x if x == kAudioControlPropertyElement as u32 => unsafe {
+            write_u32(out, out_size, kAudioObjectPropertyElementMain as u32)
+        },
+        x if x == kAudioBooleanControlPropertyValue as u32 => unsafe {
+            write_u32(out, out_size, MUTE.load(Ordering::Relaxed))
+        },
+        _ => kAudioHardwareUnknownPropertyError as OSStatus,
+    }
+}
+
 pub unsafe extern "C" fn set_property_data(
     _driver: DriverRef,
-    _object_id: AudioObjectID,
+    object_id: AudioObjectID,
     _client_pid: i32,
-    _address: *const AudioObjectPropertyAddress,
+    address: *const AudioObjectPropertyAddress,
     _qualifier_data_size: u32,
     _qualifier_data: *const c_void,
-    _data_size: u32,
-    _data: *const c_void,
+    data_size: u32,
+    data: *const c_void,
 ) -> OSStatus {
-    UNSUPPORTED
+    let addr = unsafe { &*address };
+    let sel = addr.mSelector;
+
+    match object_id {
+        OBJECT_ID_VOLUME_CONTROL => unsafe { set_volume_property(sel, data_size, data) },
+        OBJECT_ID_MUTE_CONTROL => unsafe { set_mute_property(sel, data_size, data) },
+        _ => UNSUPPORTED,
+    }
+}
+
+unsafe fn set_volume_property(sel: u32, data_size: u32, data: *const c_void) -> OSStatus {
+    match sel {
+        x if x == kAudioLevelControlPropertyScalarValue as u32 => {
+            if data_size < 4 {
+                return kAudioHardwareBadObjectError as OSStatus;
+            }
+            let new_scalar = unsafe { *(data as *const f32) }.clamp(0.0, 1.0);
+            VOLUME_SCALAR.store(new_scalar.to_bits(), Ordering::Relaxed);
+            notify_host_property_changed(
+                OBJECT_ID_VOLUME_CONTROL,
+                kAudioLevelControlPropertyScalarValue as u32,
+            );
+            kAudioHardwareNoError as OSStatus
+        }
+        x if x == kAudioLevelControlPropertyDecibelValue as u32 => {
+            if data_size < 4 {
+                return kAudioHardwareBadObjectError as OSStatus;
+            }
+            let db = unsafe { *(data as *const f32) }.clamp(-96.0, 0.0);
+            let scalar = db_to_scalar(db).clamp(0.0, 1.0);
+            VOLUME_SCALAR.store(scalar.to_bits(), Ordering::Relaxed);
+            notify_host_property_changed(
+                OBJECT_ID_VOLUME_CONTROL,
+                kAudioLevelControlPropertyDecibelValue as u32,
+            );
+            kAudioHardwareNoError as OSStatus
+        }
+        _ => UNSUPPORTED,
+    }
+}
+
+unsafe fn set_mute_property(sel: u32, data_size: u32, data: *const c_void) -> OSStatus {
+    match sel {
+        x if x == kAudioBooleanControlPropertyValue as u32 => {
+            if data_size < 4 {
+                return kAudioHardwareBadObjectError as OSStatus;
+            }
+            let v = unsafe { *(data as *const u32) };
+            MUTE.store(if v != 0 { 1 } else { 0 }, Ordering::Relaxed);
+            notify_host_property_changed(
+                OBJECT_ID_MUTE_CONTROL,
+                kAudioBooleanControlPropertyValue as u32,
+            );
+            kAudioHardwareNoError as OSStatus
+        }
+        _ => UNSUPPORTED,
+    }
+}
+
+/// Notify the HAL host that a property on an object changed so clients re-read
+/// it. Safe to call from non-realtime property handlers; never call from the
+/// IO callback.
+fn notify_host_property_changed(object_id: u32, selector: u32) {
+    let host_ptr = DRIVER.host.load(Ordering::SeqCst);
+    if host_ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let host = &*host_ptr;
+        if let Some(props_changed) = host.PropertiesChanged {
+            let addr = AudioObjectPropertyAddress {
+                mSelector: selector,
+                mScope: kAudioObjectPropertyScopeGlobal as u32,
+                mElement: kAudioObjectPropertyElementMain as u32,
+            };
+            let _ = props_changed(host_ptr, object_id, 1, &addr);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -828,6 +1219,7 @@ pub unsafe extern "C" fn start_io(
         TIMESTAMP_COUNT.store(0, Ordering::SeqCst);
         ANCHOR_HOST_TIME.store(unsafe { mach_absolute_time() }, Ordering::SeqCst);
     }
+    publish_io_running();
     kAudioHardwareNoError as OSStatus
 }
 
@@ -839,7 +1231,19 @@ pub unsafe extern "C" fn stop_io(
     let _ = IO_RUNNING_COUNT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
         if n > 0 { Some(n - 1) } else { None }
     });
+    publish_io_running();
     kAudioHardwareNoError as OSStatus
+}
+
+/// Mirror the current IO-running state into the activity region so the daemon
+/// can tell whether coreaudiod is currently driving IO on the device.
+fn publish_io_running() {
+    let ptr = ACTIVITY_PTR.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return;
+    }
+    let running = u32::from(IO_RUNNING_COUNT.load(Ordering::SeqCst) > 0);
+    unsafe { (*ptr).io_running.store(running, Ordering::Relaxed) };
 }
 
 pub unsafe extern "C" fn get_zero_time_stamp(
@@ -935,14 +1339,41 @@ pub unsafe extern "C" fn do_io_operation(
 
     match operation_id {
         x if x == kAudioServerPlugInIOOperationWriteMix as u32 => {
-            // Copy app's output into the ring buffer.
+            // Copy app's output into the ring buffer, applying volume + mute.
             let sample_time = unsafe { (*io_cycle_info).mOutputTime.mSampleTime } as usize;
             let offset = (sample_time % RING_BUFFER_FRAMES) * NUM_CHANNELS;
 
+            let muted = MUTE.load(Ordering::Relaxed) != 0;
+            let gain = if muted {
+                0.0_f32
+            } else {
+                f32::from_bits(VOLUME_SCALAR.load(Ordering::Relaxed))
+            };
+
+            let mut peak: f32 = 0.0;
             for i in 0..sample_count {
                 let ring_idx = (offset + i) % (RING_BUFFER_FRAMES * NUM_CHANNELS);
-                let sample = unsafe { *buf.add(i) };
-                RING_BUFFER[ring_idx].store(sample.to_bits(), Ordering::Relaxed);
+                let scaled = unsafe { *buf.add(i) } * gain;
+                let abs = scaled.abs();
+                if abs > peak {
+                    peak = abs;
+                }
+                RING_BUFFER[ring_idx].store(scaled.to_bits(), Ordering::Relaxed);
+            }
+
+            let activity = ACTIVITY_PTR.load(Ordering::Relaxed);
+            if !activity.is_null() {
+                unsafe {
+                    (*activity)
+                        .frames_written
+                        .fetch_add(io_buffer_frame_size as u64, Ordering::Relaxed);
+                    (*activity)
+                        .last_write_host_time
+                        .store(mach_absolute_time(), Ordering::Relaxed);
+                    (*activity)
+                        .peak_bits
+                        .store(peak.to_bits(), Ordering::Relaxed);
+                }
             }
         }
         x if x == kAudioServerPlugInIOOperationReadInput as u32 => {

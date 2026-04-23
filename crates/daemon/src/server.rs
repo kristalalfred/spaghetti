@@ -5,10 +5,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
 
+use crate::activity::{ActivityReader, FpsTracker};
 use crate::audio;
 use crate::device_manager::DeviceManager;
 use crate::router::Router;
 use crate::tap::{self, TapManager};
+
+/// Freshness window for the driver's last WriteMix timestamp — older than this
+/// and the activity snapshot is considered stale (driver idle or gone).
+const ACTIVITY_FRESHNESS_NS: u64 = 200_000_000;
 
 /// Shared daemon state accessible by all client handlers.
 pub struct DaemonState {
@@ -27,20 +32,35 @@ impl DaemonState {
     }
 }
 
+/// Per-server (not per-connection) activity tracking. Kept outside `DaemonState`
+/// so the FPS window stays consistent across concurrent clients.
+///
+/// `reader` is behind a `Mutex` so the lazy-attach path (first successful open
+/// after daemon starts before the driver has loaded) can update it safely.
+pub struct ActivityState {
+    pub reader: Mutex<Option<ActivityReader>>,
+    pub fps: FpsTracker,
+}
+
 pub struct Server {
     listener: UnixListener,
     state: Arc<Mutex<DaemonState>>,
+    activity: Arc<ActivityState>,
     pub cancel: CancellationToken,
 }
 
 impl Server {
-    pub async fn bind() -> std::io::Result<Self> {
+    pub async fn bind(activity_reader: Option<ActivityReader>) -> std::io::Result<Self> {
         // Remove stale socket file if it exists from a previous run
         let _ = std::fs::remove_file(SOCKET_PATH);
         let listener = UnixListener::bind(SOCKET_PATH)?;
         Ok(Self {
             listener,
             state: Arc::new(Mutex::new(DaemonState::new())),
+            activity: Arc::new(ActivityState {
+                reader: Mutex::new(activity_reader),
+                fps: FpsTracker::new(),
+            }),
             cancel: CancellationToken::new(),
         })
     }
@@ -52,8 +72,9 @@ impl Server {
                     match accept {
                         Ok((stream, _)) => {
                             let state = Arc::clone(&self.state);
+                            let activity = Arc::clone(&self.activity);
                             let cancel = self.cancel.clone();
-                            tokio::spawn(handle_client(stream, state, cancel));
+                            tokio::spawn(handle_client(stream, state, activity, cancel));
                         }
                         Err(e) => tracing::error!("accept error: {e}"),
                     }
@@ -70,6 +91,7 @@ impl Server {
 async fn handle_client(
     mut stream: UnixStream,
     state: Arc<Mutex<DaemonState>>,
+    activity: Arc<ActivityState>,
     cancel: CancellationToken,
 ) {
     loop {
@@ -84,7 +106,7 @@ async fn handle_client(
             }
         };
 
-        let response = dispatch(request, &state, &cancel);
+        let response = dispatch(request, &state, &activity, &cancel);
 
         if let Err(e) = write_message_async(&mut stream, &response).await {
             tracing::error!("write error: {e}");
@@ -93,7 +115,12 @@ async fn handle_client(
     }
 }
 
-fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>, cancel: &CancellationToken) -> Response {
+fn dispatch(
+    request: Request,
+    state: &Arc<Mutex<DaemonState>>,
+    activity: &Arc<ActivityState>,
+    cancel: &CancellationToken,
+) -> Response {
     match request {
         Request::Status => {
             let st = lock_state(state);
@@ -198,11 +225,63 @@ fn dispatch(request: Request, state: &Arc<Mutex<DaemonState>>, cancel: &Cancella
             let st = lock_state(state);
             Response::Devices(st.device_manager.list_devices())
         }
+        Request::GetActivity => Response::Activity(read_activity(activity)),
         Request::Shutdown => {
             tracing::info!("shutdown requested by client");
             cancel.cancel();
             Response::Ok
         }
+    }
+}
+
+/// Build an [`ActivityInfo`] response from the driver's shm snapshot.
+///
+/// Returns zeroed / inactive values when the shm region is unavailable.
+/// If the region was not available at daemon start, attempts a lazy open on
+/// each call — the driver may have loaded after the daemon started.
+fn read_activity(activity: &Arc<ActivityState>) -> ActivityInfo {
+    let mut guard = match activity.reader.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    // Lazy attach: try opening now if we don't have a reader yet.
+    if guard.is_none() {
+        match ActivityReader::open() {
+            Ok(r) => {
+                tracing::info!("activity shm attached (lazy)");
+                *guard = Some(r);
+            }
+            Err(_) => {
+                return ActivityInfo {
+                    active: false,
+                    frames_per_second: 0,
+                    peak_db: -96.0,
+                    io_running: false,
+                    total_frames: 0,
+                };
+            }
+        }
+    }
+
+    let reader = guard.as_ref().expect("reader was just set");
+    let snap = reader.snapshot();
+    let fps = activity.fps.update(snap.frames_written);
+    let stale = reader.is_stale(snap.last_write_host_time, ACTIVITY_FRESHNESS_NS);
+
+    let peak_db = if snap.peak > 0.0 {
+        let db = 20.0 * snap.peak.log10();
+        if db < -96.0 { -96.0 } else { db }
+    } else {
+        -96.0
+    };
+
+    ActivityInfo {
+        active: snap.io_running && !stale,
+        frames_per_second: fps,
+        peak_db,
+        io_running: snap.io_running,
+        total_frames: snap.frames_written,
     }
 }
 

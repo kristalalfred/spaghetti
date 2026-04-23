@@ -1,7 +1,11 @@
 mod client;
+mod daemon_mgmt;
 
 use clap::{Parser, Subcommand};
-use spaghetti_common::ipc_protocol::{AppInfo, DeviceInfo, Request, Response, RouteInfo, TapInfo};
+use spaghetti_common::ipc_protocol::{
+    ActivityInfo, AppInfo, DeviceInfo, Request, Response, RouteInfo, TapInfo,
+};
+use std::io::{IsTerminal, Write};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -96,8 +100,40 @@ enum Command {
         #[command(subcommand)]
         action: Option<DeviceAction>,
     },
+    /// Stream live driver activity (frames/s, peak dB)
+    Monitor,
     /// Shut down the daemon
     Shutdown,
+    /// Manage the background daemon (macOS LaunchAgent)
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Install the LaunchAgent so the daemon starts at login
+    Install,
+    /// Remove the LaunchAgent
+    Uninstall,
+    /// Start the daemon
+    Start,
+    /// Stop the daemon (stays stopped until `start` or next login)
+    Stop,
+    /// Restart the daemon (sends SIGTERM; launchd relaunches it)
+    Restart,
+    /// Show launchd status for the daemon
+    Status,
+    /// Show daemon logs
+    Logs {
+        /// Follow the log (like `tail -f`)
+        #[arg(short, long)]
+        follow: bool,
+        /// Number of lines to show (default: 200)
+        #[arg(short = 'n', long, default_value = "200")]
+        lines: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -174,6 +210,89 @@ fn print_error(msg: &str) {
         eprintln!("\x1b[31merror:\x1b[0m {msg}");
     } else {
         eprintln!("error: {msg}");
+    }
+}
+
+/// Render a single status line for the monitor.
+///
+/// `tty` controls ANSI colour of the active dot; everything else is plain text.
+fn format_activity_line(info: &ActivityInfo, tty: bool) -> String {
+    let (dot, io_str) = if info.active {
+        (if tty { "\x1b[32m●\x1b[0m" } else { "●" }, "on ")
+    } else if tty {
+        ("\x1b[90m○\x1b[0m", "off")
+    } else {
+        ("○", "off")
+    };
+
+    let peak = if info.active || info.peak_db > -96.0 {
+        format!("{:>5.1} dB", info.peak_db)
+    } else {
+        "--.- dB".to_string()
+    };
+
+    format!(
+        "[spaghetti] active: {dot}  io: {io}   frames/s: {fps:<6}  peak: {peak}   total: {total}",
+        io = io_str,
+        fps = info.frames_per_second,
+        total = info.total_frames,
+    )
+}
+
+fn run_monitor() -> Result<(), Box<dyn std::error::Error>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(monitor_loop())
+}
+
+async fn monitor_loop() -> Result<(), Box<dyn std::error::Error>> {
+    // Blocking Unix socket, polled from a periodic task. Using the std socket
+    // keeps the CLI deps minimal; each request/response is small so blocking
+    // the single-threaded runtime for the round-trip is acceptable here.
+    let tty = std::io::stdout().is_terminal();
+    let mut stream = client::connect().map_err(|e| -> Box<dyn std::error::Error> {
+        if e.kind() == std::io::ErrorKind::ConnectionRefused
+            || e.kind() == std::io::ErrorKind::NotFound
+        {
+            "Daemon not running. Start it with: spaghettid".into()
+        } else {
+            format!("Failed to connect to daemon: {e}").into()
+        }
+    })?;
+
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut stdout = std::io::stdout();
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!();
+                return Ok(());
+            }
+            _ = ticker.tick() => {
+                let response = client::send_request(&mut stream, &Request::GetActivity)?;
+                match response {
+                    Response::Activity(info) => {
+                        let line = format_activity_line(&info, tty);
+                        // \r + erase-to-end-of-line, then redraw without newline.
+                        write!(stdout, "\r\x1b[K{line}")?;
+                        stdout.flush()?;
+                    }
+                    Response::Error { message } => {
+                        println!();
+                        print_error(&message);
+                        std::process::exit(1);
+                    }
+                    _ => {
+                        println!();
+                        print_error("unexpected response from daemon");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -409,6 +528,14 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
             }
         },
 
+        Command::Monitor => {
+            // Monitor owns its own connection lifecycle and loops until Ctrl-C,
+            // so hand off to a dedicated function rather than fitting it into
+            // the single-request shape of the other commands.
+            drop(stream);
+            return run_monitor();
+        }
+
         Command::Shutdown => {
             let response = client::send_request(&mut stream, &Request::Shutdown)?;
             match response {
@@ -420,6 +547,8 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
                 _ => print_error("unexpected response from daemon"),
             }
         }
+
+        Command::Daemon { .. } => unreachable!("daemon commands handled in main"),
     }
 
     Ok(())
@@ -432,6 +561,24 @@ fn main() {
         None => {
             print_logo();
             println!("\nRun 'spaghetti --help' for usage.\n");
+        }
+        // Daemon-management commands don't talk to the daemon socket; they
+        // shell out to launchctl / tail. Handle them before `run_command` so
+        // they work even when the daemon is not running.
+        Some(Command::Daemon { action }) => {
+            let result = match action {
+                DaemonAction::Install => daemon_mgmt::install(),
+                DaemonAction::Uninstall => daemon_mgmt::uninstall(),
+                DaemonAction::Start => daemon_mgmt::start(),
+                DaemonAction::Stop => daemon_mgmt::stop(),
+                DaemonAction::Restart => daemon_mgmt::restart(),
+                DaemonAction::Status => daemon_mgmt::status(),
+                DaemonAction::Logs { follow, lines } => daemon_mgmt::logs(follow, lines),
+            };
+            if let Err(e) = result {
+                print_error(&e);
+                std::process::exit(1);
+            }
         }
         Some(cmd) => {
             if let Err(e) = run_command(cmd) {

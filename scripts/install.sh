@@ -27,7 +27,7 @@ step() {
 command -v cargo &>/dev/null || die "'cargo' not found. Install Rust from https://rustup.rs"
 
 echo -e "${BOLD}spaghetti install${RESET}"
-echo "This will install the CoreAudio driver and CLI tools."
+echo "This will install the CoreAudio driver, CLI tools, and a LaunchAgent."
 echo "sudo access is required to write to ${HAL_DIR} and ${BIN_DIR}."
 echo ""
 echo "Press Enter to continue (or Ctrl-C to abort)."
@@ -35,6 +35,9 @@ read -r
 
 # Acquire sudo upfront so subsequent sudo calls don't prompt mid-script.
 sudo -v
+
+# Determine the target user (the person who ran sudo, not root).
+TARGET_USER="${SUDO_USER:-$USER}"
 
 cd "$PROJECT_DIR"
 
@@ -72,17 +75,27 @@ step "Installing binaries to ${BIN_DIR}"
 sudo cp target/release/spaghetti "${BIN_DIR}/spaghetti"
 sudo cp target/release/spaghettid "${BIN_DIR}/spaghettid"
 
+# --- LaunchAgent (delegated to the CLI so end users can manage it too) ---
+
+step "Installing LaunchAgent for ${TARGET_USER}"
+sudo -u "$TARGET_USER" "${BIN_DIR}/spaghetti" daemon install
+
 # --- Done ---
 
 echo ""
 echo -e "${BOLD}Installation complete.${RESET}"
 echo ""
 echo "Getting started:"
-echo "  Start the daemon:  spaghettid"
-echo "  Use the CLI:       spaghetti --help"
+echo "  Watch output:     spaghetti monitor"
+echo "  List devices:     spaghetti devices"
+echo "  CLI help:         spaghetti --help"
+echo ""
+echo "Manage the daemon:"
+echo "  spaghetti daemon status"
+echo "  spaghetti daemon restart"
+echo "  spaghetti daemon logs -f"
+echo "  spaghetti daemon stop"
+echo "  spaghetti daemon start"
 echo ""
 echo "Verify the audio device appeared:"
 echo "  system_profiler SPAudioDataType | grep -A2 Spaghetti"
-echo ""
-echo "Monitor driver logs:"
-echo "  log stream --predicate 'sender == \"coreaudiod\"' --level debug"

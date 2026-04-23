@@ -2,7 +2,7 @@
 //! Loads the cdylib via dlopen (mirroring what coreaudiod does).
 //! Run with: cargo test -p spaghetti-asp --test driver_sanity -- --nocapture
 
-use std::ffi::{c_void, CStr};
+use std::ffi::c_void;
 use std::ptr;
 
 use coreaudio_sys::{

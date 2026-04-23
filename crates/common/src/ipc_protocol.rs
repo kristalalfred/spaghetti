@@ -15,6 +15,7 @@ pub enum Request {
     CreateDevice { name: String, channels: Option<u32> },
     DestroyDevice { device_uid: String },
     ListDevices,
+    GetActivity,
     Shutdown,
 }
 
@@ -30,6 +31,7 @@ pub enum Response {
     RouteCreated { route_id: u32 },
     DeviceCreated { device_uid: String },
     Devices(Vec<DeviceInfo>),
+    Activity(ActivityInfo),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -58,6 +60,21 @@ pub struct RouteInfo {
     pub tap_id: u32,
     pub device_uid: String,
     pub volume: f32,
+}
+
+/// Snapshot of driver-side audio activity, derived from the shared-memory region.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityInfo {
+    /// True when IO is running AND the driver wrote a block within the freshness window.
+    pub active: bool,
+    /// Frames-per-second over a ~500ms rolling window.
+    pub frames_per_second: u64,
+    /// Peak amplitude of the last block in dBFS. Floored at -96.0.
+    pub peak_db: f32,
+    /// Raw `io_running` flag from the driver.
+    pub io_running: bool,
+    /// Total frames the driver has ever written.
+    pub total_frames: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
