@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::ffi::CString;
 
 use coreaudio_sys::AudioObjectID;
-use spaghetti_common::ipc_protocol::{AppInfo, TapInfo};
+use spaghetti_common::ipc_protocol::{AppInfo, TapInfo, TapMode};
 
 unsafe extern "C" {
     unsafe fn spaghetti_create_tap(
         pids: *const i32,
         pid_count: u32,
+        mute_behavior: i32,
         out_tap_id: *mut AudioObjectID,
     ) -> i32;
 
@@ -28,6 +29,7 @@ pub struct Tap {
     pub aggregate_device_id: AudioObjectID,
     pub pid: u32,
     pub app_name: String,
+    pub mode: TapMode,
 }
 
 /// Manages the lifecycle of Core Audio process taps.
@@ -45,11 +47,12 @@ impl TapManager {
     }
 
     /// Create a process tap on the given PID and a private aggregate device to read from it.
-    pub fn create_tap(&mut self, pid: u32) -> Result<u32, String> {
+    pub fn create_tap(&mut self, pid: u32, mode: TapMode) -> Result<u32, String> {
         let pid_i32 = pid as i32;
         let mut tap_obj_id: AudioObjectID = 0;
+        let mute_behavior = if mode == TapMode::MuteSourceWhenTapped { 1 } else { 0 };
 
-        let status = unsafe { spaghetti_create_tap(&pid_i32, 1, &mut tap_obj_id) };
+        let status = unsafe { spaghetti_create_tap(&pid_i32, 1, mute_behavior, &mut tap_obj_id) };
         if status != 0 {
             return Err(format!(
                 "AudioHardwareCreateProcessTap failed: OSStatus {status}"
@@ -83,6 +86,7 @@ impl TapManager {
                 aggregate_device_id: agg_id,
                 pid,
                 app_name,
+                mode,
             },
         );
 
@@ -118,6 +122,7 @@ impl TapManager {
                 tap_id: id,
                 pid: tap.pid,
                 app_name: tap.app_name.clone(),
+                mode: tap.mode,
             })
             .collect()
     }

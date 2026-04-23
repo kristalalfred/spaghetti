@@ -5,10 +5,12 @@
 #include <AudioToolbox/AudioToolbox.h>
 
 /// Create a process tap targeting the given PIDs.
+/// mute_behavior: 0 = CATapUnmuted (mirror), 1 = CATapMutedWhenTapped.
 /// Returns the tap's AudioObjectID via out_tap_id.
 OSStatus spaghetti_create_tap(
     const pid_t *pids,
     uint32_t pid_count,
+    int mute_behavior,
     AudioObjectID *out_tap_id
 );
 

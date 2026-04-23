@@ -94,22 +94,28 @@ async fn handle_client(
     activity: Arc<ActivityState>,
     cancel: CancellationToken,
 ) {
+    let peer = stream.peer_addr().map(|a| format!("{a:?}")).unwrap_or_else(|_| "unknown".into());
     loop {
-        let request = match read_message_async(&mut stream).await {
-            Ok(req) => req,
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    return;
+        let response = match read_frame_async(&mut stream).await {
+            Ok(buf) => match serde_json::from_slice::<Request>(&buf) {
+                Ok(req) => dispatch(req, &state, &activity, &cancel),
+                Err(e) => {
+                    tracing::warn!(peer = %peer, "unrecognised request: {e}");
+                    Response::Error {
+                        message: format!("unknown or malformed request: {e}"),
+                    }
                 }
-                tracing::error!("read error: {e}");
+            },
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                    tracing::warn!(peer = %peer, "read error: {e}");
+                }
                 return;
             }
         };
 
-        let response = dispatch(request, &state, &activity, &cancel);
-
         if let Err(e) = write_message_async(&mut stream, &response).await {
-            tracing::error!("write error: {e}");
+            tracing::error!(peer = %peer, "write error: {e}");
             return;
         }
     }
@@ -134,9 +140,9 @@ fn dispatch(
             let apps = tap::list_audio_apps();
             Response::Apps(apps)
         }
-        Request::CreateTap { pid } => {
+        Request::CreateTap { pid, mode } => {
             let mut st = lock_state(state);
-            match st.tap_manager.create_tap(pid) {
+            match st.tap_manager.create_tap(pid, mode) {
                 Ok(tap_id) => Response::TapCreated { tap_id },
                 Err(message) => Response::Error { message },
             }
@@ -226,6 +232,7 @@ fn dispatch(
             Response::Devices(st.device_manager.list_devices())
         }
         Request::GetActivity => Response::Activity(read_activity(activity)),
+        Request::ListSystemDevices => Response::SystemDevices(audio::list_all_devices()),
         Request::Shutdown => {
             tracing::info!("shutdown requested by client");
             cancel.cancel();
@@ -309,15 +316,15 @@ async fn write_message_async(
     stream.flush().await
 }
 
-/// Async version of length-prefixed message read.
-async fn read_message_async<T: serde::de::DeserializeOwned>(
-    stream: &mut UnixStream,
-) -> std::io::Result<T> {
+/// Read a length-prefixed frame, returning the raw bytes.
+///
+/// Only I/O failures (EOF, socket errors) are returned as errors — JSON
+/// parsing is left to the caller so decode errors don't close the connection.
+async fn read_frame_async(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
-    serde_json::from_slice(&buf)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    Ok(buf)
 }

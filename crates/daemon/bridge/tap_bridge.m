@@ -60,6 +60,7 @@ static AudioObjectID process_object_for_pid(pid_t pid) {
 OSStatus spaghetti_create_tap(
     const pid_t *pids,
     uint32_t pid_count,
+    int mute_behavior,
     AudioObjectID *out_tap_id
 ) {
     if (!pids || pid_count == 0 || !out_tap_id) {
@@ -77,6 +78,7 @@ OSStatus spaghetti_create_tap(
     }
 
     CATapDescription *desc = [[CATapDescription alloc] initStereoMixdownOfProcesses:processObjects];
+    desc.muteBehavior = (mute_behavior != 0) ? CATapMutedWhenTapped : CATapUnmuted;
 
     AudioObjectID tapID = kAudioObjectUnknown;
     OSStatus status = AudioHardwareCreateProcessTap(desc, &tapID);
@@ -90,6 +92,43 @@ OSStatus spaghetti_create_tap(
 
 OSStatus spaghetti_destroy_tap(AudioObjectID tap_id) {
     return AudioHardwareDestroyProcessTap(tap_id);
+}
+
+/// Query the UID of the system default output device, to use as the aggregate's clock source.
+/// Returns nil if the query fails.
+static NSString *get_default_output_device_uid(void) {
+    AudioObjectPropertyAddress prop = {
+        .mSelector = kAudioHardwarePropertyDefaultOutputDevice,
+        .mScope    = kAudioObjectPropertyScopeGlobal,
+        .mElement  = kAudioObjectPropertyElementMain,
+    };
+
+    AudioDeviceID deviceID = kAudioObjectUnknown;
+    UInt32 dataSize = sizeof(AudioDeviceID);
+    OSStatus status = AudioObjectGetPropertyData(
+        kAudioObjectSystemObject, &prop, 0, NULL, &dataSize, &deviceID
+    );
+    if (status != noErr || deviceID == kAudioObjectUnknown) {
+        NSLog(@"spaghetti: failed to get default output device (status=%d)", (int)status);
+        return nil;
+    }
+
+    AudioObjectPropertyAddress uidProp = {
+        .mSelector = kAudioDevicePropertyDeviceUID,
+        .mScope    = kAudioObjectPropertyScopeGlobal,
+        .mElement  = kAudioObjectPropertyElementMain,
+    };
+
+    CFStringRef uidRef = NULL;
+    dataSize = sizeof(CFStringRef);
+    status = AudioObjectGetPropertyData(deviceID, &uidProp, 0, NULL, &dataSize, &uidRef);
+    if (status != noErr || uidRef == NULL) {
+        NSLog(@"spaghetti: failed to get default output device UID (status=%d)", (int)status);
+        return nil;
+    }
+
+    // Bridge-transfer hands ownership to ARC; CFRelease not needed after this.
+    return (__bridge_transfer NSString *)uidRef;
 }
 
 /// Query the tap object for its UID string (needed for the aggregate device dict).
@@ -125,13 +164,27 @@ OSStatus spaghetti_create_aggregate_for_tap(
         return kAudio_ParamError;
     }
 
-    NSDictionary *aggDesc = @{
+    // Query the default output device UID to use as the aggregate's clock master.
+    // A sub-device provides a real IO clock, which lets AUHAL manage device start/stop
+    // normally. Without it, the private aggregate has no clock and AudioUnitRender fails.
+    NSString *outputUID = get_default_output_device_uid();
+
+    NSMutableDictionary *aggDesc = [@{
         @(kAudioAggregateDeviceUIDKey):          @(aggregate_uid),
         @(kAudioAggregateDeviceNameKey):         @"Spaghetti Tap",
         @(kAudioAggregateDeviceIsPrivateKey):    @YES,
         @(kAudioAggregateDeviceTapAutoStartKey): @YES,
-        @(kAudioAggregateDeviceTapListKey):      @[tapUID],
-    };
+        @(kAudioAggregateDeviceTapListKey):      @[@{ @(kAudioSubTapUIDKey): tapUID }],
+    } mutableCopy];
+
+    if (outputUID) {
+        aggDesc[@(kAudioAggregateDeviceMainSubDeviceKey)] = outputUID;
+        aggDesc[@(kAudioAggregateDeviceSubDeviceListKey)] = @[
+            @{ @(kAudioSubDeviceUIDKey): outputUID }
+        ];
+    } else {
+        NSLog(@"spaghetti: no default output device UID — aggregate has no clock; routing may not work");
+    }
 
     AudioObjectID aggregateID = kAudioObjectUnknown;
     OSStatus status = AudioHardwareCreateAggregateDevice(
