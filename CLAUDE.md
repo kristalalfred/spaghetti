@@ -33,15 +33,17 @@ The routing path is the trickiest part. Flow:
 target app
   → Core Audio process tap (AudioHardwareCreateProcessTap)
   → private aggregate device (wraps the tap + a main sub-device for clocking)
-  → IOProc (AudioDeviceCreateIOProcID) delivers AudioBufferList directly
-  → AudioConverter (SRC: tap rate → dest rate, interleaved → non-interleaved)
-  → SPSC ring buffer (in router.rs)
-  → output AUHAL render callback (runs at device-native format, no conversion)
+  → one IOProc per tap (AudioDeviceCreateIOProcID) delivers AudioBufferList directly
+  → per route sink (lock-free `RtSlots` the IOProc iterates):
+      AudioConverter (SRC: tap rate → dest rate, interleaved → non-interleaved)
+      → SPSC ring buffer (in router.rs)
+  → per route output AUHAL render callback (runs at device-native format, no conversion)
   → destination device
 ```
 
 Key files:
-- `crates/daemon/src/router.rs` — the whole routing graph. `TapCapture` + `capture_ioproc` (capture side), `Sink` (per-route converter + ring producer), `OutputUnit` + `route_render_callback` (output side), `start_route`, ring buffer.
+- `crates/daemon/src/router.rs` — the whole routing graph. `TapCapture` + `capture_ioproc` (capture side), `Sink` (per-route converter + ring producer), `OutputUnit` + `route_render_callback` (output side), `attach_route`, ring buffer.
+- `crates/daemon/src/rt_slots.rs` — `RtSlots`, the lock-free handoff that lets routes join and leave a running tap capture.
 - `crates/daemon/bridge/tap_bridge.m` + `.h` — ObjC bridge for `AudioHardwareCreateProcessTap` and aggregate device creation. Compiled by `build.rs`.
 - `crates/daemon/src/tap.rs` — `TapManager`, FFI wrappers around the ObjC bridge.
 

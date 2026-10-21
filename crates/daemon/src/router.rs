@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
@@ -6,6 +7,7 @@ use coreaudio_sys::*;
 use spaghetti_common::ipc_protocol::RouteInfo;
 
 use crate::mixer;
+use crate::rt_slots::RtSlots;
 
 /// A live audio route: reads from a tap's aggregate device, writes to a virtual device.
 struct Route {
@@ -13,6 +15,7 @@ struct Route {
     tap_id: u32,
     device_uid: String,
     volume: Arc<AtomicU32>,
+    sink_slot: usize,
     output: OutputUnit,
 }
 
@@ -40,18 +43,20 @@ impl Router {
         dest_device_id: AudioObjectID,
         initial_volume: f32,
     ) -> Result<u32, String> {
-        if self.captures.contains_key(&tap_id) {
-            return Err(format!("tap {tap_id} is already routed"));
-        }
+        let capture = match self.captures.entry(tap_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(unsafe { TapCapture::open(source_aggregate_device) }?),
+        };
 
         let volume = Arc::new(AtomicU32::new(initial_volume.to_bits()));
-        let (capture, output) = unsafe {
-            start_route(source_aggregate_device, dest_device_id, Arc::clone(&volume))
-        }?;
+        let attached = unsafe { attach_route(capture, dest_device_id, Arc::clone(&volume)) };
+        if capture.is_idle() {
+            self.captures.remove(&tap_id);
+        }
+        let (sink_slot, output) = attached?;
 
         let id = self.next_id;
         self.next_id += 1;
-        self.captures.insert(tap_id, capture);
         self.routes.insert(
             id,
             Route {
@@ -59,6 +64,7 @@ impl Router {
                 tap_id,
                 device_uid: dest_device_uid.to_string(),
                 volume,
+                sink_slot,
                 output,
             },
         );
@@ -68,13 +74,24 @@ impl Router {
     }
 
     pub fn destroy_route(&mut self, route_id: u32) -> Result<(), String> {
-        let Route { tap_id, output, .. } = self
+        let Route {
+            tap_id,
+            sink_slot,
+            output,
+            ..
+        } = self
             .routes
             .remove(&route_id)
             .ok_or_else(|| format!("route {route_id} not found"))?;
 
         drop(output);
-        self.captures.remove(&tap_id);
+        if let Some(capture) = self.captures.get_mut(&tap_id) {
+            capture.remove_sink(sink_slot);
+            if capture.is_idle() {
+                self.captures.remove(&tap_id);
+                tracing::info!(tap_id, "stopped tap capture");
+            }
+        }
 
         tracing::info!(route_id, "destroyed route");
         Ok(())
@@ -272,7 +289,6 @@ unsafe impl Sync for RingBuffer {}
 
 // ── Capture side: one IOProc per tap ──────────────────────────────────────────
 
-/// Query the tap aggregate device's input stream format.
 unsafe fn query_device_stream_format(
     device: AudioObjectID,
 ) -> Result<AudioStreamBasicDescription, String> {
@@ -299,52 +315,104 @@ unsafe fn query_device_stream_format(
     Ok(format)
 }
 
-/// Owns the single IOProc registered on a tap's aggregate device.
-///
+const MAX_ROUTES_PER_TAP: usize = 8;
+
+type SinkSlots = RtSlots<Sink, MAX_ROUTES_PER_TAP>;
+
 /// Capture uses `AudioDeviceCreateIOProcID` + `AudioDeviceStart` directly on the
 /// tap aggregate device. This is the pattern Apple's `AudioCap` sample uses for
 /// process taps and avoids `-10863 kAudioUnitErr_CannotDoInCurrentContext` from
 /// pulling tap frames through an AUHAL input unit.
+///
+/// Claude: a tap aggregate runs only one IOProc. Starting a second one halts IO
+/// for every IOProc on the device, and removing it does not resume IO, so all
+/// routes on a tap share this IOProc and get their frames through `sinks`.
 struct TapCapture {
     device: AudioObjectID,
+    format: AudioStreamBasicDescription,
     ioproc_id: AudioDeviceIOProcID,
-    sink: *mut Sink,
+    sinks: Arc<SinkSlots>,
+    running: bool,
 }
 
-// Safety: the sink is only dereferenced by the IOProc while it is registered.
-unsafe impl Send for TapCapture {}
-
 impl TapCapture {
-    unsafe fn start(device: AudioObjectID, sink: Sink) -> Result<Self, String> {
-        let sink = Box::into_raw(Box::new(sink));
+    unsafe fn open(device: AudioObjectID) -> Result<Self, String> {
+        let format = unsafe { query_device_stream_format(device) }?;
+        if format.mSampleRate <= 0.0 || format.mBytesPerFrame == 0 {
+            return Err(format!(
+                "degenerate stream format from aggregate device (rate={}, bpf={})",
+                format.mSampleRate, format.mBytesPerFrame
+            ));
+        }
+        tracing::info!(
+            sample_rate = format.mSampleRate,
+            channels_per_frame = format.mChannelsPerFrame,
+            bytes_per_frame = format.mBytesPerFrame,
+            frames_per_packet = format.mFramesPerPacket,
+            bits_per_channel = format.mBitsPerChannel,
+            format_flags = format.mFormatFlags,
+            is_float = (format.mFormatFlags & kAudioFormatFlagIsFloat) != 0,
+            is_non_interleaved = (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0,
+            "tap ASBD (source aggregate device input scope)"
+        );
+
+        let sinks = Arc::new(SinkSlots::new());
         let mut ioproc_id: AudioDeviceIOProcID = None;
         let status = unsafe {
-            AudioDeviceCreateIOProcID(device, Some(capture_ioproc), sink.cast(), &mut ioproc_id)
+            AudioDeviceCreateIOProcID(
+                device,
+                Some(capture_ioproc),
+                Arc::as_ptr(&sinks).cast_mut().cast(),
+                &mut ioproc_id,
+            )
         };
         if status != 0 || ioproc_id.is_none() {
-            drop(unsafe { Box::from_raw(sink) });
             return Err(format!("AudioDeviceCreateIOProcID failed: {status:#010x}"));
         }
 
-        let capture = Self {
+        Ok(Self {
             device,
+            format,
             ioproc_id,
-            sink,
-        };
-        let status = unsafe { AudioDeviceStart(device, ioproc_id) };
-        if status != 0 {
-            return Err(format!("AudioDeviceStart (IOProc) failed: {status:#010x}"));
+            sinks,
+            running: false,
+        })
+    }
+
+    /// Publish `sink` to the IOProc, starting capture if it is not running yet.
+    unsafe fn add_sink(&mut self, sink: Sink) -> Result<usize, String> {
+        let slot = self
+            .sinks
+            .insert(Box::new(sink))
+            .map_err(|_| format!("a tap can feed at most {MAX_ROUTES_PER_TAP} routes"))?;
+
+        if !self.running {
+            let status = unsafe { AudioDeviceStart(self.device, self.ioproc_id) };
+            if status != 0 {
+                self.sinks.remove(slot);
+                return Err(format!("AudioDeviceStart (IOProc) failed: {status:#010x}"));
+            }
+            self.running = true;
         }
-        Ok(capture)
+        Ok(slot)
+    }
+
+    fn remove_sink(&mut self, slot: usize) {
+        drop(self.sinks.remove(slot));
+    }
+
+    fn is_idle(&self) -> bool {
+        self.sinks.is_empty()
     }
 }
 
 impl Drop for TapCapture {
     fn drop(&mut self) {
         unsafe {
-            AudioDeviceStop(self.device, self.ioproc_id);
+            if self.running {
+                AudioDeviceStop(self.device, self.ioproc_id);
+            }
             AudioDeviceDestroyIOProcID(self.device, self.ioproc_id);
-            drop(Box::from_raw(self.sink));
         }
     }
 }
@@ -354,8 +422,6 @@ impl Drop for TapCapture {
 /// allocation in the real-time IOProc.
 const CONV_BUF_FRAMES: usize = 2048;
 
-/// One route's share of a tap capture: converts tap frames to the route's
-/// destination format and feeds that route's ring buffer.
 struct Sink {
     converter: AudioConverterRef,
     ring: Arc<RingBuffer>,
@@ -363,6 +429,10 @@ struct Sink {
     conv_out_ch1: Vec<f32>,
     logged_once: bool,
 }
+
+// Claude: the converter is not bound to a thread; `RtSlots` guarantees one
+// thread uses a sink at a time.
+unsafe impl Send for Sink {}
 
 impl Sink {
     unsafe fn new(
@@ -602,8 +672,8 @@ unsafe extern "C" fn capture_ioproc(
         return 0;
     }
 
-    let sink = unsafe { &mut *(in_client_data as *mut Sink) };
-    unsafe { sink.push(in_input_data) };
+    let sinks = unsafe { &*(in_client_data as *const SinkSlots) };
+    unsafe { sinks.for_each(|sink| sink.push(in_input_data)) };
     0
 }
 
@@ -900,42 +970,25 @@ unsafe fn destination_format(
     dst_asbd
 }
 
-/// Start capturing `source_device` into a new ring and play that ring on `dest_device`.
-///
-/// All resources are released on failure; the caller does not need to clean up.
-unsafe fn start_route(
-    source_device: AudioObjectID,
+/// Feed `capture` into a new ring and play that ring on `dest_device`. Returns
+/// the sink slot and the running output unit; releases everything on failure.
+unsafe fn attach_route(
+    capture: &mut TapCapture,
     dest_device: AudioObjectID,
     volume: Arc<AtomicU32>,
-) -> Result<(TapCapture, OutputUnit), String> {
-    let format = unsafe { query_device_stream_format(source_device) }?;
-    if format.mSampleRate <= 0.0 || format.mBytesPerFrame == 0 {
-        return Err(format!(
-            "degenerate stream format from aggregate device (rate={}, bpf={})",
-            format.mSampleRate, format.mBytesPerFrame
-        ));
-    }
-    tracing::info!(
-        sample_rate = format.mSampleRate,
-        channels_per_frame = format.mChannelsPerFrame,
-        bytes_per_frame = format.mBytesPerFrame,
-        frames_per_packet = format.mFramesPerPacket,
-        bits_per_channel = format.mBitsPerChannel,
-        format_flags = format.mFormatFlags,
-        is_float = (format.mFormatFlags & kAudioFormatFlagIsFloat) != 0,
-        is_non_interleaved = (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0,
-        "tap ASBD (source aggregate device input scope)"
-    );
-
+) -> Result<(usize, OutputUnit), String> {
     let mut output = unsafe { OutputUnit::new(dest_device) }?;
-    let dst_asbd = unsafe { destination_format(&output, &format) };
+    let dst_asbd = unsafe { destination_format(&output, &capture.format) };
 
     let ring = Arc::new(RingBuffer::new());
-    let sink = unsafe { Sink::new(&format, &dst_asbd, Arc::clone(&ring)) }?;
+    let sink = unsafe { Sink::new(&capture.format, &dst_asbd, Arc::clone(&ring)) }?;
     unsafe { output.connect(ring, volume) }?;
 
-    let capture = unsafe { TapCapture::start(source_device, sink) }?;
-    unsafe { output.start() }?;
+    let slot = unsafe { capture.add_sink(sink) }?;
+    if let Err(e) = unsafe { output.start() } {
+        capture.remove_sink(slot);
+        return Err(e);
+    }
 
-    Ok((capture, output))
+    Ok((slot, output))
 }

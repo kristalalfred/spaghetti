@@ -9,6 +9,7 @@ mod audio;
 mod device_manager;
 mod mixer;
 mod router;
+mod rt_slots;
 mod server;
 mod tap;
 
