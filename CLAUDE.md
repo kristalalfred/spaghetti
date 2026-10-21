@@ -34,15 +34,16 @@ target app
   → Core Audio process tap (AudioHardwareCreateProcessTap)
   → private aggregate device (wraps the tap + a main sub-device for clocking)
   → one IOProc per tap (AudioDeviceCreateIOProcID) delivers AudioBufferList directly
-  → per route sink (lock-free `RtSlots` the IOProc iterates):
-      AudioConverter (SRC: tap rate → dest rate, interleaved → non-interleaved)
-      → SPSC ring buffer (in router.rs)
-  → per route output AUHAL render callback (runs at device-native format, no conversion)
+  → per route sink (lock-free `RtSlots` the IOProc iterates) → SPSC ring of tap-rate frames
+  → per route output AUHAL render callback: rubato async resampler (tap rate → dest rate)
+    pulls exactly the input it needs; the AUHAL runs at the device-native format
   → destination device
 ```
 
 Key files:
-- `crates/daemon/src/router.rs` — the whole routing graph. `TapCapture` + `capture_ioproc` (capture side), `Sink` (per-route converter + ring producer), `OutputUnit` + `route_render_callback` (output side), `attach_route`, ring buffer.
+- `crates/daemon/src/router.rs` — the routing graph and its Core Audio glue. `TapCapture` + `capture_ioproc` (capture side), `Sink` (per-route ring producer), `OutputUnit` + `route_render_callback` (output side), `attach_route`.
+- `crates/daemon/src/playout.rs` — `Playout`, a route's output side: the resampler between the ring and the render callback.
+- `crates/daemon/src/ring.rs` — the SPSC ring of interleaved stereo frames.
 - `crates/daemon/src/rt_slots.rs` — `RtSlots`, the lock-free handoff that lets routes join and leave a running tap capture.
 - `crates/daemon/bridge/tap_bridge.m` + `.h` — ObjC bridge for `AudioHardwareCreateProcessTap` and aggregate device creation. Compiled by `build.rs`.
 - `crates/daemon/src/tap.rs` — `TapManager`, FFI wrappers around the ObjC bridge.
@@ -53,13 +54,13 @@ Key files:
 
 **Private tap aggregates need a main sub-device.** Without `kAudioAggregateDeviceMainSubDeviceKey` pointing at a real output device (currently we use the system default output), the aggregate has no clock source and the IOProc never fires. See `tap_bridge.m` `spaghetti_create_aggregate_for_tap`.
 
-**`coreaudio_sys::AudioBufferList` is a flexible-array-member trap.** It's declared `mBuffers: [AudioBuffer; 1]`. Writing to `mBuffers.as_mut_ptr().add(i)` for `i ≥ 1` is out-of-provenance in Rust → UB → Core Audio's validator rejects the ABL with `-50 paramErr`. When building a multi-buffer ABL on the stack, use a `#[repr(C)]` wrapper struct with a correctly-sized array (see `Abl2` in `router.rs`). When reading/writing a multi-buffer ABL handed in from C, compute byte offsets via `mem::offset_of!(AudioBufferList, mBuffers)` instead of going through the `[AudioBuffer; 1]` field.
+**`coreaudio_sys::AudioBufferList` is a flexible-array-member trap.** It's declared `mBuffers: [AudioBuffer; 1]`. Writing to `mBuffers.as_mut_ptr().add(i)` for `i ≥ 1` is out-of-provenance in Rust → UB → Core Audio's validator rejects the ABL with `-50 paramErr`. When building a multi-buffer ABL on the stack, use a `#[repr(C)]` wrapper struct with a correctly-sized array. When reading/writing a multi-buffer ABL handed in from C, compute byte offsets via `mem::offset_of!(AudioBufferList, mBuffers)` instead of going through the `[AudioBuffer; 1]` field.
 
-**Tap ASBD ≠ IOProc delivery shape.** Process taps report themselves as one thing via `kAudioDevicePropertyStreamFormat` but can deliver a different layout in the IOProc. In practice we see **interleaved stereo f32** (`mNumberBuffers=1, mNumberChannels=2, mBytesPerFrame=8, mFormatFlags=9`) even when other codepaths imply non-interleaved. Design the converter + output ABL shape around `dst_asbd`, not around the input ABL's buffer count.
+**Tap ASBD ≠ IOProc delivery shape.** Process taps report themselves as one thing via `kAudioDevicePropertyStreamFormat` but can deliver a different layout in the IOProc. In practice we see **interleaved stereo f32** (`mNumberBuffers=1, mNumberChannels=2, mBytesPerFrame=8, mFormatFlags=9`) even when other codepaths imply non-interleaved. `Sink::push` accepts either layout.
 
 **`AudioConverterFillComplexBuffer` output ABL must match the destination ASBD's layout.** For non-interleaved stereo output, the output ABL needs `mNumberBuffers = 2`, each with `mNumberChannels = 1`. Sizing it from the input ABL (which might be interleaved, so `mNumberBuffers = 1`) gives `-50 paramErr`.
 
-**Sample rate conversion: do it on the input side.** Converting in the IOProc before the ring buffer means ring + output AUHAL both run at destination-native rate. Cleaner than plumbing an `AudioConverter` through the render callback.
+**Sample rate conversion happens per route on the output side, with rubato.** The render callback needs an exact frame count, which a fixed-output resampler provides by pulling a variable amount from the ring. `AudioConverter` was dropped because it resets its filter, and glitches, whenever its rate is changed at runtime.
 
 ## IPC
 
@@ -92,7 +93,7 @@ The activity shm is still single-region — only the first (default) device feed
 - Edition 2024.
 - `anyhow` for app-level errors, `Result<T, String>` in some places (daemon_mgmt, router setup).
 - Logging via `tracing`; default filter is `info`. Real-time paths (IOProc, render callback) use first-fire gates so we log once per route, not per callback.
-- No heap allocation in real-time callbacks. Pre-allocate buffers in `Sink` / `OutputCallbackState`.
+- No heap allocation in real-time callbacks. Pre-allocate buffers in `Playout` / `OutputCallbackState`.
 - No AI attribution in commits.
 
 ## Diagnostic logging in router.rs
@@ -100,10 +101,9 @@ The activity shm is still single-region — only the first (default) device feed
 Real-time paths emit first-fire diagnostics that are invaluable for debugging format/rate mismatches:
 - `tap ASBD` — source format from `query_device_stream_format`.
 - `destination device format` — the device side of the output AUHAL; its rate is the route's rate.
-- `dst_asbd` — the converter output format, also set as the output AUHAL's client format.
-- `created AudioConverter` — `resampling=true` only when tap and device rates differ.
-- `IOProc first call — pre-converter parameters` — input/output ABL shapes fed to `AudioConverterFillComplexBuffer`.
-- `IOProc first call — post-converter result` — `conv_status` and actual frame count.
-- `render callback first fire` — output ABL layout and `frames_popped` from ring.
+- `dst_asbd` — the output AUHAL's client format.
+- `created resampler` — tap and device rates and the resampler's delay in frames.
+- `IOProc first call` — the ABL shape the tap actually delivers.
+- `render callback first fire` — output ABL layout and the ring fill at the first render.
 
 Grep these strings in `~/Library/Logs/spaghetti/spaghettid.log` when routing breaks.

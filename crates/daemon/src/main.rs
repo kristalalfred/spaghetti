@@ -8,6 +8,8 @@ mod activity;
 mod audio;
 mod device_manager;
 mod mixer;
+mod playout;
+mod ring;
 mod router;
 mod rt_slots;
 mod server;
