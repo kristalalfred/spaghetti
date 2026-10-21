@@ -41,7 +41,7 @@ target app
 ```
 
 Key files:
-- `crates/daemon/src/router.rs` — the whole routing graph. `setup_audio_route`, `route_ioproc`, `route_render_callback`, ring buffer.
+- `crates/daemon/src/router.rs` — the whole routing graph. `TapCapture` + `capture_ioproc` (capture side), `Sink` (per-route converter + ring producer), `OutputUnit` + `route_render_callback` (output side), `start_route`, ring buffer.
 - `crates/daemon/bridge/tap_bridge.m` + `.h` — ObjC bridge for `AudioHardwareCreateProcessTap` and aggregate device creation. Compiled by `build.rs`.
 - `crates/daemon/src/tap.rs` — `TapManager`, FFI wrappers around the ObjC bridge.
 
@@ -89,8 +89,8 @@ The activity shm is still single-region — only the first (default) device feed
 
 - Edition 2024.
 - `anyhow` for app-level errors, `Result<T, String>` in some places (daemon_mgmt, router setup).
-- Logging via `tracing`; default filter is `info`. Real-time paths (IOProc, render callback) use first-fire `AtomicBool` gates so we log once per route, not per callback.
-- No heap allocation in real-time callbacks. Pre-allocate buffers in `InputCallbackState` / `OutputCallbackState`.
+- Logging via `tracing`; default filter is `info`. Real-time paths (IOProc, render callback) use first-fire gates so we log once per route, not per callback.
+- No heap allocation in real-time callbacks. Pre-allocate buffers in `Sink` / `OutputCallbackState`.
 - No AI attribution in commits.
 
 ## Diagnostic logging in router.rs
