@@ -17,16 +17,26 @@ const ACTIVITY_FRESHNESS_NS: u64 = 200_000_000;
 
 /// Shared daemon state accessible by all client handlers.
 pub struct DaemonState {
-    pub tap_manager: TapManager,
+    /// Claude: declared before `tap_manager` so routes are torn down before their taps on drop.
     pub router: Router,
+    pub tap_manager: TapManager,
 }
 
 impl DaemonState {
     pub fn new() -> Self {
         Self {
-            tap_manager: TapManager::new(),
             router: Router::new(),
+            tap_manager: TapManager::new(),
         }
+    }
+
+    /// Claude: a route has nothing to play once its tap is gone, so its routes go first.
+    fn destroy_tap(&mut self, tap_id: u32) -> Result<(), String> {
+        if self.tap_manager.get_tap(tap_id).is_none() {
+            return Err(format!("tap {tap_id} not found"));
+        }
+        self.router.destroy_routes_from_tap(tap_id);
+        self.tap_manager.destroy_tap(tap_id)
     }
 }
 
@@ -151,7 +161,7 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
         }
         Request::DestroyTap { tap_id } => {
             let mut st = lock_state(state);
-            match st.tap_manager.destroy_tap(tap_id) {
+            match st.destroy_tap(tap_id) {
                 Ok(()) => Response::Ok,
                 Err(message) => Response::Error { message },
             }

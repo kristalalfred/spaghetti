@@ -97,6 +97,18 @@ impl Router {
         Ok(())
     }
 
+    pub fn destroy_routes_from_tap(&mut self, tap_id: u32) {
+        let route_ids: Vec<u32> = self
+            .routes
+            .values()
+            .filter(|r| r.tap_id == tap_id)
+            .map(|r| r.route_id)
+            .collect();
+        for route_id in route_ids {
+            let _ = self.destroy_route(route_id);
+        }
+    }
+
     pub fn set_volume(&mut self, route_id: u32, volume: f32) -> Result<(), String> {
         let route = self
             .routes
