@@ -7,7 +7,7 @@ use coreaudio_sys::*;
 use spaghetti_common::ipc_protocol::RouteInfo;
 
 use crate::mixer;
-use crate::playout::Playout;
+use crate::playout::{Playout, PlayoutHealth};
 use crate::ring::{CHANNELS, Ring};
 use crate::rt_slots::RtSlots;
 
@@ -17,8 +17,16 @@ struct Route {
     tap_id: u32,
     device_uid: String,
     volume: Arc<AtomicU32>,
+    playback: Playback,
+}
+
+/// Claude: what a route owns once it is attached to its tap's capture.
+struct Playback {
     sink_slot: usize,
     output: OutputUnit,
+    ring: Arc<Ring>,
+    health: Arc<PlayoutHealth>,
+    reported_glitches: [u32; 3],
 }
 
 /// Manages audio routes between taps and virtual devices.
@@ -55,7 +63,7 @@ impl Router {
         if capture.is_idle() {
             self.captures.remove(&tap_id);
         }
-        let (sink_slot, output) = attached?;
+        let playback = attached?;
 
         let id = self.next_id;
         self.next_id += 1;
@@ -66,8 +74,7 @@ impl Router {
                 tap_id,
                 device_uid: dest_device_uid.to_string(),
                 volume,
-                sink_slot,
-                output,
+                playback,
             },
         );
 
@@ -77,18 +84,15 @@ impl Router {
 
     pub fn destroy_route(&mut self, route_id: u32) -> Result<(), String> {
         let Route {
-            tap_id,
-            sink_slot,
-            output,
-            ..
+            tap_id, playback, ..
         } = self
             .routes
             .remove(&route_id)
             .ok_or_else(|| format!("route {route_id} not found"))?;
 
-        drop(output);
+        drop(playback.output);
         if let Some(capture) = self.captures.get_mut(&tap_id) {
-            capture.remove_sink(sink_slot);
+            capture.remove_sink(playback.sink_slot);
             if capture.is_idle() {
                 self.captures.remove(&tap_id);
                 tracing::info!(tap_id, "stopped tap capture");
@@ -137,6 +141,35 @@ impl Router {
 
     pub fn route_count(&self) -> u32 {
         self.routes.len() as u32
+    }
+
+    pub fn log_health(&mut self) {
+        for route in self.routes.values_mut() {
+            let playback = &mut route.playback;
+            let report = playback.health.report();
+            let glitches = [report.underruns, report.resyncs, playback.ring.overflows()];
+            let to_ms = |frames: f64| frames * 1000.0 / playback.health.source_rate;
+            tracing::debug!(
+                route_id = route.route_id,
+                fill_frames = report.fill_avg_frames,
+                fill_ms = to_ms(report.fill_avg_frames as f64),
+                target_ms = to_ms(report.target_frames as f64),
+                underruns = glitches[0],
+                resyncs = glitches[1],
+                overflows = glitches[2],
+                "route playout health"
+            );
+            if glitches != playback.reported_glitches {
+                tracing::info!(
+                    route_id = route.route_id,
+                    underruns = glitches[0] - playback.reported_glitches[0],
+                    resyncs = glitches[1] - playback.reported_glitches[1],
+                    overflows = glitches[2] - playback.reported_glitches[2],
+                    "route playout glitched since the last report"
+                );
+                playback.reported_glitches = glitches;
+            }
+        }
     }
 
     /// Return every route ID currently targeting the given device UID.
@@ -325,28 +358,27 @@ struct Sink {
 impl Sink {
     /// Claude: `input` must be the ABL the HAL handed to the IOProc. Taps deliver
     /// interleaved stereo in practice whatever their ASBD says, so both layouts are accepted.
-    unsafe fn push(&mut self, input: *const AudioBufferList) {
+    unsafe fn push(&mut self, input: *const AudioBufferList, now: u64) {
         let buffers = unsafe { abl_buffers(input) };
         let Some(first) = buffers.first() else {
             return;
         };
 
-        let (frames, pushed) = if let [left, right, ..] = buffers {
+        let frames = if let [left, right, ..] = buffers {
             let frames = left.mDataByteSize.min(right.mDataByteSize) as usize
                 / std::mem::size_of::<f32>();
             let planes = unsafe { [buffer_samples(left), buffer_samples(right)] };
-            let pushed = self
-                .ring
-                .push_with(frames, |f, ch| planes[ch].map_or(0.0, |s| s[f]));
-            (frames, pushed)
+            self.ring
+                .push_with(frames, now, |f, ch| planes[ch].map_or(0.0, |s| s[f]));
+            frames
         } else {
             let channels = first.mNumberChannels.max(1) as usize;
             let frames = first.mDataByteSize as usize / (channels * std::mem::size_of::<f32>());
             let samples = unsafe { buffer_samples(first) };
-            let pushed = self.ring.push_with(frames, |f, ch| {
+            self.ring.push_with(frames, now, |f, ch| {
                 samples.map_or(0.0, |s| s[f * channels + ch.min(channels - 1)])
             });
-            (frames, pushed)
+            frames
         };
 
         if !self.logged_once {
@@ -359,9 +391,6 @@ impl Sink {
                 frames,
                 "IOProc first call"
             );
-        }
-        if !pushed {
-            tracing::warn!(dropped = frames, "ring buffer full, dropping samples");
         }
     }
 }
@@ -379,8 +408,9 @@ unsafe extern "C" fn capture_ioproc(
         return 0;
     }
 
+    let now = unsafe { AudioGetCurrentHostTime() };
     let sinks = unsafe { &*(in_client_data as *const SinkSlots) };
-    unsafe { sinks.for_each(|sink| sink.push(in_input_data)) };
+    unsafe { sinks.for_each(|sink| sink.push(in_input_data, now)) };
     0
 }
 
@@ -571,6 +601,7 @@ unsafe extern "C" fn route_render_callback(
         return 0;
     }
 
+    let now = unsafe { AudioGetCurrentHostTime() };
     let state = unsafe { &mut *(in_ref_con as *mut OutputCallbackState) };
     let buffers = unsafe { abl_buffers_mut(io_data) };
     let n_buffers = buffers.len();
@@ -585,7 +616,7 @@ unsafe extern "C" fn route_render_callback(
         return 0;
     };
 
-    state.playout.render(&state.ring, &mut out);
+    state.playout.render(&state.ring, &mut out, now);
 
     let vol = f32::from_bits(state.volume.load(Ordering::Relaxed));
     for plane in out.iter_mut() {
@@ -629,7 +660,7 @@ unsafe fn attach_route(
     capture: &mut TapCapture,
     dest_device: AudioObjectID,
     volume: Arc<AtomicU32>,
-) -> Result<(usize, OutputUnit), String> {
+) -> Result<Playback, String> {
     let mut output = unsafe { OutputUnit::new(dest_device) }?;
 
     let device_format = unsafe { output.device_format() }?;
@@ -651,7 +682,12 @@ unsafe fn attach_route(
     );
     unsafe { output.set_client_format(&dst_asbd) }?;
 
-    let playout = Playout::new(capture.format.mSampleRate, dst_asbd.mSampleRate)?;
+    let playout = Playout::new(
+        capture.format.mSampleRate,
+        dst_asbd.mSampleRate,
+        unsafe { AudioGetHostClockFrequency() },
+    )?;
+    let health = playout.health();
     tracing::info!(
         src_rate = capture.format.mSampleRate,
         dst_rate = dst_asbd.mSampleRate,
@@ -662,16 +698,22 @@ unsafe fn attach_route(
     let ring = Arc::new(Ring::new());
     unsafe { output.connect(Arc::clone(&ring), playout, volume) }?;
 
-    let slot = unsafe {
+    let sink_slot = unsafe {
         capture.add_sink(Sink {
-            ring,
+            ring: Arc::clone(&ring),
             logged_once: false,
         })
     }?;
     if let Err(e) = unsafe { output.start() } {
-        capture.remove_sink(slot);
+        capture.remove_sink(sink_slot);
         return Err(e);
     }
 
-    Ok((slot, output))
+    Ok(Playback {
+        sink_slot,
+        output,
+        ring,
+        health,
+        reported_glitches: [0; 3],
+    })
 }

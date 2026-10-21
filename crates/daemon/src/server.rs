@@ -15,6 +15,8 @@ use crate::tap::{self, TapManager};
 /// and the activity snapshot is considered stale (driver idle or gone).
 const ACTIVITY_FRESHNESS_NS: u64 = 200_000_000;
 
+const HEALTH_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Shared daemon state accessible by all client handlers.
 pub struct DaemonState {
     /// Claude: declared before `tap_manager` so routes are torn down before their taps on drop.
@@ -90,8 +92,10 @@ impl Server {
     }
 
     pub async fn run(&self) {
+        let mut health_log = tokio::time::interval(HEALTH_LOG_INTERVAL);
         loop {
             tokio::select! {
+                _ = health_log.tick() => lock_state(&self.shared.state).router.log_health(),
                 accept = self.listener.accept() => {
                     match accept {
                         Ok((stream, _)) => {
