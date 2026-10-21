@@ -1,8 +1,11 @@
 //! Spaghetti AudioServerPlugin driver.
 //! Loaded by coreaudiod to create virtual audio devices.
 
-mod driver;
+mod devices;
+pub(crate) mod driver;
 mod iface;
+pub(crate) mod registry;
+mod watcher;
 
 use std::ffi::c_void;
 
@@ -29,16 +32,25 @@ const PLUGIN_TYPE_UUID: CFUUIDBytes = CFUUIDBytes {
     byte12: 0x18, byte13: 0x70, byte14: 0x30, byte15: 0xDB,
 };
 
+fn uuid_bytes(u: &CFUUIDBytes) -> [u8; 16] {
+    [
+        u.byte0, u.byte1, u.byte2, u.byte3, u.byte4, u.byte5, u.byte6, u.byte7,
+        u.byte8, u.byte9, u.byte10, u.byte11, u.byte12, u.byte13, u.byte14, u.byte15,
+    ]
+}
+
 pub(crate) fn uuid_eq(a: &CFUUIDBytes, b: &CFUUIDBytes) -> bool {
-    unsafe {
-        std::slice::from_raw_parts(a as *const CFUUIDBytes as *const u8, 16)
-            == std::slice::from_raw_parts(b as *const CFUUIDBytes as *const u8, 16)
-    }
+    uuid_bytes(a) == uuid_bytes(b)
 }
 
 /// The CFPlugIn factory function. coreaudiod calls this after loading the bundle,
 /// passing the UUID of the interface it wants. We return the driver ref if it
 /// matches `kAudioServerPlugInTypeUUID`.
+///
+/// # Safety
+///
+/// `requested_type_uuid` must be a valid, non-null `CFUUIDRef` allocated by
+/// Core Foundation. The caller (coreaudiod / CFPlugIn) always guarantees this.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spaghetti_create(
     _allocator: CFAllocatorRef,

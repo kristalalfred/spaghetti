@@ -16,7 +16,7 @@ echo "Removing ${DRIVER_NAME}..."
 sudo rm -rf "${INSTALL_DIR}/${DRIVER_NAME}"
 
 echo "Removing binaries..."
-sudo rm -f "${BIN_DIR}/spaghettid" "${BIN_DIR}/spaghetti"
+sudo rm -f "${BIN_DIR}/spaghettid" "${BIN_DIR}/spaghetti" "${BIN_DIR}/spaghetti-tui"
 
 echo "Done. Restart coreaudiod to release the device:"
 echo "  sudo killall coreaudiod"

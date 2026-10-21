@@ -51,8 +51,9 @@ fn draw_device_list(frame: &mut Frame, area: Rect, state: &AppState) {
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(inner);
 
+    let uid_w = devices.iter().map(|d| d.uid.chars().count()).max().unwrap_or(0).max(36) + 2;
     let header = Line::from(vec![
-        Span::styled(format!("{:<38}", "UID"), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:<uid_w$}", "UID"), Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{:<24}", "Name"), Style::default().fg(Color::DarkGray)),
         Span::styled("Ch", Style::default().fg(Color::DarkGray)),
     ]);
@@ -76,11 +77,11 @@ fn draw_device_list(frame: &mut Frame, area: Rect, state: &AppState) {
             let armed = armed_uid == Some(dev.uid.as_str());
             let text = if armed {
                 format!(
-                    "{:<38}{:<24}{}  [press d again to destroy]",
+                    "{:<uid_w$}{:<24}{}  [press d again to destroy]",
                     dev.uid, dev.name, dev.channels,
                 )
             } else {
-                format!("{:<38}{:<24}{}", dev.uid, dev.name, dev.channels)
+                format!("{:<uid_w$}{:<24}{}", dev.uid, dev.name, dev.channels)
             };
 
             let style = if armed {

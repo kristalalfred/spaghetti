@@ -105,6 +105,9 @@ pub struct DeviceInfo {
     pub uid: String,
     pub name: String,
     pub channels: u32,
+    /// True for the built-in Spaghetti device that cannot be destroyed.
+    #[serde(default)]
+    pub is_default: bool,
 }
 
 /// A CoreAudio device as seen by the system — not necessarily daemon-managed.

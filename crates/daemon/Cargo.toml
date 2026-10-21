@@ -20,6 +20,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 libc = "0.2"
+uuid = { version = "1", features = ["v4", "fast-rng"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [build-dependencies]
 cc = "1"

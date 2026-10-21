@@ -188,11 +188,12 @@ fn print_routes(routes: &[RouteInfo]) {
         println!("No active routes.");
         return;
     }
-    println!("{:<6} {:<6} {:<30} VOLUME", "ID", "TAP", "DEVICE");
-    println!("{}", "-".repeat(55));
+    let dev_w = col_width(routes.iter().map(|r| r.device_uid.as_str()), 30);
+    println!("{:<6} {:<6} {:<dev_w$} VOLUME", "ID", "TAP", "DEVICE");
+    println!("{}", "-".repeat(dev_w + 21));
     for route in routes {
         println!(
-            "{:<6} {:<6} {:<30} {:.2}",
+            "{:<6} {:<6} {:<dev_w$} {:.2}",
             route.route_id, route.tap_id, route.device_uid, route.volume
         );
     }
@@ -203,11 +204,13 @@ fn print_system_devices(devices: &[SystemDeviceInfo]) {
         println!("No audio devices found.");
         return;
     }
-    println!("{:<40} {:<24} {:<8} TYPE", "UID", "NAME", "CHANNELS");
-    println!("{}", "-".repeat(80));
+    let uid_w = col_width(devices.iter().map(|d| d.uid.as_str()), 40);
+    let name_w = col_width(devices.iter().map(|d| d.name.as_str()), 24);
+    println!("{:<uid_w$} {:<name_w$} {:<8} TYPE", "UID", "NAME", "CHANNELS");
+    println!("{}", "-".repeat(uid_w + name_w + 16));
     for d in devices {
         let kind = if d.is_output { "output" } else { "input" };
-        println!("{:<40} {:<24} {:<8} {}", d.uid, d.name, d.channels, kind);
+        println!("{:<uid_w$} {:<name_w$} {:<8} {}", d.uid, d.name, d.channels, kind);
     }
 }
 
@@ -216,11 +219,18 @@ fn print_devices(devices: &[DeviceInfo]) {
         println!("No virtual devices.");
         return;
     }
-    println!("{:<40} {:<24} CHANNELS", "UID", "NAME");
-    println!("{}", "-".repeat(70));
+    let uid_w = col_width(devices.iter().map(|d| d.uid.as_str()), 40);
+    let name_w = col_width(devices.iter().map(|d| d.name.as_str()), 24);
+    println!("{:<uid_w$} {:<name_w$} {:<8} FLAGS", "UID", "NAME", "CHANNELS");
+    println!("{}", "-".repeat(uid_w + name_w + 31));
     for d in devices {
-        println!("{:<40} {:<24} {}", d.uid, d.name, d.channels);
+        let flags = if d.is_default { "(default, protected)" } else { "" };
+        println!("{:<uid_w$} {:<name_w$} {:<8} {}", d.uid, d.name, d.channels, flags);
     }
+}
+
+fn col_width<'a>(values: impl Iterator<Item = &'a str>, min: usize) -> usize {
+    values.map(|v| v.chars().count()).max().unwrap_or(0).max(min)
 }
 
 fn print_error(msg: &str) {

@@ -19,7 +19,6 @@ const ACTIVITY_FRESHNESS_NS: u64 = 200_000_000;
 pub struct DaemonState {
     pub tap_manager: TapManager,
     pub router: Router,
-    pub device_manager: DeviceManager,
 }
 
 impl DaemonState {
@@ -27,7 +26,6 @@ impl DaemonState {
         Self {
             tap_manager: TapManager::new(),
             router: Router::new(),
-            device_manager: DeviceManager::new(),
         }
     }
 }
@@ -42,26 +40,42 @@ pub struct ActivityState {
     pub fps: FpsTracker,
 }
 
+/// Claude: `devices` stays outside the `state` mutex because device
+/// create/destroy waits on coreaudiod and must not block other requests.
+struct Shared {
+    state: Mutex<DaemonState>,
+    devices: DeviceManager,
+    activity: ActivityState,
+    cancel: CancellationToken,
+}
+
 pub struct Server {
     listener: UnixListener,
-    state: Arc<Mutex<DaemonState>>,
-    activity: Arc<ActivityState>,
+    shared: Arc<Shared>,
     pub cancel: CancellationToken,
 }
 
 impl Server {
-    pub async fn bind(activity_reader: Option<ActivityReader>) -> std::io::Result<Self> {
+    pub async fn bind(
+        activity_reader: Option<ActivityReader>,
+        device_manager: DeviceManager,
+    ) -> std::io::Result<Self> {
         // Remove stale socket file if it exists from a previous run
         let _ = std::fs::remove_file(SOCKET_PATH);
         let listener = UnixListener::bind(SOCKET_PATH)?;
+        let cancel = CancellationToken::new();
         Ok(Self {
             listener,
-            state: Arc::new(Mutex::new(DaemonState::new())),
-            activity: Arc::new(ActivityState {
-                reader: Mutex::new(activity_reader),
-                fps: FpsTracker::new(),
+            shared: Arc::new(Shared {
+                state: Mutex::new(DaemonState::new()),
+                devices: device_manager,
+                activity: ActivityState {
+                    reader: Mutex::new(activity_reader),
+                    fps: FpsTracker::new(),
+                },
+                cancel: cancel.clone(),
             }),
-            cancel: CancellationToken::new(),
+            cancel,
         })
     }
 
@@ -71,15 +85,12 @@ impl Server {
                 accept = self.listener.accept() => {
                     match accept {
                         Ok((stream, _)) => {
-                            let state = Arc::clone(&self.state);
-                            let activity = Arc::clone(&self.activity);
-                            let cancel = self.cancel.clone();
-                            tokio::spawn(handle_client(stream, state, activity, cancel));
+                            tokio::spawn(handle_client(stream, Arc::clone(&self.shared)));
                         }
                         Err(e) => tracing::error!("accept error: {e}"),
                     }
                 }
-                () = self.cancel.cancelled() => {
+                () = self.shared.cancel.cancelled() => {
                     tracing::info!("server shutting down");
                     return;
                 }
@@ -88,17 +99,12 @@ impl Server {
     }
 }
 
-async fn handle_client(
-    mut stream: UnixStream,
-    state: Arc<Mutex<DaemonState>>,
-    activity: Arc<ActivityState>,
-    cancel: CancellationToken,
-) {
+async fn handle_client(mut stream: UnixStream, shared: Arc<Shared>) {
     let peer = stream.peer_addr().map(|a| format!("{a:?}")).unwrap_or_else(|_| "unknown".into());
     loop {
         let response = match read_frame_async(&mut stream).await {
             Ok(buf) => match serde_json::from_slice::<Request>(&buf) {
-                Ok(req) => dispatch(req, &state, &activity, &cancel),
+                Ok(req) => dispatch(req, &shared).await,
                 Err(e) => {
                     tracing::warn!(peer = %peer, "unrecognised request: {e}");
                     Response::Error {
@@ -121,12 +127,8 @@ async fn handle_client(
     }
 }
 
-fn dispatch(
-    request: Request,
-    state: &Arc<Mutex<DaemonState>>,
-    activity: &Arc<ActivityState>,
-    cancel: &CancellationToken,
-) -> Response {
+async fn dispatch(request: Request, shared: &Shared) -> Response {
+    let state = &shared.state;
     match request {
         Request::Status => {
             let st = lock_state(state);
@@ -213,29 +215,31 @@ fn dispatch(
             }
         }
         Request::CreateDevice { name, channels } => {
-            let mut st = lock_state(state);
-            let ch = channels.unwrap_or(2);
-            match st.device_manager.create_device(&name, ch) {
-                Ok(device_uid) => Response::DeviceCreated { device_uid },
+            match shared.devices.create_device(&name, channels).await {
+                Ok(info) => Response::DeviceCreated { device_uid: info.uid },
                 Err(message) => Response::Error { message },
             }
         }
         Request::DestroyDevice { device_uid } => {
-            let mut st = lock_state(state);
-            match st.device_manager.destroy_device(&device_uid) {
-                Ok(()) => Response::Ok,
+            let removed = {
+                let st = lock_state(state);
+                let in_use = st.router.routes_targeting(&device_uid);
+                shared.devices.remove_device(&device_uid, &in_use)
+            };
+            match removed {
+                Ok(()) => {
+                    shared.devices.wait_until_removed(&device_uid).await;
+                    Response::Ok
+                }
                 Err(message) => Response::Error { message },
             }
         }
-        Request::ListDevices => {
-            let st = lock_state(state);
-            Response::Devices(st.device_manager.list_devices())
-        }
-        Request::GetActivity => Response::Activity(read_activity(activity)),
+        Request::ListDevices => Response::Devices(shared.devices.list_devices()),
+        Request::GetActivity => Response::Activity(read_activity(&shared.activity)),
         Request::ListSystemDevices => Response::SystemDevices(audio::list_all_devices()),
         Request::Shutdown => {
             tracing::info!("shutdown requested by client");
-            cancel.cancel();
+            shared.cancel.cancel();
             Response::Ok
         }
     }
@@ -246,7 +250,7 @@ fn dispatch(
 /// Returns zeroed / inactive values when the shm region is unavailable.
 /// If the region was not available at daemon start, attempts a lazy open on
 /// each call — the driver may have loaded after the daemon started.
-fn read_activity(activity: &Arc<ActivityState>) -> ActivityInfo {
+fn read_activity(activity: &ActivityState) -> ActivityInfo {
     let mut guard = match activity.reader.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
@@ -293,7 +297,7 @@ fn read_activity(activity: &Arc<ActivityState>) -> ActivityInfo {
 }
 
 /// Recover from a poisoned mutex rather than panicking the daemon.
-fn lock_state(state: &Arc<Mutex<DaemonState>>) -> std::sync::MutexGuard<'_, DaemonState> {
+fn lock_state(state: &Mutex<DaemonState>) -> std::sync::MutexGuard<'_, DaemonState> {
     match state.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {

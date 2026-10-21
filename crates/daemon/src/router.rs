@@ -143,6 +143,15 @@ impl Router {
     pub fn route_count(&self) -> u32 {
         self.routes.len() as u32
     }
+
+    /// Return every route ID currently targeting the given device UID.
+    pub fn routes_targeting(&self, device_uid: &str) -> Vec<u32> {
+        self.routes
+            .values()
+            .filter(|r| r.device_uid == device_uid)
+            .map(|r| r.route_id)
+            .collect()
+    }
 }
 
 impl Drop for Router {

@@ -8,6 +8,7 @@ RESET='\033[0m'
 DRIVER_NAME="Spaghetti.driver"
 HAL_DIR="/Library/Audio/Plug-Ins/HAL"
 BIN_DIR="/usr/local/bin"
+CONFIG_DIR="/Library/Application Support/Spaghetti"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -50,7 +51,7 @@ cargo build --release --workspace
 
 step "Assembling driver bundle"
 BUNDLE="target/release/${DRIVER_NAME}"
-rm -rf "$BUNDLE"
+sudo rm -rf "$BUNDLE"
 mkdir -p "$BUNDLE/Contents/MacOS"
 cp target/release/libspaghetti_asp.dylib "$BUNDLE/Contents/MacOS/"
 cp crates/asp-driver/Info.plist "$BUNDLE/Contents/"
@@ -74,6 +75,13 @@ sudo killall coreaudiod
 step "Installing binaries to ${BIN_DIR}"
 sudo cp target/release/spaghetti "${BIN_DIR}/spaghetti"
 sudo cp target/release/spaghettid "${BIN_DIR}/spaghettid"
+sudo cp target/release/spaghetti-tui "${BIN_DIR}/spaghetti-tui"
+
+# --- Device config (written by the daemon, read by the driver) ---
+
+step "Creating ${CONFIG_DIR} for ${TARGET_USER}"
+sudo mkdir -p "$CONFIG_DIR"
+sudo chown "$TARGET_USER" "$CONFIG_DIR"
 
 # --- LaunchAgent (delegated to the CLI so end users can manage it too) ---
 
@@ -86,6 +94,7 @@ echo ""
 echo -e "${BOLD}Installation complete.${RESET}"
 echo ""
 echo "Getting started:"
+echo "  Terminal UI:      spaghetti-tui"
 echo "  Watch output:     spaghetti monitor"
 echo "  List devices:     spaghetti devices"
 echo "  CLI help:         spaghetti --help"

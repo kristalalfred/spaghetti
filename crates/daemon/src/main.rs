@@ -26,10 +26,10 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("spaghettid starting...");
 
-    // Verify the Spaghetti virtual device exists.
-    let device_id = audio::find_device_by_uid("SpaghettiDevice_UID")
-        .ok_or_else(|| anyhow::anyhow!("Spaghetti virtual device not found. Is the driver installed?"))?;
-    tracing::info!("Found Spaghetti device: object_id={device_id}");
+    // Bootstrap the device config file before anything else. On a fresh
+    // install this writes the default entry so the HAL plugin can publish
+    // `SpaghettiDevice_UID` when it loads.
+    let device_manager = device_manager::DeviceManager::new();
 
     // Activity shm is a soft dependency — daemon keeps running if the driver's
     // shm region is unavailable (reads will just return defaults).
@@ -44,9 +44,20 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Start the control socket server.
-    let server = server::Server::bind(activity_reader).await?;
+    // Start the control socket server FIRST — the TUI/CLI need to be able to
+    // connect regardless of whether CoreAudio is ready. Device lookups happen
+    // lazily when requests come in.
+    let server = server::Server::bind(activity_reader, device_manager).await?;
     tracing::info!("Listening on {}", spaghetti_common::ipc_protocol::SOCKET_PATH);
+
+    // Probe for the virtual device in the background so we log whether the
+    // driver is installed without blocking the socket bind.
+    tokio::task::spawn_blocking(|| match audio::find_device_by_uid("SpaghettiDevice_UID") {
+        Some(id) => tracing::info!("Found Spaghetti device: object_id={id}"),
+        None => tracing::warn!(
+            "Spaghetti virtual device not found — is the driver installed and coreaudiod loaded it?"
+        ),
+    });
 
     let mut sigterm = signal::unix::signal(SignalKind::terminate())?;
 

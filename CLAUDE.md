@@ -63,6 +63,22 @@ Key files:
 
 Unix domain socket at `spaghetti_common::ipc_protocol::SOCKET_PATH`. Request/response enum in `crates/common/src/ipc_protocol.rs`. Daemon dispatches in `crates/daemon/src/server.rs`. Clients: sync `crates/cli/src/client.rs`, async `crates/common/src/async_client.rs` (used by TUI).
 
+## Virtual devices — the multi-device model
+
+The plugin publishes N independent virtual devices, each with its own ring buffer, ASBD, and volume/mute controls. Per-device state lives in `DeviceInstance`; the plugin holds an `ArcSwap<DeviceRegistry>` keyed by object ID so IO callbacks resolve lock-free. The daemon is the sole writer of `/Library/Application Support/Spaghetti/devices.json` (fallback `/tmp/spaghetti.devices.json` when Library isn't writable), and the plugin polls the file's mtime every 500 ms and republishes `DeviceList` on change. The built-in `SpaghettiDevice_UID` always exists — destroying it is refused by the daemon, and the plugin re-inserts it even if the config omits it. Object IDs are monotonically allocated in blocks of 5 (device + 2 streams + volume + mute) and never recycle.
+
+```json
+{
+  "version": 1,
+  "devices": [
+    { "uid": "SpaghettiDevice_UID",            "name": "Spaghetti",    "channels": 2, "sample_rate": 48000 },
+    { "uid": "spaghetti_virtual_<uuid>",       "name": "Stream Audio", "channels": 2, "sample_rate": 48000 }
+  ]
+}
+```
+
+The activity shm is still single-region — only the first (default) device feeds frame counters and peak into the shared region. Multi-device activity reporting is follow-up work.
+
 ## TUI state
 
 `crates/tui/src/main.rs` owns a `tokio::sync::RwLock<State>`. Render loop reads, input/poller tasks write.

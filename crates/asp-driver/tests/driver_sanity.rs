@@ -43,6 +43,13 @@ fn dylib_path() -> std::ffi::CString {
     std::ffi::CString::new(path.to_str().unwrap()).unwrap()
 }
 
+// First device-block IDs handed out by the registry (see registry::FIRST_OBJECT_ID).
+const DEVICE_ID: u32 = 100;
+const STREAM_IN_ID: u32 = 101;
+const STREAM_OUT_ID: u32 = 102;
+const VOLUME_ID: u32 = 103;
+const MUTE_ID: u32 = 104;
+
 fn get_driver() -> DriverRef {
     unsafe {
         let path = dylib_path();
@@ -58,7 +65,19 @@ fn get_driver() -> DriverRef {
 
         let result = factory(ptr::null(), uuid_ref);
         assert!(!result.is_null(), "Factory returned null — UUID mismatch?");
-        result as DriverRef
+        let driver = result as DriverRef;
+
+        // The registry is seeded inside `Initialize`. In the real runtime
+        // coreaudiod calls this; under dlopen we must too, or every
+        // property lookup hits the empty registry.
+        let vtable = &**driver;
+        if let Some(init) = vtable.Initialize {
+            // Pass a null host pointer — property queries used in tests
+            // don't touch it, and the shm init failure path is non-fatal.
+            let _ = init(driver, ptr::null());
+        }
+
+        driver
     }
 }
 
@@ -107,17 +126,20 @@ fn get_device_list_returns_device_id() {
     let status = unsafe { get_size(driver, 1, 0, &address, 0, ptr::null(), &mut size) };
     eprintln!("GetPropertyDataSize(plugin=1, DeviceList): status={status}, size={size}");
     assert_eq!(status, kAudioHardwareNoError as i32);
-    assert_eq!(size, 4);
+    assert!(size >= 4 && size.is_multiple_of(4));
 
+    // Claude: Initialize loads the real on-disk config, which may list extra
+    // devices; the built-in device is always first.
     let get_data = vtable.GetPropertyData.expect("GetPropertyData is None");
-    let mut device_id: u32 = 0;
+    let mut device_ids = vec![0u32; size as usize / 4];
     let mut out_size: u32 = 0;
     let status = unsafe {
-        get_data(driver, 1, 0, &address, 0, ptr::null(), 4, &mut out_size, &mut device_id as *mut u32 as *mut c_void)
+        get_data(driver, 1, 0, &address, 0, ptr::null(), size, &mut out_size, device_ids.as_mut_ptr() as *mut c_void)
     };
-    eprintln!("GetPropertyData(plugin=1, DeviceList): status={status}, device_id={device_id}");
+    eprintln!("GetPropertyData(plugin=1, DeviceList): status={status}, device_ids={device_ids:?}");
     assert_eq!(status, kAudioHardwareNoError as i32);
-    assert_eq!(device_id, 2);
+    assert_eq!(out_size, size);
+    assert_eq!(device_ids[0], DEVICE_ID);
 }
 
 #[test]
@@ -130,11 +152,11 @@ fn device_has_output_streams() {
     let mut stream_id: u32 = 0;
     let mut out_size: u32 = 0;
     let status = unsafe {
-        get_data(driver, 2, 0, &address, 0, ptr::null(), 4, &mut out_size, &mut stream_id as *mut u32 as *mut c_void)
+        get_data(driver, DEVICE_ID, 0, &address, 0, ptr::null(), 4, &mut out_size, &mut stream_id as *mut u32 as *mut c_void)
     };
-    eprintln!("Streams(device=2, output): status={status}, stream_id={stream_id}");
+    eprintln!("Streams(device={DEVICE_ID}, output): status={status}, stream_id={stream_id}");
     assert_eq!(status, kAudioHardwareNoError as i32);
-    assert_eq!(stream_id, 4);
+    assert_eq!(stream_id, STREAM_OUT_ID);
 }
 
 #[test]
@@ -147,9 +169,9 @@ fn device_can_be_default() {
     let mut val: u32 = 0;
     let mut out_size: u32 = 0;
     let status = unsafe {
-        get_data(driver, 2, 0, &address, 0, ptr::null(), 4, &mut out_size, &mut val as *mut u32 as *mut c_void)
+        get_data(driver, DEVICE_ID, 0, &address, 0, ptr::null(), 4, &mut out_size, &mut val as *mut u32 as *mut c_void)
     };
-    eprintln!("CanBeDefault(device=2, output): status={status}, val={val}");
+    eprintln!("CanBeDefault(device={DEVICE_ID}, output): status={status}, val={val}");
     assert_eq!(status, kAudioHardwareNoError as i32);
     assert_eq!(val, 1);
 }
@@ -165,12 +187,12 @@ fn device_uid_returns_cfstring() {
     let mut out_size: u32 = 0;
     let status = unsafe {
         get_data(
-            driver, 2, 0, &address, 0, ptr::null(),
+            driver, DEVICE_ID, 0, &address, 0, ptr::null(),
             std::mem::size_of::<CFStringRef>() as u32,
             &mut out_size, &mut uid as *mut CFStringRef as *mut c_void,
         )
     };
-    eprintln!("DeviceUID(device=2): status={status}, uid={uid:p}, out_size={out_size}");
+    eprintln!("DeviceUID(device={DEVICE_ID}): status={status}, uid={uid:p}, out_size={out_size}");
     assert_eq!(status, kAudioHardwareNoError as i32);
     assert!(!uid.is_null());
 }
@@ -181,15 +203,16 @@ fn device_owned_objects() {
     let vtable = unsafe { &**driver };
     let get_data = vtable.GetPropertyData.expect("GetPropertyData is None");
 
+    // Request all four owned objects (two streams + volume + mute).
     let address = addr(kAudioObjectPropertyOwnedObjects as u32, kAudioObjectPropertyScopeGlobal as u32);
-    let mut ids: [u32; 2] = [0, 0];
+    let mut ids: [u32; 4] = [0; 4];
     let mut out_size: u32 = 0;
     let status = unsafe {
-        get_data(driver, 2, 0, &address, 0, ptr::null(), 8, &mut out_size, ids.as_mut_ptr() as *mut c_void)
+        get_data(driver, DEVICE_ID, 0, &address, 0, ptr::null(), 16, &mut out_size, ids.as_mut_ptr() as *mut c_void)
     };
-    eprintln!("OwnedObjects(device=2): status={status}, ids={ids:?}");
+    eprintln!("OwnedObjects(device={DEVICE_ID}): status={status}, ids={ids:?}");
     assert_eq!(status, kAudioHardwareNoError as i32);
-    assert_eq!(ids, [3, 4]);
+    assert_eq!(ids, [STREAM_IN_ID, STREAM_OUT_ID, VOLUME_ID, MUTE_ID]);
 }
 
 #[test]
