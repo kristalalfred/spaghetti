@@ -9,3 +9,6 @@ tokio = { version = "1", features = ["full"] }
 [workspace.package]
 edition = "2024"
 license = "MIT"
+
+[profile.dev.package.rubato]
+opt-level = 3

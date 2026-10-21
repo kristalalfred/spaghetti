@@ -36,13 +36,16 @@ target app
   → one IOProc per tap (AudioDeviceCreateIOProcID) delivers AudioBufferList directly
   → per route sink (lock-free `RtSlots` the IOProc iterates) → SPSC ring of tap-rate frames
   → per route output AUHAL render callback: rubato async resampler (tap rate → dest rate)
-    pulls exactly the input it needs; the AUHAL runs at the device-native format
+    pulls exactly the input it needs; the AUHAL runs at the device-native format.
+    A jitter buffer holds output silent until the ring reaches its target fill, and a PI
+    controller on the fill trims the ratio by up to 0.5% so the tap's clock (the default
+    output's hardware) and the destination's clock (mach time for virtual devices) stay matched
   → destination device
 ```
 
 Key files:
 - `crates/daemon/src/router.rs` — the routing graph and its Core Audio glue. `TapCapture` + `capture_ioproc` (capture side), `Sink` (per-route ring producer), `OutputUnit` + `route_render_callback` (output side), `attach_route`.
-- `crates/daemon/src/playout.rs` — `Playout`, a route's output side: the resampler and jitter buffer between the ring and the render callback.
+- `crates/daemon/src/playout.rs` — `Playout`, a route's output side: the resampler, jitter buffer and clock-drift controller between the ring and the render callback.
 - `crates/daemon/src/ring.rs` — the SPSC ring of interleaved stereo frames.
 - `crates/daemon/src/rt_slots.rs` — `RtSlots`, the lock-free handoff that lets routes join and leave a running tap capture.
 - `crates/daemon/bridge/tap_bridge.m` + `.h` — ObjC bridge for `AudioHardwareCreateProcessTap` and aggregate device creation. Compiled by `build.rs`.
@@ -105,7 +108,7 @@ Real-time paths emit first-fire diagnostics that are invaluable for debugging fo
 - `created resampler` — tap and device rates and the resampler's delay in frames.
 - `IOProc first call` — the ABL shape the tap actually delivers.
 - `render callback first fire` — output ABL layout and the ring fill at the first render.
-- `route playout health` (debug, every 10 s) — each route's smoothed ring fill against its target, and glitch counters.
+- `route playout health` (debug, every 10 s) — each route's smoothed ring fill against its target, the controller's ratio correction in ppm, and glitch counters.
 - `route playout glitched since the last report` (info) — underruns (re-primes), resyncs and ring overflows since the previous report.
 
 Grep these strings in `~/Library/Logs/spaghetti/spaghettid.log` when routing breaks.

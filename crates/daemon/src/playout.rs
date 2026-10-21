@@ -3,7 +3,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use rubato::audioadapter_buffers::direct::{InterleavedSlice, SequentialSliceOfSlices};
 use rubato::{
-    Async, FixedAsync, Indexing, Resampler, Resizable, SincInterpolationParameters, WindowFunction,
+    Adjustable, Async, FixedAsync, Indexing, Resampler, Resizable, SincInterpolationParameters,
+    WindowFunction,
 };
 
 use crate::ring::{CHANNELS, Ring};
@@ -14,10 +15,15 @@ const SINC_LEN: usize = 128;
 const MARGIN_SECONDS: f64 = 0.003;
 const FILL_SMOOTHING_SECONDS: f64 = 1.0;
 const RESYNC_CHUNKS: usize = 4;
+const MAX_CORRECTION: f64 = 0.005;
+const CONTROL_RADIANS_PER_SECOND: f64 = 0.1;
+const CONTROL_DAMPING: f64 = 1.0;
 
 /// Claude: the output side of a route. Resamples source-rate frames from the ring
 /// to exactly the number of device-rate frames each render asks for, and keeps
 /// the ring at a fill that survives the jitter between the two clock domains.
+/// The resampling ratio is trimmed by `FillController` so the source and device
+/// clocks stay matched however far they drift apart.
 pub struct Playout {
     resampler: Async<f32>,
     input: Vec<f32>,
@@ -27,7 +33,38 @@ pub struct Playout {
     margin_frames: usize,
     primed: bool,
     fill_avg: f64,
+    controller: FillController,
     health: Arc<PlayoutHealth>,
+}
+
+/// Claude: PI control of the ring fill. A positive correction makes the resampler
+/// consume source frames faster. With fill dynamics `d(fill)/dt = rate * (drift -
+/// correction)`, these gains give a critically damped loop at
+/// `CONTROL_RADIANS_PER_SECOND`, slow enough to ignore callback jitter.
+struct FillController {
+    kp: f64,
+    ki: f64,
+    integral: f64,
+    correction: f64,
+}
+
+impl FillController {
+    fn new(source_rate: f64) -> Self {
+        Self {
+            kp: 2.0 * CONTROL_DAMPING * CONTROL_RADIANS_PER_SECOND / source_rate,
+            ki: CONTROL_RADIANS_PER_SECOND.powi(2) / source_rate,
+            integral: 0.0,
+            correction: 0.0,
+        }
+    }
+
+    fn update(&mut self, error_frames: f64, seconds: f64) {
+        let integral_limit = MAX_CORRECTION / self.ki;
+        self.integral =
+            (self.integral + error_frames * seconds).clamp(-integral_limit, integral_limit);
+        self.correction = (self.kp * error_frames + self.ki * self.integral)
+            .clamp(-MAX_CORRECTION, MAX_CORRECTION);
+    }
 }
 
 /// Claude: written by the render callback, read by the health logger.
@@ -35,6 +72,7 @@ pub struct PlayoutHealth {
     pub source_rate: f64,
     fill_avg: AtomicU32,
     target: AtomicU32,
+    correction_ppm: AtomicU32,
     underruns: AtomicU32,
     resyncs: AtomicU32,
 }
@@ -42,6 +80,7 @@ pub struct PlayoutHealth {
 pub struct HealthReport {
     pub fill_avg_frames: f32,
     pub target_frames: u32,
+    pub correction_ppm: f32,
     pub underruns: u32,
     pub resyncs: u32,
 }
@@ -51,6 +90,7 @@ impl PlayoutHealth {
         HealthReport {
             fill_avg_frames: f32::from_bits(self.fill_avg.load(Ordering::Relaxed)),
             target_frames: self.target.load(Ordering::Relaxed),
+            correction_ppm: f32::from_bits(self.correction_ppm.load(Ordering::Relaxed)),
             underruns: self.underruns.load(Ordering::Relaxed),
             resyncs: self.resyncs.load(Ordering::Relaxed),
         }
@@ -79,10 +119,12 @@ impl Playout {
             margin_frames: (MARGIN_SECONDS * source_rate).ceil() as usize,
             primed: false,
             fill_avg: 0.0,
+            controller: FillController::new(source_rate),
             health: Arc::new(PlayoutHealth {
                 source_rate,
                 fill_avg: AtomicU32::new(0),
                 target: AtomicU32::new(0),
+                correction_ppm: AtomicU32::new(0),
                 underruns: AtomicU32::new(0),
                 resyncs: AtomicU32::new(0),
             }),
@@ -135,18 +177,29 @@ impl Playout {
             self.health.resyncs.fetch_add(1, Ordering::Relaxed);
             self.fill_avg = target as f64;
         } else {
-            let alpha = frames as f64 / (self.device_rate * FILL_SMOOTHING_SECONDS);
-            self.fill_avg += alpha * (fill - self.fill_avg);
+            let seconds = frames as f64 / self.device_rate;
+            self.fill_avg += seconds / FILL_SMOOTHING_SECONDS * (fill - self.fill_avg);
+            self.controller
+                .update(self.fill_avg - target as f64, seconds);
         }
         self.health
             .fill_avg
             .store((self.fill_avg as f32).to_bits(), Ordering::Relaxed);
+        self.health.correction_ppm.store(
+            ((self.controller.correction * 1e6) as f32).to_bits(),
+            Ordering::Relaxed,
+        );
 
         let got = ring.pop_into(&mut self.input[..need * CHANNELS]);
         self.indexing.partial_len = (got < need).then_some(got);
         if !self.resample(need, out) {
             silence(out);
         }
+        // Claude: a new ratio changes how many input frames the resampler wants, so it
+        // is applied after this render consumed exactly the `need` frames it asked for.
+        let _ = self
+            .resampler
+            .set_resample_ratio_relative(1.0 / (1.0 + self.controller.correction), true);
     }
 
     /// Claude: frames buffered as of the latest push, plus the frames the producer
@@ -162,7 +215,8 @@ impl Playout {
         let frames = out[0].len();
         let [left, right] = out;
         let mut planes = [&mut **left, &mut **right];
-        let Ok(input) = InterleavedSlice::new(&self.input[..need * CHANNELS], CHANNELS, need) else {
+        let Ok(input) = InterleavedSlice::new(&self.input[..need * CHANNELS], CHANNELS, need)
+        else {
             return false;
         };
         let Ok(mut output) = SequentialSliceOfSlices::new_mut(&mut planes, CHANNELS, frames) else {
@@ -222,15 +276,23 @@ mod tests {
             while self.next_render < end {
                 if self.next_push <= self.next_render {
                     let (rate, start) = (self.source_rate, self.produced);
-                    self.ring.push_with(self.push_frames, (self.next_push * TICKS_PER_SECOND) as u64, |f, _| {
-                        (0.5 * (2.0 * std::f64::consts::PI * TONE_HZ * (start + f) as f64 / rate).sin()) as f32
-                    });
+                    self.ring.push_with(
+                        self.push_frames,
+                        (self.next_push * TICKS_PER_SECOND) as u64,
+                        |f, _| {
+                            (0.5 * (2.0 * std::f64::consts::PI * TONE_HZ * (start + f) as f64
+                                / rate)
+                                .sin()) as f32
+                        },
+                    );
                     self.produced += self.push_frames;
                     self.next_push += self.push_frames as f64 / self.source_rate;
                 } else {
-                    let (mut left, mut right) = (vec![0.0; RENDER_FRAMES], vec![0.0; RENDER_FRAMES]);
+                    let (mut left, mut right) =
+                        (vec![0.0; RENDER_FRAMES], vec![0.0; RENDER_FRAMES]);
                     let now = (self.next_render * TICKS_PER_SECOND) as u64;
-                    self.playout.render(&self.ring, &mut [&mut left, &mut right], now);
+                    self.playout
+                        .render(&self.ring, &mut [&mut left, &mut right], now);
                     assert_eq!(left, right);
                     self.rendered.extend_from_slice(&left);
                     self.next_render += self.render_period;
@@ -253,15 +315,29 @@ mod tests {
 
     #[test]
     fn plays_a_continuous_tone_once_primed() {
-        for (source, device, push) in [(48000.0, 48000.0, 512), (48000.0, 44100.0, 512), (44100.0, 48000.0, 470)] {
+        for (source, device, push) in [
+            (48000.0, 48000.0, 512),
+            (48000.0, 44100.0, 512),
+            (44100.0, 48000.0, 470),
+        ] {
             let mut sim = Sim::new(source, device, push, 0.0);
             sim.run(5.0);
             let steady = &sim.rendered[sim.first_sound() + 4096..];
             let peak = steady.iter().fold(0.0f32, |p, s| p.max(s.abs()));
-            assert!((peak - 0.5).abs() < 0.01, "{source} -> {device}: peak {peak}");
+            assert!(
+                (peak - 0.5).abs() < 0.01,
+                "{source} -> {device}: peak {peak}"
+            );
             let error = worst_recurrence_error(steady, device);
-            assert!(error < 1e-3, "{source} -> {device}: recurrence error {error}");
-            assert_eq!(sim.playout.health.report().underruns, 0, "{source} -> {device}");
+            assert!(
+                error < 1e-3,
+                "{source} -> {device}: recurrence error {error}"
+            );
+            assert_eq!(
+                sim.playout.health.report().underruns,
+                0,
+                "{source} -> {device}"
+            );
         }
     }
 
@@ -272,8 +348,48 @@ mod tests {
         let target = sim.playout.health.report().target_frames as usize;
         assert!(target > RENDER_FRAMES * 48 / 44 + 470, "target {target}");
         let first_output = sim.rendered.iter().position(|s| *s != 0.0).unwrap();
-        assert!(first_output >= RENDER_FRAMES, "played after {first_output} frames");
-        assert_eq!(first_output % RENDER_FRAMES, 0, "playback starts mid-render");
+        assert!(
+            first_output >= RENDER_FRAMES,
+            "played after {first_output} frames"
+        );
+        assert_eq!(
+            first_output % RENDER_FRAMES,
+            0,
+            "playback starts mid-render"
+        );
+    }
+
+    #[test]
+    fn controller_holds_the_target_fill_against_clock_drift() {
+        for (source, device, push, device_ppm) in [
+            (48000.0, 48000.0, 512, 300.0),
+            (48000.0, 48000.0, 512, -300.0),
+            (48000.0, 44100.0, 512, 120.0),
+        ] {
+            let mut sim = Sim::new(source, device, push, device_ppm);
+            sim.run(60.0);
+            let mut worst_error = 0.0f32;
+            for _ in 0..20 {
+                sim.run(1.0);
+                let report = sim.playout.health.report();
+                worst_error =
+                    worst_error.max((report.fill_avg_frames - report.target_frames as f32).abs());
+            }
+            let report = sim.playout.health.report();
+            let label = format!("{source} -> {device} at {device_ppm} ppm");
+            assert_eq!(report.underruns + report.resyncs, 0, "{label}");
+            assert!(
+                worst_error < 16.0,
+                "{label}: fill strays {worst_error} frames from target"
+            );
+            assert!(
+                (report.correction_ppm as f64 + device_ppm).abs() < 0.05 * device_ppm.abs(),
+                "{label}: correction {} ppm",
+                report.correction_ppm
+            );
+            let steady = &sim.rendered[sim.rendered.len() - (20.0 * device) as usize..];
+            assert!(worst_recurrence_error(steady, device) < 1e-3, "{label}");
+        }
     }
 
     #[test]

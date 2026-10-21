@@ -154,6 +154,7 @@ impl Router {
                 fill_frames = report.fill_avg_frames,
                 fill_ms = to_ms(report.fill_avg_frames as f64),
                 target_ms = to_ms(report.target_frames as f64),
+                correction_ppm = report.correction_ppm,
                 underruns = glitches[0],
                 resyncs = glitches[1],
                 overflows = glitches[2],
