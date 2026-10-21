@@ -99,8 +99,9 @@ The activity shm is still single-region — only the first (default) device feed
 
 Real-time paths emit first-fire diagnostics that are invaluable for debugging format/rate mismatches:
 - `tap ASBD` — source format from `query_device_stream_format`.
-- `output unit native format` — destination format before any override.
-- `dst_asbd` — the converter output format we synthesize.
+- `destination device format` — the device side of the output AUHAL; its rate is the route's rate.
+- `dst_asbd` — the converter output format, also set as the output AUHAL's client format.
+- `created AudioConverter` — `resampling=true` only when tap and device rates differ.
 - `IOProc first call — pre-converter parameters` — input/output ABL shapes fed to `AudioConverterFillComplexBuffer`.
 - `IOProc first call — post-converter result` — `conv_status` and actual frame count.
 - `render callback first fire` — output ABL layout and `frames_popped` from ring.

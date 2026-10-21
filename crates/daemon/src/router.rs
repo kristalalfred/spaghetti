@@ -379,7 +379,7 @@ impl TapCapture {
         })
     }
 
-    /// Publish `sink` to the IOProc, starting capture if it is not running yet.
+    /// Claude: starts the IOProc when the first sink arrives.
     unsafe fn add_sink(&mut self, sink: Sink) -> Result<usize, String> {
         let slot = self
             .sinks
@@ -417,6 +417,8 @@ impl Drop for TapCapture {
     }
 }
 
+const ROUTE_CHANNELS: usize = 2;
+
 /// Pre-allocated converter output capacity per channel. 2048 frames is well
 /// above any realistic HAL buffer size (typically 256–1024) and avoids heap
 /// allocation in the real-time IOProc.
@@ -450,7 +452,8 @@ impl Sink {
             dst_rate = dst.mSampleRate,
             src_channels = src.mChannelsPerFrame,
             dst_channels = dst.mChannelsPerFrame,
-            "created AudioConverter for SRC"
+            resampling = src.mSampleRate != dst.mSampleRate,
+            "created AudioConverter"
         );
         Ok(Self {
             converter,
@@ -461,11 +464,7 @@ impl Sink {
         })
     }
 
-    /// Run one IOProc buffer through the converter (tap format → destination
-    /// format) and push the result into the ring, so the ring and the output
-    /// AUHAL see only destination-format frames.
-    ///
-    /// Safety: `input` must be the valid ABL the HAL handed to the IOProc.
+    /// Claude: `input` must be the ABL the HAL handed to the IOProc.
     unsafe fn push(&mut self, input: *const AudioBufferList) {
         let in_buffers = unsafe { abl_buffers(input) };
         let Some(first) = in_buffers.first() else {
@@ -492,11 +491,11 @@ impl Sink {
         #[repr(C)]
         struct Abl2 {
             n_buffers: u32,
-            buffers: [AudioBuffer; 2],
+            buffers: [AudioBuffer; ROUTE_CHANNELS],
         }
         let per_buf_bytes = (n_out_capacity as usize * std::mem::size_of::<f32>()) as u32;
         let mut out_abl = Abl2 {
-            n_buffers: 2,
+            n_buffers: ROUTE_CHANNELS as u32,
             buffers: [
                 AudioBuffer {
                     mNumberChannels: 1,
@@ -657,8 +656,6 @@ unsafe extern "C" fn converter_input_proc(
     0
 }
 
-/// Called by the HAL on the tap aggregate device's IO thread. `in_input_data`
-/// is the already-captured ABL — no `AudioUnitRender` needed.
 unsafe extern "C" fn capture_ioproc(
     _in_device: AudioObjectID,
     _in_now: *const AudioTimeStamp,
@@ -687,14 +684,13 @@ struct OutputCallbackState {
     logged_once: AtomicBool,
 }
 
-/// A HAL output unit bound to a destination device, draining a route's ring.
 struct OutputUnit {
     unit: AudioUnit,
-    /// Leaked Box handed to the render callback; freed after the unit is disposed.
+    /// Claude: leaked Box handed to the render callback; freed after the unit is disposed.
     render_state: *mut OutputCallbackState,
 }
 
-// Safety: the unit is driven from one control thread at a time; the render
+// Claude: the unit is driven from one control thread at a time, and the render
 // state is only read by the render callback while the unit exists.
 unsafe impl Send for OutputUnit {}
 
@@ -740,29 +736,47 @@ impl OutputUnit {
         Ok(output)
     }
 
-    unsafe fn stream_format(
-        &self,
-        scope: AudioUnitScope,
-    ) -> Result<AudioStreamBasicDescription, OSStatus> {
+    /// Claude: the output scope is the device side of the unit. The input scope
+    /// is the client side and defaults to 44.1 kHz whatever the device runs at.
+    unsafe fn device_format(&self) -> Result<AudioStreamBasicDescription, String> {
         let mut format: AudioStreamBasicDescription = unsafe { std::mem::zeroed() };
         let mut size = std::mem::size_of::<AudioStreamBasicDescription>() as u32;
         let status = unsafe {
             AudioUnitGetProperty(
                 self.unit,
                 kAudioUnitProperty_StreamFormat,
-                scope,
+                kAudioUnitScope_Output,
                 0,
                 &mut format as *mut _ as *mut _,
                 &mut size,
             )
         };
         if status != 0 {
-            return Err(status);
+            return Err(format!("get output device format failed: {status}"));
+        }
+        if format.mSampleRate <= 0.0 {
+            return Err(format!("output device reports sample rate {}", format.mSampleRate));
         }
         Ok(format)
     }
 
-    /// Install the render callback that drains `ring`, then initialise the unit.
+    unsafe fn set_client_format(&self, format: &AudioStreamBasicDescription) -> Result<(), String> {
+        let status = unsafe {
+            AudioUnitSetProperty(
+                self.unit,
+                kAudioUnitProperty_StreamFormat,
+                kAudioUnitScope_Input,
+                0,
+                format as *const AudioStreamBasicDescription as *const _,
+                std::mem::size_of::<AudioStreamBasicDescription>() as u32,
+            )
+        };
+        if status != 0 {
+            return Err(format!("set output unit client format failed: {status}"));
+        }
+        Ok(())
+    }
+
     unsafe fn connect(&mut self, ring: Arc<RingBuffer>, volume: Arc<AtomicU32>) -> Result<(), String> {
         self.render_state = Box::into_raw(Box::new(OutputCallbackState {
             ring,
@@ -878,107 +892,48 @@ unsafe extern "C" fn route_render_callback(
 
 // ── Route setup ────────────────────────────────────────────────────────────────
 
-/// Build the converter output format: non-interleaved f32 at the destination's rate.
-unsafe fn destination_format(
-    output: &OutputUnit,
-    format: &AudioStreamBasicDescription,
-) -> AudioStreamBasicDescription {
-    // Diagnostic: query the output unit's CURRENT input-scope format BEFORE we overwrite it.
-    // This reveals what the destination device natively expects.
-    let dest_query = unsafe { output.stream_format(kAudioUnitScope_Input) };
-    match dest_query {
-        Ok(dest_format) => {
-            let dest_non_interleaved =
-                (dest_format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
-            let dest_float = (dest_format.mFormatFlags & kAudioFormatFlagIsFloat) != 0;
-            tracing::info!(
-                sample_rate = dest_format.mSampleRate,
-                channels_per_frame = dest_format.mChannelsPerFrame,
-                bytes_per_frame = dest_format.mBytesPerFrame,
-                frames_per_packet = dest_format.mFramesPerPacket,
-                bits_per_channel = dest_format.mBitsPerChannel,
-                format_flags = dest_format.mFormatFlags,
-                is_float = dest_float,
-                is_non_interleaved = dest_non_interleaved,
-                "output unit native format (input scope, before override)"
-            );
-            if (dest_format.mSampleRate - format.mSampleRate).abs() > 1.0 {
-                tracing::warn!(
-                    tap_rate = format.mSampleRate,
-                    dest_rate = dest_format.mSampleRate,
-                    "SAMPLE RATE MISMATCH between tap and destination — this will cause silence or distortion"
-                );
-            }
-            if dest_format.mChannelsPerFrame != format.mChannelsPerFrame {
-                tracing::warn!(
-                    tap_channels = format.mChannelsPerFrame,
-                    dest_channels = dest_format.mChannelsPerFrame,
-                    "CHANNEL COUNT MISMATCH between tap and destination"
-                );
-            }
-        }
-        Err(status) => {
-            tracing::warn!(
-                status,
-                "could not query output unit's native format (status={:#010x})",
-                status
-            );
-        }
+/// Claude: the layout every route carries from converter to ring to AUHAL client.
+fn route_format(sample_rate: f64) -> AudioStreamBasicDescription {
+    AudioStreamBasicDescription {
+        mSampleRate: sample_rate,
+        mFormatID: kAudioFormatLinearPCM,
+        mFormatFlags: kAudioFormatFlagIsFloat
+            | kAudioFormatFlagIsPacked
+            | kAudioFormatFlagIsNonInterleaved,
+        mBytesPerPacket: 4,
+        mFramesPerPacket: 1,
+        mBytesPerFrame: 4,
+        mChannelsPerFrame: ROUTE_CHANNELS as u32,
+        mBitsPerChannel: 32,
+        mReserved: 0,
     }
-
-    // Build the destination ASBD as non-interleaved f32 at the device's native rate.
-    // We use the queried native format but enforce non-interleaved f32 layout so it
-    // matches what our ring buffer and render callback expect.
-    let dst_asbd = match dest_query {
-        Ok(dest_format) => {
-            let mut dst = dest_format;
-            dst.mFormatID = kAudioFormatLinearPCM;
-            dst.mFormatFlags =
-                kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved;
-            dst.mBitsPerChannel = 32;
-            dst.mBytesPerFrame = 4;
-            dst.mFramesPerPacket = 1;
-            dst.mBytesPerPacket = 4;
-            if dst.mChannelsPerFrame == 0 {
-                dst.mChannelsPerFrame = format.mChannelsPerFrame;
-            }
-            dst
-        }
-        Err(_) => {
-            let mut dst = *format;
-            dst.mSampleRate = 44100.0;
-            dst
-        }
-    };
-
-    // Diagnostic: dump dst_asbd in full so we can verify every field before handing
-    // it to AudioConverterNew — invalid fields here are the leading cause of -50.
-    tracing::info!(
-        sample_rate        = dst_asbd.mSampleRate,
-        channels_per_frame = dst_asbd.mChannelsPerFrame,
-        format_id          = dst_asbd.mFormatID,
-        format_flags       = dst_asbd.mFormatFlags,
-        bytes_per_packet   = dst_asbd.mBytesPerPacket,
-        frames_per_packet  = dst_asbd.mFramesPerPacket,
-        bytes_per_frame    = dst_asbd.mBytesPerFrame,
-        bits_per_channel   = dst_asbd.mBitsPerChannel,
-        is_float           = (dst_asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0,
-        is_non_interleaved = (dst_asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0,
-        "dst_asbd (converter output format, built before AudioConverterNew)"
-    );
-
-    dst_asbd
 }
 
-/// Feed `capture` into a new ring and play that ring on `dest_device`. Returns
-/// the sink slot and the running output unit; releases everything on failure.
 unsafe fn attach_route(
     capture: &mut TapCapture,
     dest_device: AudioObjectID,
     volume: Arc<AtomicU32>,
 ) -> Result<(usize, OutputUnit), String> {
     let mut output = unsafe { OutputUnit::new(dest_device) }?;
-    let dst_asbd = unsafe { destination_format(&output, &capture.format) };
+
+    let device_format = unsafe { output.device_format() }?;
+    tracing::info!(
+        sample_rate = device_format.mSampleRate,
+        channels_per_frame = device_format.mChannelsPerFrame,
+        format_flags = device_format.mFormatFlags,
+        is_non_interleaved = (device_format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0,
+        "destination device format (output unit output scope)"
+    );
+
+    let dst_asbd = route_format(device_format.mSampleRate);
+    tracing::info!(
+        sample_rate        = dst_asbd.mSampleRate,
+        channels_per_frame = dst_asbd.mChannelsPerFrame,
+        format_flags       = dst_asbd.mFormatFlags,
+        bytes_per_frame    = dst_asbd.mBytesPerFrame,
+        "dst_asbd (converter output and output unit client format)"
+    );
+    unsafe { output.set_client_format(&dst_asbd) }?;
 
     let ring = Arc::new(RingBuffer::new());
     let sink = unsafe { Sink::new(&capture.format, &dst_asbd, Arc::clone(&ring)) }?;
