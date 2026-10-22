@@ -314,7 +314,12 @@ pub unsafe extern "C" fn initialize(
 
     // Map the shared-memory activity region. Failure is non-fatal — the driver
     // still services audio, the daemon just won't see activity.
-    init_activity_region();
+    // Claude: the region's name is system-wide and creating it unlinks the old
+    // one, so a test harness that loads the driver without a host must leave
+    // the live driver's region alone.
+    if !host.is_null() {
+        init_activity_region();
+    }
 
     log("initialize: returning noErr");
     0 // noErr

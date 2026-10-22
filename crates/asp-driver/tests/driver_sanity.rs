@@ -73,7 +73,8 @@ fn get_driver() -> DriverRef {
         let vtable = &**driver;
         if let Some(init) = vtable.Initialize {
             // Pass a null host pointer — property queries used in tests
-            // don't touch it, and the shm init failure path is non-fatal.
+            // don't touch it, and without a host the driver leaves the
+            // system-wide activity region alone.
             let _ = init(driver, ptr::null());
         }
 
