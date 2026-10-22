@@ -145,9 +145,9 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
             let apps = tap::list_audio_apps();
             Response::Apps(apps)
         }
-        Request::CreateSource { source } => {
+        Request::CreateSource { source, tag } => {
             let mut st = lock_state(state);
-            match st.router.create_source(source) {
+            match st.router.create_source(source, tag) {
                 Ok(source_id) => Response::SourceCreated { source_id },
                 Err(message) => Response::Error { message },
             }

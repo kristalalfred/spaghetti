@@ -706,7 +706,7 @@ fn create_source(
     stream: &mut std::os::unix::net::UnixStream,
     source: SourceSpec,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match client::send_request(stream, &Request::CreateSource { source })? {
+    match client::send_request(stream, &Request::CreateSource { source, tag: None })? {
         Response::SourceCreated { source_id } => println!("Source created: id={source_id}"),
         Response::Error { message } => {
             print_error(&message);

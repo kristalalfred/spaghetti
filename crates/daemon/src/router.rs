@@ -107,6 +107,7 @@ impl Output {
 
 struct SourceEntry {
     spec: SourceSpec,
+    tag: Option<String>,
     source: Source,
 }
 
@@ -139,12 +140,12 @@ impl Router {
         }
     }
 
-    pub fn create_source(&mut self, spec: SourceSpec) -> Result<u32, String> {
+    pub fn create_source(&mut self, spec: SourceSpec, tag: Option<String>) -> Result<u32, String> {
         let id = self.next_source_id;
         let source = Source::open(id, &spec)?;
         self.next_source_id += 1;
-        tracing::info!(source_id = id, label = source.label(), "created source");
-        self.sources.insert(id, SourceEntry { spec, source });
+        tracing::info!(source_id = id, label = source.label(), ?tag, "created source");
+        self.sources.insert(id, SourceEntry { spec, tag, source });
         Ok(id)
     }
 
@@ -172,6 +173,7 @@ impl Router {
             .map(|(&id, entry)| SourceInfo {
                 source_id: id,
                 spec: entry.spec.clone(),
+                tag: entry.tag.clone(),
                 label: entry.source.label().to_string(),
                 status: entry.source.status(),
             })

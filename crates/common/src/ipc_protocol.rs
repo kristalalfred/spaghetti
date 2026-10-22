@@ -28,7 +28,8 @@ pub const IPC_VERSION: u32 = 2;
 pub enum Request {
     Status,
     ListApps,
-    CreateSource { source: SourceSpec },
+    /// `tag` is the client's own name for the source, listed back with it.
+    CreateSource { source: SourceSpec, tag: Option<String> },
     DestroySource { source_id: u32 },
     ListSources,
     CreateRoute { source_id: u32, destination: Destination, volume: f32 },
@@ -142,6 +143,7 @@ pub struct AppInfo {
 pub struct SourceInfo {
     pub source_id: u32,
     pub spec: SourceSpec,
+    pub tag: Option<String>,
     /// The tapped app's name, or the SRT endpoint.
     pub label: String,
     pub status: FlowStatus,
