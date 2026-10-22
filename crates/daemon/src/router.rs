@@ -167,6 +167,21 @@ impl Router {
         Ok(())
     }
 
+    pub fn set_tap_processes(&mut self, source_id: u32, pids: Vec<u32>) -> Result<(), String> {
+        let entry = self
+            .sources
+            .get_mut(&source_id)
+            .ok_or_else(|| format!("source {source_id} not found"))?;
+        let (Source::Tap(tap), SourceSpec::Tap { pids: tapped, .. }) =
+            (&mut entry.source, &mut entry.spec)
+        else {
+            return Err(format!("source {source_id} is not a tap"));
+        };
+        tap.set_processes(&pids)?;
+        *tapped = pids;
+        Ok(())
+    }
+
     pub fn list_sources(&self) -> Vec<SourceInfo> {
         self.sources
             .iter()

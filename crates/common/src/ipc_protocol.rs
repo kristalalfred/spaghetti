@@ -31,6 +31,8 @@ pub enum Request {
     /// `tag` is the client's own name for the source, listed back with it.
     CreateSource { source: SourceSpec, tag: Option<String> },
     DestroySource { source_id: u32 },
+    /// Replace the processes a tap source mixes, keeping its routes running.
+    SetTapProcesses { source_id: u32, pids: Vec<u32> },
     ListSources,
     CreateRoute { source_id: u32, destination: Destination, volume: f32 },
     DestroyRoute { route_id: u32 },
@@ -78,13 +80,24 @@ pub enum Destination {
     Srt(SrtSocket),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SrtSocket {
     pub mode: SrtMode,
     pub latency_ms: u32,
     pub passphrase: Option<String>,
     /// AES key length in bytes: 16, 24 or 32. Only used with a passphrase.
     pub key_size: Option<u8>,
+}
+
+impl std::fmt::Debug for SrtSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SrtSocket")
+            .field("mode", &self.mode)
+            .field("latency_ms", &self.latency_ms)
+            .field("passphrase", &self.passphrase.as_ref().map(|_| "<redacted>"))
+            .field("key_size", &self.key_size)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -126,17 +126,23 @@ enum Command {
     },
 }
 
+const DEFAULT_SRT_LATENCY_MS: u32 = 200;
+
 #[derive(clap::Args)]
 struct SrtArgs {
-    /// SRT latency in milliseconds
-    #[arg(long, default_value = "200")]
-    latency: u32,
-    /// SRT passphrase, 10 to 79 characters; the peer must use the same one
+    /// SRT latency in milliseconds [default: 200]
     #[arg(long)]
+    latency: Option<u32>,
+    /// SRT passphrase, 10 to 79 characters; the peer must use the same one
+    #[arg(long, env = "SPAGHETTI_SRT_PASSPHRASE", hide_env_values = true)]
     passphrase: Option<String>,
 }
 
 impl SrtArgs {
+    fn is_set(&self) -> bool {
+        self.latency.is_some() || self.passphrase.is_some()
+    }
+
     fn socket(&self, url: &str) -> Result<SrtSocket, String> {
         let rest = url
             .strip_prefix("srt://")
@@ -157,7 +163,7 @@ impl SrtArgs {
         };
         Ok(SrtSocket {
             mode,
-            latency_ms: self.latency,
+            latency_ms: self.latency.unwrap_or(DEFAULT_SRT_LATENCY_MS),
             passphrase: self.passphrase.clone(),
             key_size: None,
         })
@@ -545,6 +551,9 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
                     print_error(&e);
                     std::process::exit(1);
                 }))
+            } else if srt.is_set() {
+                print_error("--latency and --passphrase apply only to srt:// destinations");
+                std::process::exit(1);
             } else {
                 Destination::Device { uid: destination }
             };

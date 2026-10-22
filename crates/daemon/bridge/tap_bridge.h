@@ -17,6 +17,10 @@ OSStatus spaghetti_create_tap(
 /// Destroy a previously created process tap.
 OSStatus spaghetti_destroy_tap(AudioObjectID tap_id);
 
+/// Replace the processes a running tap mixes. PIDs Core Audio does not know are
+/// skipped; it fails when none are left.
+OSStatus spaghetti_set_tap_processes(AudioObjectID tap_id, const pid_t *pids, uint32_t pid_count);
+
 /// Create a private aggregate device that captures from the given tap.
 /// The aggregate device acts as an input-only device the daemon can read from.
 OSStatus spaghetti_create_aggregate_for_tap(

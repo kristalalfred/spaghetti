@@ -37,7 +37,7 @@ spaghetti receive srt://sending-mac.local:9000 --passphrase 'shared secret 1'
 spaghetti route 2 BuiltInSpeakerDevice
 ```
 
-Audio travels as AAC-LC in MPEG-TS. `--latency` sets the SRT latency in milliseconds, 200 by default.
+Audio travels as AAC-LC in MPEG-TS. `--latency` sets the SRT latency in milliseconds, 200 by default. `SPAGHETTI_SRT_PASSPHRASE` can replace `--passphrase`, which keeps the passphrase out of the process list.
 
 List sources, and remove a route or a source with its routes:
 

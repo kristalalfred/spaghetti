@@ -8,6 +8,8 @@ const ADTS_HEADER_LEN: usize = 7;
 const SAMPLE_RATES: [u32; 13] = [
     96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
 ];
+/// Claude: the rates AudioToolbox's AAC-LC encoder accepts; it refuses 64, 88.2 and 96 kHz.
+const ENCODER_RATES: [u32; 9] = [48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000];
 /// Claude: returned by the input callbacks once their packet is consumed. The
 /// converter stops filling and hands the status back to `AudioConverterFillComplexBuffer`.
 const DRAINED: OSStatus = 0x64726e64;
@@ -25,6 +27,27 @@ impl AacConfig {
             .position(|&rate| rate == self.sample_rate)
             .map(|index| index as u8)
     }
+
+    /// Claude: ADTS channel configuration 7 is eight channels.
+    fn channel_config(self) -> Option<u8> {
+        match self.channels {
+            1..=6 => Some(self.channels),
+            8 => Some(7),
+            _ => None,
+        }
+    }
+}
+
+/// Claude: the rate to encode a source at: its own when the encoder takes it,
+/// otherwise 44.1 kHz for its multiples and 48 kHz for anything else.
+fn encode_rate(source_rate: u32) -> u32 {
+    if ENCODER_RATES.contains(&source_rate) {
+        source_rate
+    } else if source_rate.is_multiple_of(44100) {
+        44100
+    } else {
+        48000
+    }
 }
 
 /// Claude: an ADTS frame wrapping one AAC-LC access unit.
@@ -32,6 +55,9 @@ pub fn adts_frame(config: AacConfig, access_unit: &[u8], out: &mut Vec<u8>) -> R
     let index = config
         .rate_index()
         .ok_or_else(|| format!("AAC has no sampling frequency index for {} Hz", config.sample_rate))?;
+    let channels = config
+        .channel_config()
+        .ok_or_else(|| format!("ADTS cannot carry {} channels", config.channels))?;
     let len = access_unit.len() + ADTS_HEADER_LEN;
     if len >= 1 << 13 {
         return Err(format!("AAC access unit of {} bytes does not fit ADTS", access_unit.len()));
@@ -40,8 +66,8 @@ pub fn adts_frame(config: AacConfig, access_unit: &[u8], out: &mut Vec<u8>) -> R
     out.extend_from_slice(&[
         0xff,
         0xf1,
-        (profile << 6) | (index << 2) | ((config.channels >> 2) & 1),
-        ((config.channels & 3) << 6) | ((len >> 11) as u8 & 3),
+        (profile << 6) | (index << 2) | ((channels >> 2) & 1),
+        ((channels & 3) << 6) | ((len >> 11) as u8 & 3),
         (len >> 3) as u8,
         ((len as u8 & 7) << 5) | 0x1f,
         0xfc,
@@ -64,7 +90,10 @@ pub fn parse_adts(data: &[u8], mut each: impl FnMut(AacConfig, &[u8])) -> usize 
         let protection_absent = header[1] & 1 == 1;
         let header_len = if protection_absent { 7 } else { 9 };
         let index = (header[2] >> 2) & 0xf;
-        let channels = ((header[2] & 1) << 2) | (header[3] >> 6);
+        let channels = match ((header[2] & 1) << 2) | (header[3] >> 6) {
+            7 => 8,
+            config => config,
+        };
         let len = ((header[3] as usize & 3) << 11) | ((header[4] as usize) << 3) | (header[5] as usize >> 5);
         let Some(&sample_rate) = SAMPLE_RATES.get(index as usize) else {
             at += 1;
@@ -166,8 +195,9 @@ unsafe extern "C" fn pcm_input(
     0
 }
 
-/// Claude: AAC-LC encoder for interleaved stereo f32, one access unit per
-/// `FRAMES_PER_PACKET` frames once the encoder's priming is filled.
+/// Claude: AAC-LC encoder for interleaved stereo f32 at the source's rate. It
+/// encodes at `encode_rate` of it, resampling in the same converter, so the
+/// stream's access units each hold `FRAMES_PER_PACKET` frames at `config().sample_rate`.
 pub struct AacEncoder {
     converter: Converter,
     config: AacConfig,
@@ -175,15 +205,13 @@ pub struct AacEncoder {
 }
 
 impl AacEncoder {
-    pub fn new(sample_rate: u32, bitrate: u32) -> Result<Self, String> {
+    pub fn new(source_rate: u32, bitrate: u32) -> Result<Self, String> {
         let config = AacConfig {
-            sample_rate,
+            sample_rate: encode_rate(source_rate),
             channels: 2,
         };
-        config
-            .rate_index()
-            .ok_or_else(|| format!("AAC cannot encode at {sample_rate} Hz"))?;
-        let converter = Converter::new(&pcm_format(f64::from(sample_rate), 2), &aac_format(config))?;
+        let converter =
+            Converter::new(&pcm_format(f64::from(source_rate), 2), &aac_format(config))?;
         let status = unsafe {
             AudioConverterSetProperty(
                 converter.0,
@@ -219,43 +247,44 @@ impl AacEncoder {
         self.config
     }
 
-    /// Claude: `pcm` holds `FRAMES_PER_PACKET` interleaved stereo frames. Appends
-    /// the access unit it completes, if any, to `out` and returns whether it did.
-    pub fn encode(&mut self, pcm: &[f32], out: &mut Vec<u8>) -> Result<bool, String> {
+    /// Claude: feeds interleaved stereo frames at the source rate and hands each
+    /// access unit they complete to `each`, in order.
+    pub fn encode(&mut self, pcm: &[f32], mut each: impl FnMut(&[u8])) -> Result<(), String> {
         let mut input = PcmInput {
             data: pcm.as_ptr(),
             frames: (pcm.len() / 2) as u32,
             channels: 2,
         };
-        let mut output = AudioBufferList {
-            mNumberBuffers: 1,
-            mBuffers: [AudioBuffer {
-                mNumberChannels: 2,
-                mDataByteSize: self.packet.len() as u32,
-                mData: self.packet.as_mut_ptr().cast(),
-            }],
-        };
-        let mut description: AudioStreamPacketDescription = unsafe { std::mem::zeroed() };
-        let mut packets: u32 = 1;
-        let status = unsafe {
-            AudioConverterFillComplexBuffer(
-                self.converter.0,
-                Some(pcm_input),
-                (&mut input as *mut PcmInput).cast(),
-                &mut packets,
-                &mut output,
-                &mut description,
-            )
-        };
-        if status != 0 && status != DRAINED {
-            return Err(format!("AAC encode failed: {status}"));
+        loop {
+            let mut output = AudioBufferList {
+                mNumberBuffers: 1,
+                mBuffers: [AudioBuffer {
+                    mNumberChannels: 2,
+                    mDataByteSize: self.packet.len() as u32,
+                    mData: self.packet.as_mut_ptr().cast(),
+                }],
+            };
+            let mut description: AudioStreamPacketDescription = unsafe { std::mem::zeroed() };
+            let mut packets: u32 = 1;
+            let status = unsafe {
+                AudioConverterFillComplexBuffer(
+                    self.converter.0,
+                    Some(pcm_input),
+                    (&mut input as *mut PcmInput).cast(),
+                    &mut packets,
+                    &mut output,
+                    &mut description,
+                )
+            };
+            if status != 0 && status != DRAINED {
+                return Err(format!("AAC encode failed: {status}"));
+            }
+            if packets == 0 {
+                return Ok(());
+            }
+            let start = description.mStartOffset as usize;
+            each(&self.packet[start..start + description.mDataByteSize as usize]);
         }
-        if packets == 0 {
-            return Ok(false);
-        }
-        let start = description.mStartOffset as usize;
-        out.extend_from_slice(&self.packet[start..start + description.mDataByteSize as usize]);
-        Ok(true)
     }
 }
 
@@ -322,10 +351,6 @@ impl AacDecoder {
         })
     }
 
-    pub fn config(&self) -> AacConfig {
-        self.config
-    }
-
     /// Claude: appends the interleaved frames `access_unit` decodes to and returns how many.
     pub fn decode(&mut self, access_unit: &[u8], out: &mut Vec<f32>) -> Result<usize, String> {
         let channels = u32::from(self.config.channels);
@@ -385,13 +410,13 @@ pub mod tests {
 
     fn encode_tone(rate: u32, hz: f64, packets: usize) -> Vec<(AacConfig, Vec<u8>)> {
         let mut encoder = AacEncoder::new(rate, 192_000).unwrap();
+        let config = encoder.config();
         let pcm = tone(f64::from(rate), hz, 0.5, packets * FRAMES_PER_PACKET);
         let mut units = Vec::new();
         for chunk in pcm.chunks(FRAMES_PER_PACKET * 2) {
-            let mut unit = Vec::new();
-            if encoder.encode(chunk, &mut unit).unwrap() {
-                units.push((encoder.config(), unit));
-            }
+            encoder
+                .encode(chunk, |unit| units.push((config, unit.to_vec())))
+                .unwrap();
         }
         units
     }
@@ -431,6 +456,36 @@ pub mod tests {
         let (hz, rms) = measure(steady, 2, 48000.0);
         assert!((hz - 1000.0).abs() < 5.0, "{hz} Hz");
         assert!((rms - 0.5 / 2f32.sqrt()).abs() < 0.02, "rms {rms}");
+    }
+
+    #[test]
+    fn a_source_above_the_encoders_rates_is_encoded_at_one_it_takes() {
+        for (source, encoded) in [(96000, 48000), (88200, 44100), (64000, 48000)] {
+            let units = encode_tone(source, 1000.0, 120);
+            assert_eq!(units[0].0.sample_rate, encoded, "{source} Hz");
+            let expected = 120 * FRAMES_PER_PACKET * encoded as usize / source as usize / FRAMES_PER_PACKET;
+            assert!(units.len().abs_diff(expected) <= 3, "{source} Hz: {} units", units.len());
+            let mut decoder = AacDecoder::new(units[0].0, 48000.0).unwrap();
+            let mut pcm = Vec::new();
+            for (_, unit) in &units {
+                decoder.decode(unit, &mut pcm).unwrap();
+            }
+            let (hz, rms) = measure(&pcm[pcm.len() / 2..], 2, 48000.0);
+            assert!((hz - 1000.0).abs() < 5.0, "{source} Hz: {hz} Hz");
+            assert!((rms - 0.5 / 2f32.sqrt()).abs() < 0.03, "{source} Hz: rms {rms}");
+        }
+    }
+
+    #[test]
+    fn adts_channel_configuration_seven_is_eight_channels() {
+        let config = AacConfig { sample_rate: 48000, channels: 8 };
+        let mut stream = Vec::new();
+        adts_frame(config, &[1], &mut stream).unwrap();
+        let mut seen = Vec::new();
+        parse_adts(&stream, |c, _| seen.push(c));
+        assert_eq!(seen, [config]);
+        let mut out = Vec::new();
+        assert!(adts_frame(AacConfig { sample_rate: 48000, channels: 7 }, &[1], &mut out).is_err());
     }
 
     #[test]

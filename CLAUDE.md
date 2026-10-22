@@ -53,7 +53,7 @@ SRT destination: the route's ring → encoder thread (every 5 ms, 1024-frame chu
 A source reports its `SourceTiming`: its rate, and how unevenly it pushes. `Playout` sizes its jitter buffer from it.
 
 Key files:
-- `crates/daemon/src/router.rs` — `Router`, the routing graph: taps, routes, and attaching a route's ring to its tap and its output.
+- `crates/daemon/src/router.rs` — `Router`, the routing graph: sources, routes, and attaching a route's ring to its source and its output.
 - `crates/daemon/src/tap.rs` — `TapSource`: a process tap, its private aggregate device and the capture IOProc (`capture_ioproc`) that pushes into every attached route's ring. FFI wrappers around the ObjC bridge, and `list_audio_apps`.
 - `crates/daemon/src/device_output.rs` — `DeviceOutput`: a route's output AUHAL and `route_render_callback`.
 - `crates/daemon/src/playout.rs` — `Playout`, a route's output side: the resampler, jitter buffer and clock-drift controller between the ring and the render callback.
@@ -79,7 +79,7 @@ Key files:
 
 **srt-tokio releases received packets unevenly.** Packets stamped 21.3 ms apart arrive 9 to 34 ms apart, so `SrtSource` declares 25 ms of delivery jitter and routes from it buffer that much more. The sender stamps each packet with the capture time of its audio, from the ring's push times, rather than its send time; stamping with send time added the encoder's polling and AAC batching on top.
 
-**The driver's activity region is system-wide.** `Initialize` unlinks and recreates `/spaghetti.activity`. A process that loads the driver with a host would replace the live driver's region, and every daemon started afterwards would read zeros until coreaudiod restarts. Only a non-null host creates it.
+**The driver's activity region is system-wide.** Creating it unlinks the existing `/spaghetti.activity` first, so any process that loads the driver and creates the region replaces the live driver's, and every daemon started afterwards reads zeros until coreaudiod restarts. `Initialize` creates it only when given a host, which only coreaudiod passes; the driver tests pass none.
 
 **Sample rate conversion happens per route on the output side, with rubato.** The render callback needs an exact frame count, which a fixed-output resampler provides by pulling a variable amount from the ring. `AudioConverter` was dropped because it resets its filter, and glitches, whenever its rate is changed at runtime.
 

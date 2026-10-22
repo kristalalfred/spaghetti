@@ -159,6 +159,13 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
                 Err(message) => Response::Error { message },
             }
         }
+        Request::SetTapProcesses { source_id, pids } => {
+            let mut st = lock_state(state);
+            match st.router.set_tap_processes(source_id, pids) {
+                Ok(()) => Response::Ok,
+                Err(message) => Response::Error { message },
+            }
+        }
         Request::ListSources => {
             let st = lock_state(state);
             Response::Sources(st.router.list_sources())

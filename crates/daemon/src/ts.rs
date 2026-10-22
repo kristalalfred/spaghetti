@@ -7,6 +7,7 @@ const AUDIO_PID: u16 = 0x100;
 const STREAM_TYPE_ADTS: u8 = 0x0f;
 const AUDIO_STREAM_ID: u8 = 0xc0;
 const PSI_EVERY: u32 = 10;
+const MAX_PES_LEN: usize = 6 + 0xffff;
 /// Claude: 100 ms of 90 kHz ticks between the PCR and the PTS it precedes.
 const PTS_LEAD: u64 = 9000;
 
@@ -180,12 +181,16 @@ fn read_timestamp(bytes: &[u8]) -> u64 {
 }
 
 /// Claude: finds the first ADTS AAC stream through the PAT and PMT and hands
-/// out each complete PES payload with its PTS. Input may be split anywhere.
+/// out each complete PES payload with its PTS. Input may be split anywhere and
+/// comes from the network, so a PES that loses a packet, overruns its length or
+/// grows past the largest valid PES is dropped rather than handed out.
 pub struct TsDemuxer {
     partial: Vec<u8>,
     pmt_pid: Option<u16>,
     audio_pid: Option<u16>,
     pes: Vec<u8>,
+    continuity: Option<u8>,
+    pes_broken: bool,
 }
 
 impl TsDemuxer {
@@ -195,6 +200,8 @@ impl TsDemuxer {
             pmt_pid: None,
             audio_pid: None,
             pes: Vec::new(),
+            continuity: None,
+            pes_broken: false,
         }
     }
 
@@ -230,6 +237,7 @@ impl TsDemuxer {
         let unit_start = packet[1] & 0x40 != 0;
         let pid = (u16::from(packet[1] & 0x1f) << 8) | u16::from(packet[2]);
         let control = (packet[3] >> 4) & 0x3;
+        let counter = packet[3] & 0xf;
         let mut at = 4;
         if control & 0x2 != 0 {
             at += 1 + packet[4] as usize;
@@ -244,9 +252,23 @@ impl TsDemuxer {
         } else if Some(pid) == self.pmt_pid && unit_start {
             self.audio_pid = psi_section(payload, 0x02).and_then(pmt_adts_pid);
         } else if Some(pid) == self.audio_pid {
+            let expected = self.continuity.map(|last| (last + 1) & 0xf);
+            if self.continuity == Some(counter) {
+                return;
+            }
+            self.continuity = Some(counter);
+            if expected.is_some_and(|expected| expected != counter) {
+                self.pes_broken = true;
+            }
             if unit_start {
                 self.finish_pes(each);
                 self.pes.clear();
+                self.pes_broken = false;
+            }
+            if self.pes_broken || self.pes.len() + payload.len() > MAX_PES_LEN {
+                self.pes.clear();
+                self.pes_broken = true;
+                return;
             }
             self.pes.extend_from_slice(payload);
             if self.pes_complete() {
@@ -279,6 +301,9 @@ impl TsDemuxer {
         } else {
             (6 + declared).min(pes.len())
         };
+        if end < header_len || self.pes_broken {
+            return;
+        }
         each(&pes[header_len..end], pts);
     }
 }
@@ -354,6 +379,69 @@ mod tests {
         }
     }
 
+    fn psi(muxer: &mut TsMuxer) -> Vec<u8> {
+        let mut out = Vec::new();
+        muxer.section(PAT_PID, &pat(), &mut out);
+        muxer.section(PMT_PID, &pmt(), &mut out);
+        out
+    }
+
+    fn audio_packet(unit_start: bool, counter: u8, payload: &[u8]) -> Vec<u8> {
+        let mut packet = vec![SYNC, (u8::from(unit_start) << 6) | (AUDIO_PID >> 8) as u8, AUDIO_PID as u8, 0x10 | counter];
+        packet.extend_from_slice(payload);
+        packet.resize(PACKET_LEN, 0xff);
+        packet
+    }
+
+    #[test]
+    fn hostile_input_neither_panics_nor_grows_without_bound() {
+        let mut demuxer = TsDemuxer::new();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut noise = vec![0u8; 1 << 16];
+        for byte in &mut noise {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *byte = if seed.is_multiple_of(7) { SYNC } else { seed as u8 };
+        }
+        demuxer.push(&noise, |_, _| {});
+
+        let mut stream = psi(&mut TsMuxer::new());
+        stream.extend(audio_packet(true, 0, &[0, 0, 1, AUDIO_STREAM_ID, 0, 1, 0x80, 0x80, 0]));
+        stream.extend(audio_packet(true, 1, &[0, 0, 1, AUDIO_STREAM_ID, 0, 0, 0x80, 0x80, 0]));
+        for n in 0..2000u32 {
+            stream.extend(audio_packet(false, (2 + n) as u8 & 0xf, &[0xaa; 184]));
+        }
+        let mut handed_out = 0;
+        let mut demuxer = TsDemuxer::new();
+        demuxer.push(&stream, |_, _| handed_out += 1);
+        assert_eq!(handed_out, 0, "a short PES and an endless one are both dropped");
+        assert!(demuxer.pes.len() <= MAX_PES_LEN);
+    }
+
+    #[test]
+    fn a_lost_packet_drops_its_pes_instead_of_splicing_two() {
+        let frames: Vec<Vec<u8>> = (0..4).map(|n| adts(n, 600)).collect();
+        let mut muxer = TsMuxer::new();
+        let mut stream = Vec::new();
+        for (n, frame) in frames.iter().enumerate() {
+            muxer.mux(frame, n as u64 * 1920, &mut stream);
+        }
+        let packets: Vec<&[u8]> = stream.chunks(PACKET_LEN).collect();
+        let audio: Vec<usize> = (0..packets.len())
+            .filter(|&i| (u16::from(packets[i][1] & 0x1f) << 8 | u16::from(packets[i][2])) == AUDIO_PID)
+            .collect();
+        let lost = audio[1];
+        let mut demuxer = TsDemuxer::new();
+        let mut seen = Vec::new();
+        for (i, packet) in packets.iter().enumerate() {
+            if i != lost {
+                demuxer.push(packet, |payload, _| seen.push(payload.to_vec()));
+            }
+        }
+        assert_eq!(seen, frames[1..]);
+    }
+
     #[test]
     fn the_psi_tables_carry_a_valid_crc() {
         for section in [pat(), pmt()] {
@@ -366,18 +454,20 @@ mod tests {
         let stream = include_bytes!("../testdata/tone-1khz-48k-mono.ts");
         let mut demuxer = TsDemuxer::new();
         let mut decoder: Option<AacDecoder> = None;
+        let mut configs = Vec::new();
         let mut pcm = Vec::new();
         let mut carry = Vec::new();
         demuxer.push(stream, |payload, _| {
             carry.extend_from_slice(payload);
             let used = aac::parse_adts(&carry, |config, unit| {
+                configs.push(config);
                 let decoder = decoder.get_or_insert_with(|| AacDecoder::new(config, 48000.0).unwrap());
                 decoder.decode(unit, &mut pcm).unwrap();
             });
             carry.drain(..used);
         });
-        let decoder = decoder.expect("found an ADTS stream");
-        assert_eq!(decoder.config(), AacConfig { sample_rate: 48000, channels: 1 });
+        assert!(!configs.is_empty(), "found an ADTS stream");
+        assert!(configs.iter().all(|&c| c == AacConfig { sample_rate: 48000, channels: 1 }));
         let (hz, _) = aac::tests::measure(&pcm[pcm.len() / 4..pcm.len() * 3 / 4], 1, 48000.0);
         assert!((hz - 1000.0).abs() < 5.0, "{hz} Hz");
     }

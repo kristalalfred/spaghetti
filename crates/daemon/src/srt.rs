@@ -13,6 +13,25 @@ use crate::flow::{FlowMeter, Link};
 
 const RETRY_AFTER: Duration = Duration::from_millis(500);
 
+/// Claude: logs a connect failure at warn when it differs from the previous
+/// one, so a taken port or an unresolvable host shows up once, not every retry.
+#[derive(Default)]
+struct Failures {
+    last: Option<String>,
+}
+
+impl Failures {
+    fn report(&mut self, endpoint: &SrtEndpoint, error: &io::Error) {
+        let text = error.to_string();
+        if self.last.as_deref() == Some(text.as_str()) {
+            tracing::debug!(endpoint = endpoint.label(), error = text, "SRT connect failed again");
+        } else {
+            tracing::warn!(endpoint = endpoint.label(), error = text, "SRT connect failed; retrying");
+            self.last = Some(text);
+        }
+    }
+}
+
 /// Claude: an SRT socket spec checked against what srt-tokio accepts, so
 /// connecting cannot fail on the options themselves.
 #[derive(Clone)]
@@ -185,11 +204,15 @@ impl SrtLink {
         });
         let state = Arc::clone(&shared);
         let task = tokio::spawn(async move {
+            let mut failures = Failures::default();
             loop {
                 let mut socket = match endpoint.connect().await {
-                    Ok(socket) => socket,
+                    Ok(socket) => {
+                        failures = Failures::default();
+                        socket
+                    }
                     Err(e) => {
-                        tracing::debug!(endpoint = endpoint.label(), error = %e, "SRT receiver connect failed");
+                        failures.report(&endpoint, &e);
                         tokio::time::sleep(RETRY_AFTER).await;
                         continue;
                     }
@@ -249,6 +272,7 @@ async fn connect_draining(
     endpoint: &SrtEndpoint,
     messages: &mut tokio::sync::mpsc::Receiver<(Instant, Bytes)>,
 ) -> Option<srt_tokio::SrtSocket> {
+    let mut failures = Failures::default();
     loop {
         let attempt = endpoint.connect();
         tokio::pin!(attempt);
@@ -261,7 +285,7 @@ async fn connect_draining(
         match result {
             Ok(socket) => return Some(socket),
             Err(e) => {
-                tracing::debug!(endpoint = endpoint.label(), error = %e, "SRT sender connect failed");
+                failures.report(endpoint, &e);
                 let retry = tokio::time::sleep(RETRY_AFTER);
                 tokio::pin!(retry);
                 loop {

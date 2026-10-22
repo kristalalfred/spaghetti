@@ -7,7 +7,7 @@ use bytes::Bytes;
 use coreaudio_sys::AudioGetCurrentHostTime;
 use spaghetti_common::ipc_protocol::{FlowStatus, SrtSocket};
 
-use crate::aac::{self, AacDecoder};
+use crate::aac::{self, AacConfig, AacDecoder};
 use crate::ring::Ring;
 use crate::sinks::{MAX_SINKS, Sinks, SourceTiming};
 use crate::srt::{SrtEndpoint, SrtLink};
@@ -90,6 +90,7 @@ impl Drop for SrtSource {
 fn decode(received: Receiver<Bytes>, sinks: &Sinks, stop: &AtomicBool) {
     let mut demuxer = TsDemuxer::new();
     let mut adts = Vec::new();
+    let mut format: Option<AacConfig> = None;
     let mut decoder: Option<AacDecoder> = None;
     let mut pcm = Vec::new();
     while !stop.load(Ordering::Relaxed) {
@@ -100,7 +101,8 @@ fn decode(received: Receiver<Bytes>, sinks: &Sinks, stop: &AtomicBool) {
         };
         demuxer.push(&payload, |es, _| adts.extend_from_slice(es));
         let used = aac::parse_adts(&adts, |config, unit| {
-            if decoder.as_ref().map(AacDecoder::config) != Some(config) {
+            if format != Some(config) {
+                format = Some(config);
                 tracing::info!(
                     sample_rate = config.sample_rate,
                     channels = config.channels,

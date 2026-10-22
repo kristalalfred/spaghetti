@@ -3,6 +3,8 @@ use core_foundation::string::CFString;
 use core_foundation_sys::string::CFStringRef;
 use coreaudio_sys::*;
 use spaghetti_common::ipc_protocol::SystemDeviceInfo;
+
+use crate::tap;
 use std::mem;
 use std::ptr;
 
@@ -71,7 +73,7 @@ pub fn list_all_devices() -> Vec<SystemDeviceInfo> {
     device_ids
         .into_iter()
         .filter_map(|id| {
-            let uid = get_device_uid(id)?;
+            let uid = get_device_uid(id).filter(|uid| !uid.starts_with(tap::AGGREGATE_UID_PREFIX))?;
             let name = get_device_name(id).unwrap_or_else(|| uid.clone());
             let channels = get_output_channel_count(id);
             Some(SystemDeviceInfo {

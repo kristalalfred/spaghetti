@@ -24,6 +24,12 @@ unsafe extern "C" {
 
     unsafe fn spaghetti_destroy_tap(tap_id: AudioObjectID) -> i32;
 
+    unsafe fn spaghetti_set_tap_processes(
+        tap_id: AudioObjectID,
+        pids: *const i32,
+        pid_count: u32,
+    ) -> i32;
+
     unsafe fn spaghetti_create_aggregate_for_tap(
         tap_id: AudioObjectID,
         aggregate_uid: *const i8,
@@ -32,6 +38,8 @@ unsafe extern "C" {
 
     unsafe fn spaghetti_destroy_aggregate(aggregate_id: AudioObjectID) -> i32;
 }
+
+pub const AGGREGATE_UID_PREFIX: &str = "spaghetti_tap_agg_";
 
 /// Claude: a process tap and the private aggregate device that exposes it.
 struct ProcessTap {
@@ -148,7 +156,8 @@ pub struct TapSource {
 impl TapSource {
     pub fn create(source_id: u32, pids: &[u32], mode: TapMode) -> Result<Self, String> {
         let &first = pids.first().ok_or("a tap needs at least one process")?;
-        let process_tap = ProcessTap::create(pids, mode, &format!("spaghetti_tap_agg_{source_id}"))?;
+        let process_tap =
+            ProcessTap::create(pids, mode, &format!("{AGGREGATE_UID_PREFIX}{source_id}"))?;
         let format = unsafe { query_device_stream_format(process_tap.aggregate) }?;
         tracing::info!(
             sample_rate = format.mSampleRate,
@@ -182,7 +191,7 @@ impl TapSource {
             }),
             process_tap,
             sample_rate: format.mSampleRate,
-            label: get_process_name(first).unwrap_or_else(|| format!("PID {first}")),
+            label: app_label(first),
         })
     }
 
@@ -197,6 +206,20 @@ impl TapSource {
             Link::Idle
         };
         self.state.meter.status(link)
+    }
+
+    /// Claude: replaces the processes the running tap mixes, without stopping
+    /// its capture, so an app's helpers can come and go.
+    pub fn set_processes(&mut self, pids: &[u32]) -> Result<(), String> {
+        let pids: Vec<i32> = pids.iter().map(|&pid| pid as i32).collect();
+        let status = unsafe {
+            spaghetti_set_tap_processes(self.process_tap.tap, pids.as_ptr(), pids.len() as u32)
+        };
+        if status != 0 {
+            return Err(format!("set the tap's processes failed: OSStatus {status}"));
+        }
+        tracing::info!(label = self.label, ?pids, "updated tap processes");
+        Ok(())
     }
 
     pub fn timing(&self) -> SourceTiming {
@@ -361,6 +384,15 @@ pub fn list_audio_apps() -> Vec<AppInfo> {
     }
     apps.sort_by_key(|app| app.name.to_lowercase());
     apps
+}
+
+fn app_label(pid: u32) -> String {
+    process_path(pid)
+        .as_deref()
+        .and_then(app_bundle)
+        .map(|bundle| bundle_app(bundle).name)
+        .or_else(|| get_process_name(pid))
+        .unwrap_or_else(|| format!("PID {pid}"))
 }
 
 /// Claude: the outermost `.app` bundle in an executable's path.

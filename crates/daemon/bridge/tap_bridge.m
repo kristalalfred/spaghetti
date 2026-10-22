@@ -94,6 +94,36 @@ OSStatus spaghetti_destroy_tap(AudioObjectID tap_id) {
     return AudioHardwareDestroyProcessTap(tap_id);
 }
 
+OSStatus spaghetti_set_tap_processes(AudioObjectID tap_id, const pid_t *pids, uint32_t pid_count) {
+    NSMutableArray<NSNumber *> *processObjects = [NSMutableArray arrayWithCapacity:pid_count];
+    for (uint32_t i = 0; i < pid_count; i++) {
+        AudioObjectID objID = process_object_for_pid(pids[i]);
+        if (objID != kAudioObjectUnknown) {
+            [processObjects addObject:@(objID)];
+        }
+    }
+    if (processObjects.count == 0) {
+        return kAudio_ParamError;
+    }
+
+    AudioObjectPropertyAddress addr = {
+        .mSelector = kAudioTapPropertyDescription,
+        .mScope    = kAudioObjectPropertyScopeGlobal,
+        .mElement  = kAudioObjectPropertyElementMain,
+    };
+    CFTypeRef current = NULL;
+    UInt32 dataSize = sizeof(CFTypeRef);
+    OSStatus status = AudioObjectGetPropertyData(tap_id, &addr, 0, NULL, &dataSize, &current);
+    if (status != noErr || current == NULL) {
+        return status != noErr ? status : kAudio_ParamError;
+    }
+
+    CATapDescription *desc = (__bridge_transfer CATapDescription *)current;
+    desc.processes = processObjects;
+    CFTypeRef updated = (__bridge CFTypeRef)desc;
+    return AudioObjectSetPropertyData(tap_id, &addr, 0, NULL, sizeof(CFTypeRef), &updated);
+}
+
 /// Query the UID of the system default output device, to use as the aggregate's clock source.
 /// Returns nil if the query fails.
 static NSString *get_default_output_device_uid(void) {
