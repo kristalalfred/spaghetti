@@ -73,6 +73,7 @@ sudo killall coreaudiod
 # --- CLI binaries ---
 
 step "Installing binaries to ${BIN_DIR}"
+codesign --sign - --force target/release/spaghettid
 sudo cp target/release/spaghetti "${BIN_DIR}/spaghetti"
 sudo cp target/release/spaghettid "${BIN_DIR}/spaghettid"
 sudo rm -f "${BIN_DIR}/spaghetti-tui"

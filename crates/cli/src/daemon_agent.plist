@@ -7,7 +7,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/spaghettid</string>
+        <string>__DAEMON_PATH__</string>
     </array>
 
     <key>RunAtLoad</key>

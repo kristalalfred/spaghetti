@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.spaghetti.daemon</string>
+    <key>CFBundleName</key>
+    <string>spaghettid</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Spaghetti sends and receives audio over SRT with computers on your network.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Spaghetti captures the audio of the apps you route.</string>
+</dict>
+</plist>

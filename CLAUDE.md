@@ -16,6 +16,7 @@ Daemon is installed system-wide. Standard loop after editing `crates/daemon/`:
 ```bash
 sudo chown -R $USER target/release
 cargo build --release --workspace
+codesign --sign - --force target/release/spaghettid
 sudo cp target/release/spaghettid /usr/local/bin/spaghettid
 spaghetti daemon restart
 ```

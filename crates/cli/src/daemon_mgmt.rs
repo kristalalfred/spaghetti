@@ -2,7 +2,8 @@
 //!
 //! The CLI owns the lifecycle of the agent plist at
 //! ~/Library/LaunchAgents/com.spaghetti.daemon.plist. The plist template is
-//! embedded at compile time and rendered with the user's log path on install.
+//! embedded at compile time and rendered with the daemon's path and the user's
+//! log path on install.
 
 use std::fs;
 use std::path::PathBuf;
@@ -39,6 +40,19 @@ pub fn log_path() -> Result<PathBuf, String> {
     Ok(log_dir()?.join("spaghettid.log"))
 }
 
+/// Claude: the spaghettid installed beside this CLI, so the agent runs the
+/// daemon that ships with it wherever the pair was installed.
+fn daemon_path() -> Result<PathBuf, String> {
+    let cli = std::env::current_exe()
+        .and_then(fs::canonicalize)
+        .map_err(|e| format!("locate the spaghetti CLI: {e}"))?;
+    let daemon = cli.with_file_name("spaghettid");
+    if !daemon.is_file() {
+        return Err(format!("{} is not installed", daemon.display()));
+    }
+    Ok(daemon)
+}
+
 fn agents_dir() -> Result<PathBuf, String> {
     Ok(home_dir()?.join("Library/LaunchAgents"))
 }
@@ -62,11 +76,17 @@ pub fn install() -> Result<(), String> {
     let agents = agents_dir()?;
     fs::create_dir_all(&agents).map_err(|e| format!("create {}: {e}", agents.display()))?;
 
+    let daemon = daemon_path()?;
     let log = log_path()?;
-    let rendered = PLIST_TEMPLATE.replace(
-        "__LOG_PATH__",
-        log.to_str().ok_or("log path is not valid UTF-8")?,
-    );
+    let rendered = PLIST_TEMPLATE
+        .replace(
+            "__DAEMON_PATH__",
+            daemon.to_str().ok_or("daemon path is not valid UTF-8")?,
+        )
+        .replace(
+            "__LOG_PATH__",
+            log.to_str().ok_or("log path is not valid UTF-8")?,
+        );
 
     let plist = plist_path()?;
     fs::write(&plist, rendered).map_err(|e| format!("write {}: {e}", plist.display()))?;
