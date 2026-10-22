@@ -128,10 +128,14 @@ pub struct DaemonStatus {
     pub route_count: u32,
 }
 
+/// An app and the processes of it Core Audio knows.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AppInfo {
-    pub pid: u32,
     pub name: String,
+    pub bundle_id: Option<String>,
+    /// The `.app` the processes run from; absent for a process outside any bundle.
+    pub bundle_path: Option<String>,
+    pub pids: Vec<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

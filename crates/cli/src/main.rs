@@ -211,10 +211,12 @@ fn print_apps(apps: &[AppInfo]) {
         println!("No audio apps detected.");
         return;
     }
-    println!("{:<8} NAME", "PID");
-    println!("{}", "-".repeat(40));
+    let name_w = col_width(apps.iter().map(|a| a.name.as_str()), 24);
+    println!("{:<name_w$} {:<16} BUNDLE", "NAME", "PIDS");
+    println!("{}", "-".repeat(name_w + 40));
     for app in apps {
-        println!("{:<8} {}", app.pid, app.name);
+        let pids = app.pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        println!("{:<name_w$} {:<16} {}", app.name, pids, app.bundle_id.as_deref().unwrap_or("-"));
     }
 }
 
@@ -460,8 +462,8 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
             let mode = if mute { TapMode::MuteSourceWhenTapped } else { TapMode::Mirror };
 
             // Try parsing as PID first; fall back to name lookup.
-            let pid = if let Ok(pid) = target.parse::<u32>() {
-                pid
+            let pids = if let Ok(pid) = target.parse::<u32>() {
+                vec![pid]
             } else {
                 let response = client::send_request(&mut stream, &Request::ListApps)?;
                 let apps = match response {
@@ -479,10 +481,11 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
                 let needle = target.to_lowercase();
                 let matched = apps
                     .iter()
-                    .find(|a| a.name.to_lowercase().contains(&needle));
+                    .find(|a| a.name.to_lowercase() == needle)
+                    .or_else(|| apps.iter().find(|a| a.name.to_lowercase().contains(&needle)));
 
                 match matched {
-                    Some(app) => app.pid,
+                    Some(app) => app.pids.clone(),
                     None => {
                         print_error(&format!("no app matching '{target}' found"));
                         std::process::exit(1);
@@ -490,7 +493,7 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            let source = SourceSpec::Tap { pids: vec![pid], mode };
+            let source = SourceSpec::Tap { pids, mode };
             create_source(&mut stream, source)?;
         }
 

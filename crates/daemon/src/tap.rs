@@ -1,7 +1,11 @@
+use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use core_foundation::bundle::CFBundle;
+use core_foundation::string::CFString;
+use core_foundation::url::CFURL;
 use coreaudio_sys::*;
 use spaghetti_common::ipc_protocol::{AppInfo, FlowStatus, TapMode};
 
@@ -325,11 +329,81 @@ fn get_process_name(pid: u32) -> Option<String> {
     }
 }
 
-/// List processes currently producing audio.
-///
-/// Uses `kAudioHardwarePropertyProcessObjectList` to get process objects known
-/// to Core Audio, then queries each for its PID and bundle ID.
+/// Claude: the processes Core Audio knows, grouped under the app bundle each
+/// runs from. A helper inside `Slack.app/Contents/Frameworks/...` belongs to
+/// Slack; a process outside any `.app` is listed alone.
 pub fn list_audio_apps() -> Vec<AppInfo> {
+    let mut apps: BTreeMap<String, AppInfo> = BTreeMap::new();
+    for pid in audio_process_pids() {
+        let executable = process_path(pid);
+        match executable.as_deref().and_then(app_bundle) {
+            Some(bundle) => apps
+                .entry(bundle.to_string())
+                .or_insert_with(|| bundle_app(bundle))
+                .pids
+                .push(pid),
+            None => {
+                apps.insert(
+                    format!("pid:{pid}"),
+                    AppInfo {
+                        name: get_process_name(pid).unwrap_or_else(|| format!("PID {pid}")),
+                        bundle_id: None,
+                        bundle_path: None,
+                        pids: vec![pid],
+                    },
+                );
+            }
+        }
+    }
+    let mut apps: Vec<AppInfo> = apps.into_values().collect();
+    for app in &mut apps {
+        app.pids.sort_unstable();
+    }
+    apps.sort_by_key(|app| app.name.to_lowercase());
+    apps
+}
+
+/// Claude: the outermost `.app` bundle in an executable's path.
+fn app_bundle(executable: &str) -> Option<&str> {
+    executable.find(".app/").map(|end| &executable[..end + 4])
+}
+
+fn bundle_app(bundle: &str) -> AppInfo {
+    let fallback = bundle
+        .rsplit('/')
+        .next()
+        .unwrap_or(bundle)
+        .trim_end_matches(".app")
+        .to_string();
+    let info = CFURL::from_path(bundle, true)
+        .and_then(CFBundle::new)
+        .map(|bundle| bundle.info_dictionary());
+    let string = |key: &str| {
+        info.as_ref()?
+            .find(CFString::new(key))
+            .and_then(|value| value.downcast::<CFString>())
+            .map(|value| value.to_string())
+            .filter(|value| !value.trim().is_empty())
+    };
+    AppInfo {
+        name: string("CFBundleDisplayName")
+            .or_else(|| string("CFBundleName"))
+            .unwrap_or(fallback),
+        bundle_id: string("CFBundleIdentifier"),
+        bundle_path: Some(bundle.to_string()),
+        pids: Vec::new(),
+    }
+}
+
+fn process_path(pid: u32) -> Option<String> {
+    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let len = unsafe { libc::proc_pidpath(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    (len > 0)
+        .then(|| String::from_utf8(buf[..len as usize].to_vec()).ok())
+        .flatten()
+}
+
+fn audio_process_pids() -> Vec<u32> {
     use std::{mem, ptr};
 
     let prop = AudioObjectPropertyAddress {
@@ -369,39 +443,58 @@ pub fn list_audio_apps() -> Vec<AppInfo> {
         return Vec::new();
     }
 
-    let mut apps = Vec::new();
-    for &obj in &objects {
-        if let Some(info) = process_object_to_app_info(obj) {
-            apps.push(info);
-        }
-    }
-    apps
-}
-
-/// Extract PID and name from a Core Audio process object.
-fn process_object_to_app_info(obj: AudioObjectID) -> Option<AppInfo> {
-    use std::{mem, ptr};
-
-    // Query PID
     let pid_prop = AudioObjectPropertyAddress {
         mSelector: kAudioProcessPropertyPID,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain,
     };
+    objects
+        .into_iter()
+        .filter_map(|obj| {
+            let mut pid: i32 = 0;
+            let mut size = mem::size_of::<i32>() as u32;
+            let status = unsafe {
+                AudioObjectGetPropertyData(
+                    obj,
+                    &pid_prop,
+                    0,
+                    ptr::null(),
+                    &mut size,
+                    (&mut pid as *mut i32).cast(),
+                )
+            };
+            (status == 0 && pid > 0).then_some(pid as u32)
+        })
+        .collect()
+}
 
-    let mut pid: i32 = 0;
-    let mut size = mem::size_of::<i32>() as u32;
-    let status = unsafe {
-        AudioObjectGetPropertyData(obj, &pid_prop, 0, ptr::null(), &mut size, (&mut pid as *mut i32).cast())
-    };
-    if status != 0 || pid <= 0 {
-        return None;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn helpers_belong_to_the_outermost_app_bundle() {
+        assert_eq!(
+            app_bundle("/System/Applications/Music.app/Contents/MacOS/Music"),
+            Some("/System/Applications/Music.app")
+        );
+        assert_eq!(
+            app_bundle(
+                "/Applications/Slack.app/Contents/Frameworks/Slack Helper.app/Contents/MacOS/Slack Helper"
+            ),
+            Some("/Applications/Slack.app")
+        );
+        assert_eq!(app_bundle("/usr/sbin/coreaudiod"), None);
+        assert_eq!(app_bundle("/Applications/Weird.application/bin/x"), None);
     }
 
-    let name = get_process_name(pid as u32).unwrap_or_else(|| format!("PID {pid}"));
-
-    Some(AppInfo {
-        pid: pid as u32,
-        name,
-    })
+    #[test]
+    fn a_bundle_is_named_from_its_info_plist() {
+        let music = bundle_app("/System/Applications/Music.app");
+        assert_eq!(music.name, "Music");
+        assert_eq!(music.bundle_id.as_deref(), Some("com.apple.Music"));
+        let missing = bundle_app("/nonexistent/Some Thing.app");
+        assert_eq!(missing.name, "Some Thing");
+        assert_eq!(missing.bundle_id, None);
+    }
 }
