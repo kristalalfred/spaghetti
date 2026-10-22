@@ -1,12 +1,12 @@
 # Spaghetti
 
-macOS audio routing tool. Lets you tap audio from a running app (by PID) and route it to any output device. Ships as a virtual Core Audio driver, a daemon, and a CLI.
+macOS audio routing tool. Routes a source (a tapped app, or a stream received over SRT) to destinations (any output device, or an SRT peer). Ships as a virtual Core Audio driver, a daemon, and a CLI.
 
 ## Crates
 
 - **`crates/asp-driver/`** — user-space Core Audio HAL plugin. Registers a virtual output device (`SpaghettiDevice_UID`) the system can target. Info.plist configures the bundle.
-- **`crates/daemon/`** (`spaghettid`) — long-running process. Owns the audio routing graph, the tap lifecycle, and an IPC control socket. Managed as a macOS LaunchAgent (`com.spaghetti.daemon`).
-- **`crates/cli/`** (`spaghetti`) — user-facing CLI. `spaghetti tap <pid>`, `spaghetti route <tap_id> <device_uid>`, `spaghetti daemon install/restart/logs`, etc.
+- **`crates/daemon/`** (`spaghettid`) — long-running process. Owns the audio routing graph, source and route lifecycles, and an IPC control socket. Managed as a macOS LaunchAgent (`com.spaghetti.daemon`).
+- **`crates/cli/`** (`spaghetti`) — user-facing CLI. `spaghetti tap <app>`, `spaghetti receive srt://...`, `spaghetti route <source_id> <device_uid|srt://...>`, `spaghetti daemon install/restart/logs`, etc.
 - **`crates/common/`** — IPC protocol definitions (`ipc_protocol.rs`) and shared types.
 
 ## Build + install
@@ -22,9 +22,9 @@ spaghetti daemon restart
 
 Daemon logs: `~/Library/Logs/spaghetti/spaghettid.log`. Follow with `spaghetti daemon logs --follow` or `tail -f`.
 
-## Architecture: tap → route pipeline
+## Architecture: source → route pipeline
 
-The routing path is the trickiest part. Flow:
+The routing path is the trickiest part. Flow for a tap routed to a device:
 
 ```
 target app
@@ -40,6 +40,18 @@ target app
   → destination device
 ```
 
+SRT ends replace either side:
+
+```
+SRT source: srt-tokio receive → TsDemuxer → ADTS → AudioToolbox AAC decode at 48 kHz
+  → the same per route rings, Playout and AUHAL as a tap
+
+SRT destination: the route's ring → encoder thread (every 5 ms, 1024-frame chunks)
+  → AudioToolbox AAC-LC 256 kb/s → ADTS → TsMuxer → 1316-byte messages → srt-tokio send
+```
+
+A source reports its `SourceTiming`: its rate, and how unevenly it pushes. `Playout` sizes its jitter buffer from it.
+
 Key files:
 - `crates/daemon/src/router.rs` — `Router`, the routing graph: taps, routes, and attaching a route's ring to its tap and its output.
 - `crates/daemon/src/tap.rs` — `TapSource`: a process tap, its private aggregate device and the capture IOProc (`capture_ioproc`) that pushes into every attached route's ring. FFI wrappers around the ObjC bridge, and `list_audio_apps`.
@@ -48,6 +60,10 @@ Key files:
 - `crates/daemon/src/ring.rs` — the SPSC ring of interleaved stereo frames.
 - `crates/daemon/src/sinks.rs` + `rt_slots.rs` — `Sinks`, the rings a source feeds, held in `RtSlots`, the lock-free handoff that lets routes join and leave a running capture.
 - `crates/daemon/bridge/tap_bridge.m` + `.h` — ObjC bridge for `AudioHardwareCreateProcessTap` and aggregate device creation. Compiled by `build.rs`.
+- `crates/daemon/src/srt.rs` — `SrtLink`, one SRT connection that reconnects when it drops, with its `FlowStatus`.
+- `crates/daemon/src/srt_receiver.rs` + `srt_sender.rs` — `SrtSource` (decode thread) and `SrtOutput` (encode thread).
+- `crates/daemon/src/aac.rs` + `ts.rs` — the AudioToolbox AAC codec, ADTS framing, and a single-stream MPEG-TS muxer and demuxer.
+- `crates/daemon/src/flow.rs` — `FlowMeter`, which every source and output uses to report idle, connecting, connected, flowing or stalled.
 
 ## Core Audio gotchas (learned the hard way)
 
@@ -57,15 +73,19 @@ Key files:
 
 **`coreaudio_sys::AudioBufferList` is a flexible-array-member trap.** It's declared `mBuffers: [AudioBuffer; 1]`. Writing to `mBuffers.as_mut_ptr().add(i)` for `i ≥ 1` is out-of-provenance in Rust → UB → Core Audio's validator rejects the ABL with `-50 paramErr`. When building a multi-buffer ABL on the stack, use a `#[repr(C)]` wrapper struct with a correctly-sized array. When reading/writing a multi-buffer ABL handed in from C, compute byte offsets via `mem::offset_of!(AudioBufferList, mBuffers)` instead of going through the `[AudioBuffer; 1]` field.
 
-**Tap ASBD ≠ IOProc delivery shape.** Process taps report themselves as one thing via `kAudioDevicePropertyStreamFormat` but can deliver a different layout in the IOProc. In practice we see **interleaved stereo f32** (`mNumberBuffers=1, mNumberChannels=2, mBytesPerFrame=8, mFormatFlags=9`) even when other codepaths imply non-interleaved. `Sink::push` accepts either layout.
+**Tap ASBD ≠ IOProc delivery shape.** Process taps report themselves as one thing via `kAudioDevicePropertyStreamFormat` but can deliver a different layout in the IOProc. In practice we see **interleaved stereo f32** (`mNumberBuffers=1, mNumberChannels=2, mBytesPerFrame=8, mFormatFlags=9`) even when other codepaths imply non-interleaved. `push_buffers` in `tap.rs` accepts either layout.
 
 **`AudioConverterFillComplexBuffer` output ABL must match the destination ASBD's layout.** For non-interleaved stereo output, the output ABL needs `mNumberBuffers = 2`, each with `mNumberChannels = 1`. Sizing it from the input ABL (which might be interleaved, so `mNumberBuffers = 1`) gives `-50 paramErr`.
+
+**srt-tokio releases received packets unevenly.** Packets stamped 21.3 ms apart arrive 9 to 34 ms apart, so `SrtSource` declares 25 ms of delivery jitter and routes from it buffer that much more. The sender stamps each packet with the capture time of its audio, from the ring's push times, rather than its send time; stamping with send time added the encoder's polling and AAC batching on top.
+
+**The driver's activity region is system-wide.** `Initialize` unlinks and recreates `/spaghetti.activity`. A process that loads the driver with a host would replace the live driver's region, and every daemon started afterwards would read zeros until coreaudiod restarts. Only a non-null host creates it.
 
 **Sample rate conversion happens per route on the output side, with rubato.** The render callback needs an exact frame count, which a fixed-output resampler provides by pulling a variable amount from the ring. `AudioConverter` was dropped because it resets its filter, and glitches, whenever its rate is changed at runtime.
 
 ## IPC
 
-Unix domain socket at `spaghetti_common::ipc_protocol::SOCKET_PATH`. Request/response enum in `crates/common/src/ipc_protocol.rs`. Daemon dispatches in `crates/daemon/src/server.rs`. The CLI client is `crates/cli/src/client.rs`.
+Unix domain socket at `spaghetti_common::ipc_protocol::SOCKET_PATH`. Request/response enum in `crates/common/src/ipc_protocol.rs`; bump `IPC_VERSION` when a payload changes shape. Daemon dispatches in `crates/daemon/src/server.rs`. The CLI client is `crates/cli/src/client.rs`.
 
 ## Virtual devices — the multi-device model
 
@@ -91,7 +111,7 @@ The activity shm is still single-region — only the first (default) device feed
 - No heap allocation in real-time callbacks. Pre-allocate buffers in `Playout` / `OutputCallbackState`.
 - No AI attribution in commits.
 
-## Diagnostic logging in router.rs
+## Diagnostic logging
 
 Real-time paths emit first-fire diagnostics that are invaluable for debugging format/rate mismatches:
 - `tap ASBD` — source format from `query_device_stream_format`.
@@ -102,5 +122,8 @@ Real-time paths emit first-fire diagnostics that are invaluable for debugging fo
 - `render callback first fire` — output ABL layout and the ring fill at the first render.
 - `route playout health` (debug, every 10 s) — each route's smoothed ring fill against its target, the controller's ratio correction in ppm, and glitch counters.
 - `route playout glitched since the last report` (info) — underruns (re-primes), resyncs and ring overflows since the previous report.
+- `SRT connected` / `SRT sender disconnected` / `SRT receiver disconnected` (info) — each SRT link's peer coming and going.
+- `SRT stream format` (info) — the AAC rate and channels of a received stream, logged when they change.
+- `route SRT health` (debug, every 10 s) — an SRT route's state, bytes and packet counters.
 
 Grep these strings in `~/Library/Logs/spaghetti/spaghettid.log` when routing breaks.

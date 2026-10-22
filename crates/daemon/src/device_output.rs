@@ -2,24 +2,28 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use coreaudio_sys::*;
+use spaghetti_common::ipc_protocol::FlowStatus;
 
 use crate::abl;
+use crate::flow::{FlowMeter, Link};
 use crate::mixer;
 use crate::playout::{Playout, PlayoutHealth};
 use crate::ring::{CHANNELS, Ring};
+use crate::sinks::SourceTiming;
 
 /// Claude: a route's output to a Core Audio device. The device pulls through the
 /// render callback, and `Playout` resamples the route's ring to the device rate.
 pub struct DeviceOutput {
     unit: OutputUnit,
     health: Arc<PlayoutHealth>,
+    meter: Arc<FlowMeter>,
     reported_glitches: [u32; 3],
 }
 
 impl DeviceOutput {
     pub unsafe fn open(
         device: AudioObjectID,
-        source_rate: f64,
+        source: SourceTiming,
         ring: Arc<Ring>,
         volume: Arc<AtomicU32>,
     ) -> Result<Self, String> {
@@ -45,22 +49,37 @@ impl DeviceOutput {
         );
         unsafe { unit.set_client_format(&dst_asbd) }?;
 
-        let playout = Playout::new(source_rate, dst_asbd.mSampleRate, unsafe {
-            AudioGetHostClockFrequency()
-        })?;
+        let playout = Playout::new(
+            source.sample_rate,
+            dst_asbd.mSampleRate,
+            unsafe { AudioGetHostClockFrequency() },
+            source.delivery_jitter,
+        )?;
         let health = playout.health();
         tracing::info!(
-            src_rate = source_rate,
+            src_rate = source.sample_rate,
             dst_rate = dst_asbd.mSampleRate,
+            delivery_jitter = source.delivery_jitter,
             delay_frames = playout.delay_frames(),
             "created resampler"
         );
 
-        unsafe { unit.connect(ring, playout, volume) }?;
+        let meter = Arc::new(FlowMeter::new());
+        unsafe { unit.connect(ring, playout, volume, Arc::clone(&meter)) }?;
         Ok(Self {
             unit,
             health,
+            meter,
             reported_glitches: [0; 3],
+        })
+    }
+
+    /// Claude: `Connected` until the route's ring fills enough to play.
+    pub fn status(&self) -> FlowStatus {
+        self.meter.status(Link::Connected {
+            peer: None,
+            packets_lost: 0,
+            packets_retransmitted: 0,
         })
     }
 
@@ -100,6 +119,7 @@ struct OutputCallbackState {
     ring: Arc<Ring>,
     playout: Playout,
     volume: Arc<AtomicU32>,
+    meter: Arc<FlowMeter>,
     logged_once: bool,
 }
 
@@ -201,11 +221,13 @@ impl OutputUnit {
         ring: Arc<Ring>,
         playout: Playout,
         volume: Arc<AtomicU32>,
+        meter: Arc<FlowMeter>,
     ) -> Result<(), String> {
         self.render_state = Box::into_raw(Box::new(OutputCallbackState {
             ring,
             playout,
             volume,
+            meter,
             logged_once: false,
         }));
 
@@ -297,6 +319,12 @@ unsafe extern "C" fn route_render_callback(
     };
 
     state.playout.render(&state.ring, &mut out, now);
+    if state.playout.is_playing() {
+        state.meter.record(
+            (in_number_frames as usize * CHANNELS * std::mem::size_of::<f32>()) as u64,
+            now,
+        );
+    }
 
     let vol = f32::from_bits(state.volume.load(Ordering::Relaxed));
     for plane in out.iter_mut() {

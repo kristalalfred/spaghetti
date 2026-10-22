@@ -3,11 +3,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use coreaudio_sys::*;
-use spaghetti_common::ipc_protocol::{AppInfo, TapMode};
+use spaghetti_common::ipc_protocol::{AppInfo, FlowStatus, TapMode};
 
 use crate::abl;
-use crate::ring::Ring;
-use crate::sinks::{MAX_SINKS, Sinks};
+use crate::flow::{FlowMeter, Link};
+use crate::ring::{CHANNELS, Ring};
+use crate::sinks::{MAX_SINKS, Sinks, SourceTiming};
 
 unsafe extern "C" {
     unsafe fn spaghetti_create_tap(
@@ -35,12 +36,14 @@ struct ProcessTap {
 }
 
 impl ProcessTap {
-    fn create(pid: u32, mode: TapMode, aggregate_uid: &str) -> Result<Self, String> {
-        let pid_i32 = pid as i32;
+    fn create(pids: &[u32], mode: TapMode, aggregate_uid: &str) -> Result<Self, String> {
+        let pids: Vec<i32> = pids.iter().map(|&pid| pid as i32).collect();
         let mut tap: AudioObjectID = 0;
         let mute_behavior = if mode == TapMode::MuteSourceWhenTapped { 1 } else { 0 };
 
-        let status = unsafe { spaghetti_create_tap(&pid_i32, 1, mute_behavior, &mut tap) };
+        let status = unsafe {
+            spaghetti_create_tap(pids.as_ptr(), pids.len() as u32, mute_behavior, &mut tap)
+        };
         if status != 0 {
             return Err(format!(
                 "AudioHardwareCreateProcessTap failed: OSStatus {status}"
@@ -78,6 +81,7 @@ impl Drop for ProcessTap {
 /// Claude: what the IOProc reads. It outlives every IOProc that points at it.
 struct CaptureState {
     sinks: Sinks,
+    meter: FlowMeter,
     logged_once: AtomicBool,
 }
 
@@ -134,14 +138,13 @@ pub struct TapSource {
     state: Arc<CaptureState>,
     process_tap: ProcessTap,
     sample_rate: f64,
-    pub pid: u32,
-    pub app_name: String,
-    pub mode: TapMode,
+    pub label: String,
 }
 
 impl TapSource {
-    pub fn create(source_id: u32, pid: u32, mode: TapMode) -> Result<Self, String> {
-        let process_tap = ProcessTap::create(pid, mode, &format!("spaghetti_tap_agg_{source_id}"))?;
+    pub fn create(source_id: u32, pids: &[u32], mode: TapMode) -> Result<Self, String> {
+        let &first = pids.first().ok_or("a tap needs at least one process")?;
+        let process_tap = ProcessTap::create(pids, mode, &format!("spaghetti_tap_agg_{source_id}"))?;
         let format = unsafe { query_device_stream_format(process_tap.aggregate) }?;
         tracing::info!(
             sample_rate = format.mSampleRate,
@@ -165,23 +168,38 @@ impl TapSource {
             ));
         }
 
-        tracing::info!(source_id, pid, "created process tap");
+        tracing::info!(source_id, ?pids, "created process tap");
         Ok(Self {
             capture: None,
             state: Arc::new(CaptureState {
                 sinks: Sinks::new(),
+                meter: FlowMeter::new(),
                 logged_once: AtomicBool::new(false),
             }),
             process_tap,
             sample_rate: format.mSampleRate,
-            pid,
-            app_name: get_process_name(pid).unwrap_or_else(|| format!("PID {pid}")),
-            mode,
+            label: get_process_name(first).unwrap_or_else(|| format!("PID {first}")),
         })
     }
 
-    pub fn sample_rate(&self) -> f64 {
-        self.sample_rate
+    pub fn status(&self) -> FlowStatus {
+        let link = if self.capture.is_some() {
+            Link::Connected {
+                peer: None,
+                packets_lost: 0,
+                packets_retransmitted: 0,
+            }
+        } else {
+            Link::Idle
+        };
+        self.state.meter.status(link)
+    }
+
+    pub fn timing(&self) -> SourceTiming {
+        SourceTiming {
+            sample_rate: self.sample_rate,
+            delivery_jitter: 0.0,
+        }
     }
 
     pub fn add_sink(&mut self, ring: Arc<Ring>) -> Result<usize, String> {
@@ -205,7 +223,7 @@ impl TapSource {
     pub fn remove_sink(&mut self, slot: usize) {
         drop(self.state.sinks.remove(slot));
         if self.state.sinks.is_empty() && self.capture.take().is_some() {
-            tracing::info!(pid = self.pid, "stopped tap capture");
+            tracing::info!(label = self.label, "stopped tap capture");
         }
     }
 }
@@ -277,6 +295,9 @@ unsafe extern "C" fn capture_ioproc(
     let buffers = unsafe { abl::buffers(in_input_data) };
     let mut frames = 0;
     unsafe { state.sinks.for_each(|ring| frames = push_buffers(ring, buffers, now)) };
+    state
+        .meter
+        .record((frames * CHANNELS * std::mem::size_of::<f32>()) as u64, now);
 
     if !state.logged_once.swap(true, Ordering::Relaxed)
         && let Some(first) = buffers.first()

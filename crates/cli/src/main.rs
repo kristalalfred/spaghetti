@@ -3,8 +3,8 @@ mod daemon_mgmt;
 
 use clap::{Parser, Subcommand};
 use spaghetti_common::ipc_protocol::{
-    ActivityInfo, AppInfo, DeviceInfo, Request, Response, RouteInfo, SystemDeviceInfo, TapInfo,
-    TapMode,
+    ActivityInfo, AppInfo, Destination, DeviceInfo, FlowState, Request, Response, RouteInfo,
+    SourceInfo, SourceSpec, SrtMode, SrtSocket, SystemDeviceInfo, TapMode,
 };
 use std::io::{IsTerminal, Write};
 
@@ -59,7 +59,7 @@ enum Command {
     Status,
     /// List audio-producing apps
     Apps,
-    /// Create a tap on an app (by PID or name)
+    /// Tap an app's audio as a source (by PID or name)
     Tap {
         /// Process ID or app name to tap
         target: String,
@@ -67,23 +67,32 @@ enum Command {
         #[arg(short, long)]
         mute: bool,
     },
-    /// Remove a tap
-    Untap {
-        /// Tap ID to remove
-        tap_id: u32,
+    /// Receive AAC in MPEG-TS over SRT as a source
+    Receive {
+        /// srt://:PORT to listen, srt://HOST:PORT to call
+        url: String,
+        #[command(flatten)]
+        srt: SrtArgs,
     },
-    /// List active taps
-    Taps,
-    /// Route a tap to a virtual device
+    /// Remove a source and its routes
+    Unsource {
+        /// Source ID to remove
+        source_id: u32,
+    },
+    /// List sources
+    Sources,
+    /// Route a source to an output device or an SRT peer
     Route {
-        /// Tap ID to route
-        tap_id: u32,
-        /// Destination device UID
+        /// Source ID to route
+        source_id: u32,
+        /// Output device UID, or srt://:PORT to listen, srt://HOST:PORT to call
         #[arg(default_value = "SpaghettiDevice_UID")]
-        device: String,
-        /// Initial volume (0.0-1.0)
+        destination: String,
+        /// Initial volume (0.0-2.0)
         #[arg(short, long, default_value = "1.0")]
         volume: f32,
+        #[command(flatten)]
+        srt: SrtArgs,
     },
     /// Remove a route
     Unroute {
@@ -115,6 +124,44 @@ enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
+}
+
+#[derive(clap::Args)]
+struct SrtArgs {
+    /// SRT latency in milliseconds
+    #[arg(long, default_value = "200")]
+    latency: u32,
+    /// SRT passphrase, 10 to 79 characters; the peer must use the same one
+    #[arg(long)]
+    passphrase: Option<String>,
+}
+
+impl SrtArgs {
+    fn socket(&self, url: &str) -> Result<SrtSocket, String> {
+        let rest = url
+            .strip_prefix("srt://")
+            .ok_or_else(|| format!("'{url}' is not an srt:// URL"))?;
+        let (host, port) = rest
+            .rsplit_once(':')
+            .ok_or_else(|| format!("'{url}' has no port"))?;
+        let port: u16 = port
+            .parse()
+            .map_err(|_| format!("'{port}' is not a port"))?;
+        let mode = if host.is_empty() {
+            SrtMode::Listen { port }
+        } else {
+            SrtMode::Call {
+                host: host.trim_start_matches('[').trim_end_matches(']').to_string(),
+                port,
+            }
+        };
+        Ok(SrtSocket {
+            mode,
+            latency_ms: self.latency,
+            passphrase: self.passphrase.clone(),
+            key_size: None,
+        })
+    }
 }
 
 #[derive(Subcommand)]
@@ -171,15 +218,45 @@ fn print_apps(apps: &[AppInfo]) {
     }
 }
 
-fn print_taps(taps: &[TapInfo]) {
-    if taps.is_empty() {
-        println!("No active taps.");
+fn flow_label(state: FlowState) -> &'static str {
+    match state {
+        FlowState::Idle => "idle",
+        FlowState::Connecting => "connecting",
+        FlowState::Connected => "connected",
+        FlowState::Flowing => "flowing",
+        FlowState::Stalled => "stalled",
+    }
+}
+
+fn srt_label(socket: &SrtSocket) -> String {
+    match &socket.mode {
+        SrtMode::Listen { port } => format!("srt://:{port}"),
+        SrtMode::Call { host, port } => format!("srt://{host}:{port}"),
+    }
+}
+
+fn print_sources(sources: &[SourceInfo]) {
+    if sources.is_empty() {
+        println!("No sources.");
         return;
     }
-    println!("{:<6} {:<8} {:<8} APP NAME", "ID", "PID", "MODE");
-    println!("{}", "-".repeat(50));
-    for tap in taps {
-        println!("{:<6} {:<8} {:<8} {}", tap.tap_id, tap.pid, tap.mode.label(), tap.app_name);
+    let mut sources: Vec<_> = sources.iter().collect();
+    sources.sort_by_key(|s| s.source_id);
+    let label_w = col_width(sources.iter().map(|s| s.label.as_str()), 24);
+    println!("{:<6} {:<12} {:<label_w$} STATE", "ID", "KIND", "LABEL");
+    println!("{}", "-".repeat(label_w + 32));
+    for source in sources {
+        let kind = match &source.spec {
+            SourceSpec::Tap { mode, .. } => format!("tap ({})", mode.label()),
+            SourceSpec::Srt(_) => "srt".to_string(),
+        };
+        println!(
+            "{:<6} {:<12} {:<label_w$} {}",
+            source.source_id,
+            kind,
+            source.label,
+            flow_label(source.status.state)
+        );
     }
 }
 
@@ -188,13 +265,26 @@ fn print_routes(routes: &[RouteInfo]) {
         println!("No active routes.");
         return;
     }
-    let dev_w = col_width(routes.iter().map(|r| r.device_uid.as_str()), 30);
-    println!("{:<6} {:<6} {:<dev_w$} VOLUME", "ID", "TAP", "DEVICE");
-    println!("{}", "-".repeat(dev_w + 21));
-    for route in routes {
+    let mut routes: Vec<_> = routes.iter().collect();
+    routes.sort_by_key(|r| r.route_id);
+    let destinations: Vec<String> = routes
+        .iter()
+        .map(|route| match &route.destination {
+            Destination::Device { uid } => uid.clone(),
+            Destination::Srt(socket) => srt_label(socket),
+        })
+        .collect();
+    let dest_w = col_width(destinations.iter().map(String::as_str), 30);
+    println!("{:<6} {:<7} {:<dest_w$} {:<7} STATE", "ID", "SOURCE", "DESTINATION", "VOLUME");
+    println!("{}", "-".repeat(dest_w + 34));
+    for (route, destination) in routes.into_iter().zip(&destinations) {
         println!(
-            "{:<6} {:<6} {:<dev_w$} {:.2}",
-            route.route_id, route.tap_id, route.device_uid, route.volume
+            "{:<6} {:<7} {:<dest_w$} {:<7.2} {}",
+            route.route_id,
+            route.source_id,
+            destination,
+            route.volume,
+            flow_label(route.status.state)
         );
     }
 }
@@ -342,9 +432,9 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
             match response {
                 Response::Status(s) => {
                     let state = if s.running { "running" } else { "stopped" };
-                    println!("Daemon: {state}");
-                    println!("Taps:   {}", s.tap_count);
-                    println!("Routes: {}", s.route_count);
+                    println!("Daemon:  {state}");
+                    println!("Sources: {}", s.source_count);
+                    println!("Routes:  {}", s.route_count);
                 }
                 Response::Error { message } => {
                     print_error(&message);
@@ -400,9 +490,23 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            let response = client::send_request(&mut stream, &Request::CreateTap { pid, mode })?;
+            let source = SourceSpec::Tap { pids: vec![pid], mode };
+            create_source(&mut stream, source)?;
+        }
+
+        Command::Receive { url, srt } => {
+            let socket = srt.socket(&url).unwrap_or_else(|e| {
+                print_error(&e);
+                std::process::exit(1);
+            });
+            create_source(&mut stream, SourceSpec::Srt(socket))?;
+        }
+
+        Command::Unsource { source_id } => {
+            let response =
+                client::send_request(&mut stream, &Request::DestroySource { source_id })?;
             match response {
-                Response::TapCreated { tap_id } => println!("Tap created: id={tap_id}"),
+                Response::Ok => println!("Source {source_id} removed."),
                 Response::Error { message } => {
                     print_error(&message);
                     std::process::exit(1);
@@ -411,10 +515,10 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Command::Untap { tap_id } => {
-            let response = client::send_request(&mut stream, &Request::DestroyTap { tap_id })?;
+        Command::Sources => {
+            let response = client::send_request(&mut stream, &Request::ListSources)?;
             match response {
-                Response::Ok => println!("Tap {tap_id} removed."),
+                Response::Sources(sources) => print_sources(&sources),
                 Response::Error { message } => {
                     print_error(&message);
                     std::process::exit(1);
@@ -423,28 +527,29 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Command::Taps => {
-            let response = client::send_request(&mut stream, &Request::ListTaps)?;
-            match response {
-                Response::Taps(taps) => print_taps(&taps),
-                Response::Error { message } => {
-                    print_error(&message);
-                    std::process::exit(1);
-                }
-                _ => print_error("unexpected response from daemon"),
-            }
-        }
-
-        Command::Route { tap_id, device, volume } => {
+        Command::Route {
+            source_id,
+            destination,
+            volume,
+            srt,
+        } => {
             if !(0.0..=2.0).contains(&volume) {
                 print_error("volume must be between 0.0 and 2.0");
                 std::process::exit(1);
             }
+            let destination = if destination.starts_with("srt://") {
+                Destination::Srt(srt.socket(&destination).unwrap_or_else(|e| {
+                    print_error(&e);
+                    std::process::exit(1);
+                }))
+            } else {
+                Destination::Device { uid: destination }
+            };
             let response = client::send_request(
                 &mut stream,
                 &Request::CreateRoute {
-                    tap_id,
-                    device_uid: device,
+                    source_id,
+                    destination,
                     volume,
                 },
             )?;
@@ -591,6 +696,21 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Daemon { .. } => unreachable!("daemon commands handled in main"),
     }
 
+    Ok(())
+}
+
+fn create_source(
+    stream: &mut std::os::unix::net::UnixStream,
+    source: SourceSpec,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match client::send_request(stream, &Request::CreateSource { source })? {
+        Response::SourceCreated { source_id } => println!("Source created: id={source_id}"),
+        Response::Error { message } => {
+            print_error(&message);
+            std::process::exit(1);
+        }
+        _ => print_error("unexpected response from daemon"),
+    }
     Ok(())
 }
 

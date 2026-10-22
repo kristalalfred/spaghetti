@@ -4,11 +4,13 @@ use tokio::signal;
 use tokio::signal::unix::SignalKind;
 use tracing_subscriber::EnvFilter;
 
+mod aac;
 mod abl;
 mod activity;
 mod audio;
 mod device_manager;
 mod device_output;
+mod flow;
 mod mixer;
 mod playout;
 mod ring;
@@ -16,7 +18,11 @@ mod router;
 mod rt_slots;
 mod server;
 mod sinks;
+mod srt;
+mod srt_receiver;
+mod srt_sender;
 mod tap;
+mod ts;
 
 fn init_logging() {
     tracing_subscriber::fmt()

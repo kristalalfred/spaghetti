@@ -2,30 +2,130 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use coreaudio_sys::AudioObjectID;
-use spaghetti_common::ipc_protocol::{RouteInfo, TapInfo, TapMode};
+use spaghetti_common::ipc_protocol::{Destination, FlowStatus, RouteInfo, SourceInfo, SourceSpec};
 
+use crate::audio;
 use crate::device_output::DeviceOutput;
 use crate::ring::Ring;
+use crate::sinks::SourceTiming;
+use crate::srt_receiver::SrtSource;
+use crate::srt_sender::SrtOutput;
 use crate::tap::TapSource;
 
-/// A live audio route: reads from a tap's aggregate device, writes to a virtual device.
+enum Source {
+    Tap(TapSource),
+    Srt(SrtSource),
+}
+
+impl Source {
+    fn open(source_id: u32, spec: &SourceSpec) -> Result<Self, String> {
+        match spec {
+            SourceSpec::Tap { pids, mode } => TapSource::create(source_id, pids, *mode).map(Self::Tap),
+            SourceSpec::Srt(socket) => SrtSource::open(socket).map(Self::Srt),
+        }
+    }
+
+    fn timing(&self) -> SourceTiming {
+        match self {
+            Self::Tap(tap) => tap.timing(),
+            Self::Srt(srt) => srt.timing(),
+        }
+    }
+
+    fn add_sink(&mut self, ring: Arc<Ring>) -> Result<usize, String> {
+        match self {
+            Self::Tap(tap) => tap.add_sink(ring),
+            Self::Srt(srt) => srt.add_sink(ring),
+        }
+    }
+
+    fn remove_sink(&mut self, slot: usize) {
+        match self {
+            Self::Tap(tap) => tap.remove_sink(slot),
+            Self::Srt(srt) => srt.remove_sink(slot),
+        }
+    }
+
+    fn label(&self) -> &str {
+        match self {
+            Self::Tap(tap) => &tap.label,
+            Self::Srt(srt) => &srt.label,
+        }
+    }
+
+    fn status(&self) -> FlowStatus {
+        match self {
+            Self::Tap(tap) => tap.status(),
+            Self::Srt(srt) => srt.status(),
+        }
+    }
+}
+
+enum Output {
+    Device(DeviceOutput),
+    Srt(SrtOutput),
+}
+
+impl Output {
+    fn open(
+        destination: &Destination,
+        source: SourceTiming,
+        ring: Arc<Ring>,
+        volume: Arc<AtomicU32>,
+    ) -> Result<Self, String> {
+        match destination {
+            Destination::Device { uid } => {
+                let device = audio::find_device_by_uid(uid)
+                    .ok_or_else(|| format!("device '{uid}' not found"))?;
+                unsafe { DeviceOutput::open(device, source, ring, volume) }.map(Self::Device)
+            }
+            Destination::Srt(socket) => SrtOutput::open(socket, source, ring, volume).map(Self::Srt),
+        }
+    }
+
+    fn start(&self) -> Result<(), String> {
+        match self {
+            Self::Device(device) => device.start(),
+            Self::Srt(_) => Ok(()),
+        }
+    }
+
+    fn status(&self) -> FlowStatus {
+        match self {
+            Self::Device(device) => device.status(),
+            Self::Srt(srt) => srt.status(),
+        }
+    }
+
+    fn log_health(&mut self, route_id: u32, ring: &Ring) {
+        match self {
+            Self::Device(device) => device.log_health(route_id, ring),
+            Self::Srt(srt) => srt.log_health(route_id, ring),
+        }
+    }
+}
+
+struct SourceEntry {
+    spec: SourceSpec,
+    source: Source,
+}
+
 struct Route {
-    tap_id: u32,
-    device_uid: String,
+    source_id: u32,
+    destination: Destination,
     volume: Arc<AtomicU32>,
     sink_slot: usize,
     ring: Arc<Ring>,
-    output: DeviceOutput,
+    output: Output,
 }
 
 /// Claude: the routing graph. Sources feed routes through their sinks, and a
 /// source's routes are destroyed before the source.
 pub struct Router {
-    /// Claude: declared before `taps` so routes are torn down before their taps on drop.
+    /// Claude: declared before `sources` so routes are torn down before their sources on drop.
     routes: HashMap<u32, Route>,
-    taps: HashMap<u32, TapSource>,
-    next_tap_id: u32,
+    sources: HashMap<u32, SourceEntry>,
+    next_source_id: u32,
     next_route_id: u32,
 }
 
@@ -33,103 +133,101 @@ impl Router {
     pub fn new() -> Self {
         Self {
             routes: HashMap::new(),
-            taps: HashMap::new(),
-            next_tap_id: 1,
+            sources: HashMap::new(),
+            next_source_id: 1,
             next_route_id: 1,
         }
     }
 
-    pub fn create_tap(&mut self, pid: u32, mode: TapMode) -> Result<u32, String> {
-        let id = self.next_tap_id;
-        let tap = TapSource::create(id, pid, mode)?;
-        self.next_tap_id += 1;
-        self.taps.insert(id, tap);
+    pub fn create_source(&mut self, spec: SourceSpec) -> Result<u32, String> {
+        let id = self.next_source_id;
+        let source = Source::open(id, &spec)?;
+        self.next_source_id += 1;
+        tracing::info!(source_id = id, label = source.label(), "created source");
+        self.sources.insert(id, SourceEntry { spec, source });
         Ok(id)
     }
 
-    pub fn destroy_tap(&mut self, tap_id: u32) -> Result<(), String> {
-        if !self.taps.contains_key(&tap_id) {
-            return Err(format!("tap {tap_id} not found"));
+    pub fn destroy_source(&mut self, source_id: u32) -> Result<(), String> {
+        if !self.sources.contains_key(&source_id) {
+            return Err(format!("source {source_id} not found"));
         }
         let route_ids: Vec<u32> = self
             .routes
             .iter()
-            .filter(|(_, route)| route.tap_id == tap_id)
+            .filter(|(_, route)| route.source_id == source_id)
             .map(|(&id, _)| id)
             .collect();
         for route_id in route_ids {
             self.destroy_route(route_id)?;
         }
-        self.taps.remove(&tap_id);
-        tracing::info!(tap_id, "destroyed process tap");
+        self.sources.remove(&source_id);
+        tracing::info!(source_id, "destroyed source");
         Ok(())
     }
 
-    pub fn list_taps(&self) -> Vec<TapInfo> {
-        self.taps
+    pub fn list_sources(&self) -> Vec<SourceInfo> {
+        self.sources
             .iter()
-            .map(|(&id, tap)| TapInfo {
-                tap_id: id,
-                pid: tap.pid,
-                app_name: tap.app_name.clone(),
-                mode: tap.mode,
+            .map(|(&id, entry)| SourceInfo {
+                source_id: id,
+                spec: entry.spec.clone(),
+                label: entry.source.label().to_string(),
+                status: entry.source.status(),
             })
             .collect()
     }
 
-    pub fn tap_count(&self) -> u32 {
-        self.taps.len() as u32
+    pub fn source_count(&self) -> u32 {
+        self.sources.len() as u32
     }
 
     pub fn create_route(
         &mut self,
-        tap_id: u32,
-        dest_device_uid: &str,
-        dest_device_id: AudioObjectID,
+        source_id: u32,
+        destination: Destination,
         initial_volume: f32,
     ) -> Result<u32, String> {
-        let tap = self
-            .taps
-            .get_mut(&tap_id)
-            .ok_or_else(|| format!("tap {tap_id} not found"))?;
+        let source = &mut self
+            .sources
+            .get_mut(&source_id)
+            .ok_or_else(|| format!("source {source_id} not found"))?
+            .source;
 
-        let volume = Arc::new(AtomicU32::new(initial_volume.to_bits()));
+        let volume = Arc::new(AtomicU32::new(initial_volume.clamp(0.0, 2.0).to_bits()));
         let ring = Arc::new(Ring::new());
-        let output = unsafe {
-            DeviceOutput::open(
-                dest_device_id,
-                tap.sample_rate(),
-                Arc::clone(&ring),
-                Arc::clone(&volume),
-            )
-        }?;
-        let sink_slot = tap.add_sink(Arc::clone(&ring))?;
+        let output = Output::open(
+            &destination,
+            source.timing(),
+            Arc::clone(&ring),
+            Arc::clone(&volume),
+        )?;
+        let sink_slot = source.add_sink(Arc::clone(&ring))?;
         if let Err(e) = output.start() {
-            tap.remove_sink(sink_slot);
+            source.remove_sink(sink_slot);
             return Err(e);
         }
 
         let id = self.next_route_id;
         self.next_route_id += 1;
+        tracing::info!(route_id = id, source_id, ?destination, "created route");
         self.routes.insert(
             id,
             Route {
-                tap_id,
-                device_uid: dest_device_uid.to_string(),
+                source_id,
+                destination,
                 volume,
                 sink_slot,
                 ring,
                 output,
             },
         );
-
-        tracing::info!(route_id = id, tap_id, dest = dest_device_uid, "created route");
         Ok(id)
     }
 
     pub fn destroy_route(&mut self, route_id: u32) -> Result<(), String> {
         let Route {
-            tap_id,
+            source_id,
             sink_slot,
             output,
             ..
@@ -139,8 +237,8 @@ impl Router {
             .ok_or_else(|| format!("route {route_id} not found"))?;
 
         drop(output);
-        if let Some(tap) = self.taps.get_mut(&tap_id) {
-            tap.remove_sink(sink_slot);
+        if let Some(entry) = self.sources.get_mut(&source_id) {
+            entry.source.remove_sink(sink_slot);
         }
 
         tracing::info!(route_id, "destroyed route");
@@ -164,9 +262,10 @@ impl Router {
             .iter()
             .map(|(&id, r)| RouteInfo {
                 route_id: id,
-                tap_id: r.tap_id,
-                device_uid: r.device_uid.clone(),
+                source_id: r.source_id,
+                destination: r.destination.clone(),
                 volume: f32::from_bits(r.volume.load(Ordering::Relaxed)),
+                status: r.output.status(),
             })
             .collect()
     }
@@ -185,7 +284,7 @@ impl Router {
     pub fn routes_targeting(&self, device_uid: &str) -> Vec<u32> {
         self.routes
             .iter()
-            .filter(|(_, r)| r.device_uid == device_uid)
+            .filter(|(_, r)| matches!(&r.destination, Destination::Device { uid } if uid == device_uid))
             .map(|(&id, _)| id)
             .collect()
     }

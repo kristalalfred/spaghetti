@@ -136,7 +136,8 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
             let st = lock_state(state);
             Response::Status(DaemonStatus {
                 running: true,
-                tap_count: st.router.tap_count(),
+                ipc_version: IPC_VERSION,
+                source_count: st.router.source_count(),
                 route_count: st.router.route_count(),
             })
         }
@@ -144,46 +145,31 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
             let apps = tap::list_audio_apps();
             Response::Apps(apps)
         }
-        Request::CreateTap { pid, mode } => {
+        Request::CreateSource { source } => {
             let mut st = lock_state(state);
-            match st.router.create_tap(pid, mode) {
-                Ok(tap_id) => Response::TapCreated { tap_id },
+            match st.router.create_source(source) {
+                Ok(source_id) => Response::SourceCreated { source_id },
                 Err(message) => Response::Error { message },
             }
         }
-        Request::DestroyTap { tap_id } => {
+        Request::DestroySource { source_id } => {
             let mut st = lock_state(state);
-            match st.router.destroy_tap(tap_id) {
+            match st.router.destroy_source(source_id) {
                 Ok(()) => Response::Ok,
                 Err(message) => Response::Error { message },
             }
         }
-        Request::ListTaps => {
+        Request::ListSources => {
             let st = lock_state(state);
-            Response::Taps(st.router.list_taps())
+            Response::Sources(st.router.list_sources())
         }
         Request::CreateRoute {
-            tap_id,
-            device_uid,
+            source_id,
+            destination,
             volume,
         } => {
             let mut st = lock_state(state);
-
-            let dest_device_id = match audio::find_device_by_uid(&device_uid) {
-                Some(id) => id,
-                None => {
-                    return Response::Error {
-                        message: format!("device '{device_uid}' not found"),
-                    }
-                }
-            };
-
-            match st.router.create_route(
-                tap_id,
-                &device_uid,
-                dest_device_id,
-                volume,
-            ) {
+            match st.router.create_route(source_id, destination, volume) {
                 Ok(route_id) => Response::RouteCreated { route_id },
                 Err(message) => Response::Error { message },
             }

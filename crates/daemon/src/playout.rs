@@ -98,7 +98,14 @@ impl PlayoutHealth {
 }
 
 impl Playout {
-    pub fn new(source_rate: f64, device_rate: f64, ticks_per_second: f64) -> Result<Self, String> {
+    /// Claude: `delivery_jitter` is how late, in seconds, the producer may push
+    /// beyond its own cadence; the jitter buffer holds that much more.
+    pub fn new(
+        source_rate: f64,
+        device_rate: f64,
+        ticks_per_second: f64,
+        delivery_jitter: f64,
+    ) -> Result<Self, String> {
         let params = SincInterpolationParameters::new(SINC_LEN, WindowFunction::BlackmanHarris2);
         let resampler = Async::<f32>::new_sinc(
             device_rate / source_rate,
@@ -116,7 +123,7 @@ impl Playout {
             indexing: Indexing::default(),
             device_rate,
             source_frames_per_tick: source_rate / ticks_per_second,
-            margin_frames: (MARGIN_SECONDS * source_rate).ceil() as usize,
+            margin_frames: ((MARGIN_SECONDS + delivery_jitter) * source_rate).ceil() as usize,
             primed: false,
             fill_avg: 0.0,
             controller: FillController::new(source_rate),
@@ -137,6 +144,11 @@ impl Playout {
 
     pub fn delay_frames(&self) -> usize {
         self.resampler.output_delay()
+    }
+
+    /// Claude: whether the latest render played the ring rather than priming silence.
+    pub fn is_playing(&self) -> bool {
+        self.primed
     }
 
     /// Claude: both channel slices must have the same length. `now` is the host
@@ -250,6 +262,8 @@ mod tests {
         source_rate: f64,
         push_frames: usize,
         next_push: f64,
+        lateness: Vec<f64>,
+        pushes: usize,
         next_render: f64,
         produced: usize,
         rendered: Vec<f32>,
@@ -258,12 +272,27 @@ mod tests {
 
     impl Sim {
         fn new(source_rate: f64, device_rate: f64, push_frames: usize, device_ppm: f64) -> Self {
+            Self::late(source_rate, device_rate, push_frames, device_ppm, 0.0, &[0.0])
+        }
+
+        /// Claude: each push lands `lateness[i]` seconds after its regular time.
+        fn late(
+            source_rate: f64,
+            device_rate: f64,
+            push_frames: usize,
+            device_ppm: f64,
+            delivery_jitter: f64,
+            lateness: &[f64],
+        ) -> Self {
             Self {
                 ring: Ring::new(),
-                playout: Playout::new(source_rate, device_rate, TICKS_PER_SECOND).unwrap(),
+                playout: Playout::new(source_rate, device_rate, TICKS_PER_SECOND, delivery_jitter)
+                    .unwrap(),
                 source_rate,
                 push_frames,
                 next_push: 0.0,
+                lateness: lateness.to_vec(),
+                pushes: 0,
                 next_render: 0.0013,
                 produced: 0,
                 rendered: Vec::new(),
@@ -274,11 +303,13 @@ mod tests {
         fn run(&mut self, seconds: f64) {
             let end = self.next_render + seconds;
             while self.next_render < end {
-                if self.next_push <= self.next_render {
+                let push_at = self.next_push + self.lateness[self.pushes % self.lateness.len()];
+                if push_at <= self.next_render {
                     let (rate, start) = (self.source_rate, self.produced);
+                    self.pushes += 1;
                     self.ring.push_with(
                         self.push_frames,
-                        (self.next_push * TICKS_PER_SECOND) as u64,
+                        (push_at * TICKS_PER_SECOND) as u64,
                         |f, _| {
                             (0.5 * (2.0 * std::f64::consts::PI * TONE_HZ * (start + f) as f64
                                 / rate)
@@ -390,6 +421,21 @@ mod tests {
             let steady = &sim.rendered[sim.rendered.len() - (20.0 * device) as usize..];
             assert!(worst_recurrence_error(steady, device) < 1e-3, "{label}");
         }
+    }
+
+    #[test]
+    fn a_delivery_jitter_margin_absorbs_pushes_that_land_late() {
+        let lateness = [0.0, 0.012, 0.004, 0.0, 0.011, 0.002, 0.0, 0.013];
+        let mut tight = Sim::late(48000.0, 48000.0, 1024, 0.0, 0.0, &lateness);
+        tight.run(20.0);
+        assert!(tight.playout.health.report().underruns > 0, "late pushes starve a tight buffer");
+
+        let mut padded = Sim::late(48000.0, 48000.0, 1024, 0.0, 0.025, &lateness);
+        padded.run(20.0);
+        let report = padded.playout.health.report();
+        assert_eq!(report.underruns + report.resyncs, 0);
+        let steady = &padded.rendered[padded.first_sound() + 4096..];
+        assert!(worst_recurrence_error(steady, 48000.0) < 1e-3);
     }
 
     #[test]
