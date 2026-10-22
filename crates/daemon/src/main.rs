@@ -4,15 +4,18 @@ use tokio::signal;
 use tokio::signal::unix::SignalKind;
 use tracing_subscriber::EnvFilter;
 
+mod abl;
 mod activity;
 mod audio;
 mod device_manager;
+mod device_output;
 mod mixer;
 mod playout;
 mod ring;
 mod router;
 mod rt_slots;
 mod server;
+mod sinks;
 mod tap;
 
 fn init_logging() {

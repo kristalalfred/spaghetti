@@ -1,8 +1,13 @@
-use std::collections::HashMap;
 use std::ffi::CString;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use coreaudio_sys::AudioObjectID;
-use spaghetti_common::ipc_protocol::{AppInfo, TapInfo, TapMode};
+use coreaudio_sys::*;
+use spaghetti_common::ipc_protocol::{AppInfo, TapMode};
+
+use crate::abl;
+use crate::ring::Ring;
+use crate::sinks::{MAX_SINKS, Sinks};
 
 unsafe extern "C" {
     unsafe fn spaghetti_create_tap(
@@ -23,129 +28,269 @@ unsafe extern "C" {
     unsafe fn spaghetti_destroy_aggregate(aggregate_id: AudioObjectID) -> i32;
 }
 
-/// A live process tap with its backing aggregate device.
-pub struct Tap {
-    pub tap_obj_id: AudioObjectID,
-    pub aggregate_device_id: AudioObjectID,
-    pub pid: u32,
-    pub app_name: String,
-    pub mode: TapMode,
+/// Claude: a process tap and the private aggregate device that exposes it.
+struct ProcessTap {
+    tap: AudioObjectID,
+    aggregate: AudioObjectID,
 }
 
-/// Manages the lifecycle of Core Audio process taps.
-pub struct TapManager {
-    taps: HashMap<u32, Tap>,
-    next_id: u32,
-}
-
-impl TapManager {
-    pub fn new() -> Self {
-        Self {
-            taps: HashMap::new(),
-            next_id: 1,
-        }
-    }
-
-    /// Create a process tap on the given PID and a private aggregate device to read from it.
-    pub fn create_tap(&mut self, pid: u32, mode: TapMode) -> Result<u32, String> {
+impl ProcessTap {
+    fn create(pid: u32, mode: TapMode, aggregate_uid: &str) -> Result<Self, String> {
         let pid_i32 = pid as i32;
-        let mut tap_obj_id: AudioObjectID = 0;
+        let mut tap: AudioObjectID = 0;
         let mute_behavior = if mode == TapMode::MuteSourceWhenTapped { 1 } else { 0 };
 
-        let status = unsafe { spaghetti_create_tap(&pid_i32, 1, mute_behavior, &mut tap_obj_id) };
+        let status = unsafe { spaghetti_create_tap(&pid_i32, 1, mute_behavior, &mut tap) };
         if status != 0 {
             return Err(format!(
                 "AudioHardwareCreateProcessTap failed: OSStatus {status}"
             ));
         }
 
-        let agg_uid = format!("spaghetti_tap_agg_{}", self.next_id);
-        let agg_uid_c = CString::new(agg_uid)
+        let agg_uid_c = CString::new(aggregate_uid)
             .map_err(|e| format!("invalid aggregate UID: {e}"))?;
-        let mut agg_id: AudioObjectID = 0;
-
-        let status = unsafe {
-            spaghetti_create_aggregate_for_tap(tap_obj_id, agg_uid_c.as_ptr(), &mut agg_id)
-        };
+        let mut aggregate: AudioObjectID = 0;
+        let status =
+            unsafe { spaghetti_create_aggregate_for_tap(tap, agg_uid_c.as_ptr(), &mut aggregate) };
         if status != 0 {
-            unsafe { spaghetti_destroy_tap(tap_obj_id) };
+            unsafe { spaghetti_destroy_tap(tap) };
             return Err(format!(
                 "AudioHardwareCreateAggregateDevice failed: OSStatus {status}"
             ));
         }
-
-        let id = self.next_id;
-        self.next_id += 1;
-
-        let app_name = get_process_name(pid).unwrap_or_else(|| format!("PID {pid}"));
-
-        self.taps.insert(
-            id,
-            Tap {
-                tap_obj_id,
-                aggregate_device_id: agg_id,
-                pid,
-                app_name,
-                mode,
-            },
-        );
-
-        tracing::info!(tap_id = id, pid, "created process tap");
-        Ok(id)
-    }
-
-    /// Tear down a tap and its aggregate device.
-    pub fn destroy_tap(&mut self, tap_id: u32) -> Result<(), String> {
-        let tap = self
-            .taps
-            .remove(&tap_id)
-            .ok_or_else(|| format!("tap {tap_id} not found"))?;
-
-        let status = unsafe { spaghetti_destroy_aggregate(tap.aggregate_device_id) };
-        if status != 0 {
-            tracing::warn!(tap_id, status, "spaghetti_destroy_aggregate returned non-zero OSStatus");
-        }
-
-        let status = unsafe { spaghetti_destroy_tap(tap.tap_obj_id) };
-        if status != 0 {
-            tracing::warn!(tap_id, status, "spaghetti_destroy_tap returned non-zero OSStatus");
-        }
-
-        tracing::info!(tap_id, "destroyed process tap");
-        Ok(())
-    }
-
-    pub fn list_taps(&self) -> Vec<TapInfo> {
-        self.taps
-            .iter()
-            .map(|(&id, tap)| TapInfo {
-                tap_id: id,
-                pid: tap.pid,
-                app_name: tap.app_name.clone(),
-                mode: tap.mode,
-            })
-            .collect()
-    }
-
-    #[allow(dead_code)]
-    pub fn get_tap(&self, tap_id: u32) -> Option<&Tap> {
-        self.taps.get(&tap_id)
-    }
-
-    pub fn tap_count(&self) -> u32 {
-        self.taps.len() as u32
+        Ok(Self { tap, aggregate })
     }
 }
 
-impl Drop for TapManager {
+impl Drop for ProcessTap {
     fn drop(&mut self) {
-        let ids: Vec<u32> = self.taps.keys().copied().collect();
-        for id in ids {
-            if let Err(e) = self.destroy_tap(id) {
-                tracing::warn!(tap_id = id, error = %e, "failed to destroy tap during cleanup");
-            }
+        let status = unsafe { spaghetti_destroy_aggregate(self.aggregate) };
+        if status != 0 {
+            tracing::warn!(status, "spaghetti_destroy_aggregate returned non-zero OSStatus");
+        }
+        let status = unsafe { spaghetti_destroy_tap(self.tap) };
+        if status != 0 {
+            tracing::warn!(status, "spaghetti_destroy_tap returned non-zero OSStatus");
         }
     }
+}
+
+/// Claude: what the IOProc reads. It outlives every IOProc that points at it.
+struct CaptureState {
+    sinks: Sinks,
+    logged_once: AtomicBool,
+}
+
+/// Claude: a running IOProc on the tap's aggregate device.
+struct Capture {
+    device: AudioObjectID,
+    ioproc_id: AudioDeviceIOProcID,
+    _state: Arc<CaptureState>,
+}
+
+impl Capture {
+    /// Claude: a tap aggregate runs only one IOProc. Starting a second one halts IO
+    /// for every IOProc on the device, and removing it does not resume IO, so all
+    /// routes on a tap share this IOProc and get their frames through `Sinks`.
+    fn start(device: AudioObjectID, state: Arc<CaptureState>) -> Result<Self, String> {
+        let mut ioproc_id: AudioDeviceIOProcID = None;
+        let status = unsafe {
+            AudioDeviceCreateIOProcID(
+                device,
+                Some(capture_ioproc),
+                Arc::as_ptr(&state).cast_mut().cast(),
+                &mut ioproc_id,
+            )
+        };
+        if status != 0 || ioproc_id.is_none() {
+            return Err(format!("AudioDeviceCreateIOProcID failed: {status:#010x}"));
+        }
+        let capture = Self {
+            device,
+            ioproc_id,
+            _state: state,
+        };
+        let status = unsafe { AudioDeviceStart(device, ioproc_id) };
+        if status != 0 {
+            return Err(format!("AudioDeviceStart (IOProc) failed: {status:#010x}"));
+        }
+        Ok(capture)
+    }
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        unsafe {
+            AudioDeviceStop(self.device, self.ioproc_id);
+            AudioDeviceDestroyIOProcID(self.device, self.ioproc_id);
+        }
+    }
+}
+
+/// Claude: an app's audio, captured from a process tap. The IOProc runs only
+/// while at least one route is attached.
+pub struct TapSource {
+    capture: Option<Capture>,
+    state: Arc<CaptureState>,
+    process_tap: ProcessTap,
+    sample_rate: f64,
+    pub pid: u32,
+    pub app_name: String,
+    pub mode: TapMode,
+}
+
+impl TapSource {
+    pub fn create(source_id: u32, pid: u32, mode: TapMode) -> Result<Self, String> {
+        let process_tap = ProcessTap::create(pid, mode, &format!("spaghetti_tap_agg_{source_id}"))?;
+        let format = unsafe { query_device_stream_format(process_tap.aggregate) }?;
+        tracing::info!(
+            sample_rate = format.mSampleRate,
+            channels_per_frame = format.mChannelsPerFrame,
+            bytes_per_frame = format.mBytesPerFrame,
+            frames_per_packet = format.mFramesPerPacket,
+            bits_per_channel = format.mBitsPerChannel,
+            format_flags = format.mFormatFlags,
+            is_float = (format.mFormatFlags & kAudioFormatFlagIsFloat) != 0,
+            is_non_interleaved = (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0,
+            "tap ASBD (source aggregate device input scope)"
+        );
+        if format.mSampleRate <= 0.0
+            || format.mFormatID != kAudioFormatLinearPCM
+            || format.mFormatFlags & kAudioFormatFlagIsFloat == 0
+            || format.mBitsPerChannel != 32
+        {
+            return Err(format!(
+                "unsupported tap stream format (rate={}, format={:#x}, flags={:#x}, bits={})",
+                format.mSampleRate, format.mFormatID, format.mFormatFlags, format.mBitsPerChannel
+            ));
+        }
+
+        tracing::info!(source_id, pid, "created process tap");
+        Ok(Self {
+            capture: None,
+            state: Arc::new(CaptureState {
+                sinks: Sinks::new(),
+                logged_once: AtomicBool::new(false),
+            }),
+            process_tap,
+            sample_rate: format.mSampleRate,
+            pid,
+            app_name: get_process_name(pid).unwrap_or_else(|| format!("PID {pid}")),
+            mode,
+        })
+    }
+
+    pub fn sample_rate(&self) -> f64 {
+        self.sample_rate
+    }
+
+    pub fn add_sink(&mut self, ring: Arc<Ring>) -> Result<usize, String> {
+        let slot = self
+            .state
+            .sinks
+            .insert(Box::new(ring))
+            .map_err(|_| format!("a source can feed at most {MAX_SINKS} routes"))?;
+        if self.capture.is_none() {
+            match Capture::start(self.process_tap.aggregate, Arc::clone(&self.state)) {
+                Ok(capture) => self.capture = Some(capture),
+                Err(e) => {
+                    self.state.sinks.remove(slot);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(slot)
+    }
+
+    pub fn remove_sink(&mut self, slot: usize) {
+        drop(self.state.sinks.remove(slot));
+        if self.state.sinks.is_empty() && self.capture.take().is_some() {
+            tracing::info!(pid = self.pid, "stopped tap capture");
+        }
+    }
+}
+
+unsafe fn query_device_stream_format(
+    device: AudioObjectID,
+) -> Result<AudioStreamBasicDescription, String> {
+    let mut format: AudioStreamBasicDescription = unsafe { std::mem::zeroed() };
+    let mut size = std::mem::size_of::<AudioStreamBasicDescription>() as u32;
+    let address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyStreamFormat,
+        mScope: kAudioDevicePropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            device,
+            &address,
+            0,
+            std::ptr::null(),
+            &mut size,
+            &mut format as *mut _ as *mut _,
+        )
+    };
+    if status != 0 {
+        return Err(format!("get device stream format failed: {status:#010x}"));
+    }
+    Ok(format)
+}
+
+/// Claude: `buffers` must be the ABL the HAL handed to the IOProc. Taps deliver
+/// interleaved stereo in practice whatever their ASBD says, so both layouts are accepted.
+fn push_buffers(ring: &Ring, buffers: &[AudioBuffer], now: u64) -> usize {
+    let Some(first) = buffers.first() else {
+        return 0;
+    };
+    if let [left, right, ..] = buffers {
+        let frames =
+            left.mDataByteSize.min(right.mDataByteSize) as usize / std::mem::size_of::<f32>();
+        let planes = unsafe { [abl::samples(left), abl::samples(right)] };
+        ring.push_with(frames, now, |f, ch| planes[ch].map_or(0.0, |s| s[f]));
+        frames
+    } else {
+        let channels = first.mNumberChannels.max(1) as usize;
+        let frames = first.mDataByteSize as usize / (channels * std::mem::size_of::<f32>());
+        let samples = unsafe { abl::samples(first) };
+        ring.push_with(frames, now, |f, ch| {
+            samples.map_or(0.0, |s| s[f * channels + ch.min(channels - 1)])
+        });
+        frames
+    }
+}
+
+unsafe extern "C" fn capture_ioproc(
+    _in_device: AudioObjectID,
+    _in_now: *const AudioTimeStamp,
+    in_input_data: *const AudioBufferList,
+    _in_input_time: *const AudioTimeStamp,
+    _out_output_data: *mut AudioBufferList,
+    _in_output_time: *const AudioTimeStamp,
+    in_client_data: *mut std::ffi::c_void,
+) -> OSStatus {
+    if in_input_data.is_null() || in_client_data.is_null() {
+        return 0;
+    }
+
+    let now = unsafe { AudioGetCurrentHostTime() };
+    let state = unsafe { &*(in_client_data as *const CaptureState) };
+    let buffers = unsafe { abl::buffers(in_input_data) };
+    let mut frames = 0;
+    unsafe { state.sinks.for_each(|ring| frames = push_buffers(ring, buffers, now)) };
+
+    if !state.logged_once.swap(true, Ordering::Relaxed)
+        && let Some(first) = buffers.first()
+    {
+        tracing::info!(
+            in_n_buffers = buffers.len(),
+            in_buf0_channels = first.mNumberChannels,
+            in_buf0_bytes = first.mDataByteSize,
+            in_buf0_null = first.mData.is_null(),
+            frames,
+            "IOProc first call"
+        );
+    }
+    0
 }
 
 /// Resolve a PID to its process name via libproc.
@@ -164,7 +309,6 @@ fn get_process_name(pid: u32) -> Option<String> {
 /// Uses `kAudioHardwarePropertyProcessObjectList` to get process objects known
 /// to Core Audio, then queries each for its PID and bundle ID.
 pub fn list_audio_apps() -> Vec<AppInfo> {
-    use coreaudio_sys::*;
     use std::{mem, ptr};
 
     let prop = AudioObjectPropertyAddress {
@@ -215,7 +359,6 @@ pub fn list_audio_apps() -> Vec<AppInfo> {
 
 /// Extract PID and name from a Core Audio process object.
 fn process_object_to_app_info(obj: AudioObjectID) -> Option<AppInfo> {
-    use coreaudio_sys::*;
     use std::{mem, ptr};
 
     // Query PID

@@ -41,12 +41,13 @@ target app
 ```
 
 Key files:
-- `crates/daemon/src/router.rs` — the routing graph and its Core Audio glue. `TapCapture` + `capture_ioproc` (capture side), `Sink` (per-route ring producer), `OutputUnit` + `route_render_callback` (output side), `attach_route`.
+- `crates/daemon/src/router.rs` — `Router`, the routing graph: taps, routes, and attaching a route's ring to its tap and its output.
+- `crates/daemon/src/tap.rs` — `TapSource`: a process tap, its private aggregate device and the capture IOProc (`capture_ioproc`) that pushes into every attached route's ring. FFI wrappers around the ObjC bridge, and `list_audio_apps`.
+- `crates/daemon/src/device_output.rs` — `DeviceOutput`: a route's output AUHAL and `route_render_callback`.
 - `crates/daemon/src/playout.rs` — `Playout`, a route's output side: the resampler, jitter buffer and clock-drift controller between the ring and the render callback.
 - `crates/daemon/src/ring.rs` — the SPSC ring of interleaved stereo frames.
-- `crates/daemon/src/rt_slots.rs` — `RtSlots`, the lock-free handoff that lets routes join and leave a running tap capture.
+- `crates/daemon/src/sinks.rs` + `rt_slots.rs` — `Sinks`, the rings a source feeds, held in `RtSlots`, the lock-free handoff that lets routes join and leave a running capture.
 - `crates/daemon/bridge/tap_bridge.m` + `.h` — ObjC bridge for `AudioHardwareCreateProcessTap` and aggregate device creation. Compiled by `build.rs`.
-- `crates/daemon/src/tap.rs` — `TapManager`, FFI wrappers around the ObjC bridge.
 
 ## Core Audio gotchas (learned the hard way)
 

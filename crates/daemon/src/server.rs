@@ -9,7 +9,7 @@ use crate::activity::{ActivityReader, FpsTracker};
 use crate::audio;
 use crate::device_manager::DeviceManager;
 use crate::router::Router;
-use crate::tap::{self, TapManager};
+use crate::tap;
 
 /// Freshness window for the driver's last WriteMix timestamp — older than this
 /// and the activity snapshot is considered stale (driver idle or gone).
@@ -19,26 +19,14 @@ const HEALTH_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 
 /// Shared daemon state accessible by all client handlers.
 pub struct DaemonState {
-    /// Claude: declared before `tap_manager` so routes are torn down before their taps on drop.
     pub router: Router,
-    pub tap_manager: TapManager,
 }
 
 impl DaemonState {
     pub fn new() -> Self {
         Self {
             router: Router::new(),
-            tap_manager: TapManager::new(),
         }
-    }
-
-    /// Claude: a route has nothing to play once its tap is gone, so its routes go first.
-    fn destroy_tap(&mut self, tap_id: u32) -> Result<(), String> {
-        if self.tap_manager.get_tap(tap_id).is_none() {
-            return Err(format!("tap {tap_id} not found"));
-        }
-        self.router.destroy_routes_from_tap(tap_id);
-        self.tap_manager.destroy_tap(tap_id)
     }
 }
 
@@ -148,7 +136,7 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
             let st = lock_state(state);
             Response::Status(DaemonStatus {
                 running: true,
-                tap_count: st.tap_manager.tap_count(),
+                tap_count: st.router.tap_count(),
                 route_count: st.router.route_count(),
             })
         }
@@ -158,21 +146,21 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
         }
         Request::CreateTap { pid, mode } => {
             let mut st = lock_state(state);
-            match st.tap_manager.create_tap(pid, mode) {
+            match st.router.create_tap(pid, mode) {
                 Ok(tap_id) => Response::TapCreated { tap_id },
                 Err(message) => Response::Error { message },
             }
         }
         Request::DestroyTap { tap_id } => {
             let mut st = lock_state(state);
-            match st.destroy_tap(tap_id) {
+            match st.router.destroy_tap(tap_id) {
                 Ok(()) => Response::Ok,
                 Err(message) => Response::Error { message },
             }
         }
         Request::ListTaps => {
             let st = lock_state(state);
-            Response::Taps(st.tap_manager.list_taps())
+            Response::Taps(st.router.list_taps())
         }
         Request::CreateRoute {
             tap_id,
@@ -180,15 +168,6 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
             volume,
         } => {
             let mut st = lock_state(state);
-
-            let aggregate_device_id = match st.tap_manager.get_tap(tap_id) {
-                Some(tap) => tap.aggregate_device_id,
-                None => {
-                    return Response::Error {
-                        message: format!("tap {tap_id} not found"),
-                    }
-                }
-            };
 
             let dest_device_id = match audio::find_device_by_uid(&device_uid) {
                 Some(id) => id,
@@ -201,7 +180,6 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
 
             match st.router.create_route(
                 tap_id,
-                aggregate_device_id,
                 &device_uid,
                 dest_device_id,
                 volume,
