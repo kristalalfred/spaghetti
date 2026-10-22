@@ -248,11 +248,6 @@ const MAX_ROUTES_PER_TAP: usize = 8;
 
 type SinkSlots = RtSlots<Sink, MAX_ROUTES_PER_TAP>;
 
-/// Capture uses `AudioDeviceCreateIOProcID` + `AudioDeviceStart` directly on the
-/// tap aggregate device. This is the pattern Apple's `AudioCap` sample uses for
-/// process taps and avoids `-10863 kAudioUnitErr_CannotDoInCurrentContext` from
-/// pulling tap frames through an AUHAL input unit.
-///
 /// Claude: a tap aggregate runs only one IOProc. Starting a second one halts IO
 /// for every IOProc on the device, and removing it does not resume IO, so all
 /// routes on a tap share this IOProc and get their frames through `sinks`.

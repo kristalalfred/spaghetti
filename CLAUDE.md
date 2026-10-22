@@ -53,7 +53,7 @@ Key files:
 
 ## Core Audio gotchas (learned the hard way)
 
-**Don't use AUHAL for tap capture.** AUHAL input units on a tap aggregate device return `-10863 kAudioUnitErr_CannotDoInCurrentContext` when you try to `AudioUnitRender`. Use `AudioDeviceCreateIOProcID` directly — this is the pattern Apple's `AudioCap` sample uses.
+**Don't use AUHAL for tap capture.** AUHAL input units on a tap aggregate device return `-10863 kAudioUnitErr_CannotDoInCurrentContext` when you try to `AudioUnitRender`. Use `AudioDeviceCreateIOProcID` directly.
 
 **Private tap aggregates need a main sub-device.** Without `kAudioAggregateDeviceMainSubDeviceKey` pointing at a real output device (currently we use the system default output), the aggregate has no clock source and the IOProc never fires. See `tap_bridge.m` `spaghetti_create_aggregate_for_tap`.
 
