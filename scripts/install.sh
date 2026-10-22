@@ -75,7 +75,7 @@ sudo killall coreaudiod
 step "Installing binaries to ${BIN_DIR}"
 sudo cp target/release/spaghetti "${BIN_DIR}/spaghetti"
 sudo cp target/release/spaghettid "${BIN_DIR}/spaghettid"
-sudo cp target/release/spaghetti-tui "${BIN_DIR}/spaghetti-tui"
+sudo rm -f "${BIN_DIR}/spaghetti-tui"
 
 # --- Device config (written by the daemon, read by the driver) ---
 
@@ -94,7 +94,7 @@ echo ""
 echo -e "${BOLD}Installation complete.${RESET}"
 echo ""
 echo "Getting started:"
-echo "  Terminal UI:      spaghetti-tui"
+echo "  List apps:        spaghetti apps"
 echo "  Watch output:     spaghetti monitor"
 echo "  List devices:     spaghetti devices"
 echo "  CLI help:         spaghetti --help"

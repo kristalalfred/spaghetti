@@ -11,8 +11,8 @@ check:
 install:
     ./scripts/install.sh
 
-tui:
-    cargo run -p spaghetti-tui
+run *args:
+    cargo run -p spaghetti -- {{args}}
 
 logs:
     tail -f ~/Library/Logs/spaghetti/spaghettid.log /tmp/spaghetti-driver.log

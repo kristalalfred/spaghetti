@@ -1,14 +1,13 @@
 # Spaghetti
 
-macOS audio routing tool. Lets you tap audio from a running app (by PID) and route it to any output device. Ships as a virtual Core Audio driver, a daemon, a CLI, and a TUI.
+macOS audio routing tool. Lets you tap audio from a running app (by PID) and route it to any output device. Ships as a virtual Core Audio driver, a daemon, and a CLI.
 
 ## Crates
 
 - **`crates/asp-driver/`** — user-space Core Audio HAL plugin. Registers a virtual output device (`SpaghettiDevice_UID`) the system can target. Info.plist configures the bundle.
 - **`crates/daemon/`** (`spaghettid`) — long-running process. Owns the audio routing graph, the tap lifecycle, and an IPC control socket. Managed as a macOS LaunchAgent (`com.spaghetti.daemon`).
 - **`crates/cli/`** (`spaghetti`) — user-facing CLI. `spaghetti tap <pid>`, `spaghetti route <tap_id> <device_uid>`, `spaghetti daemon install/restart/logs`, etc.
-- **`crates/tui/`** (`spaghetti-tui`) — ratatui-based terminal UI. Polls the daemon and sends IPC requests. Uses `tokio::sync::RwLock` for shared state.
-- **`crates/common/`** — IPC protocol definitions (`ipc_protocol.rs`), async client (`async_client.rs`), shared types.
+- **`crates/common/`** — IPC protocol definitions (`ipc_protocol.rs`) and shared types.
 
 ## Build + install
 
@@ -20,8 +19,6 @@ cargo build --release --workspace
 sudo cp target/release/spaghettid /usr/local/bin/spaghettid
 spaghetti daemon restart
 ```
-
-For TUI iteration just `cargo run -p spaghetti-tui` (or rebuild and run the installed binary).
 
 Daemon logs: `~/Library/Logs/spaghetti/spaghettid.log`. Follow with `spaghetti daemon logs --follow` or `tail -f`.
 
@@ -67,7 +64,7 @@ Key files:
 
 ## IPC
 
-Unix domain socket at `spaghetti_common::ipc_protocol::SOCKET_PATH`. Request/response enum in `crates/common/src/ipc_protocol.rs`. Daemon dispatches in `crates/daemon/src/server.rs`. Clients: sync `crates/cli/src/client.rs`, async `crates/common/src/async_client.rs` (used by TUI).
+Unix domain socket at `spaghetti_common::ipc_protocol::SOCKET_PATH`. Request/response enum in `crates/common/src/ipc_protocol.rs`. Daemon dispatches in `crates/daemon/src/server.rs`. The CLI client is `crates/cli/src/client.rs`.
 
 ## Virtual devices — the multi-device model
 
@@ -84,12 +81,6 @@ The plugin publishes N independent virtual devices, each with its own ring buffe
 ```
 
 The activity shm is still single-region — only the first (default) device feeds frame counters and peak into the shared region. Multi-device activity reporting is follow-up work.
-
-## TUI state
-
-`crates/tui/src/main.rs` owns a `tokio::sync::RwLock<State>`. Render loop reads, input/poller tasks write.
-
-**Don't hold a read guard across a write-lock await on the same lock.** Rust variable shadowing does not drop the original binding — the outer read guard stays alive until its block ends. `tokio::RwLock` is write-preferring, so a task holding a read and awaiting a write deadlocks against queued writers. Pattern: scope the read to its own `{ ... }` block, then acquire the write.
 
 ## Conventions
 

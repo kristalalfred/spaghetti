@@ -47,9 +47,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Start the control socket server FIRST — the TUI/CLI need to be able to
-    // connect regardless of whether CoreAudio is ready. Device lookups happen
-    // lazily when requests come in.
     let server = server::Server::bind(activity_reader, device_manager).await?;
     tracing::info!("Listening on {}", spaghetti_common::ipc_protocol::SOCKET_PATH);
 
