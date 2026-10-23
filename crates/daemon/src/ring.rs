@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 use coreaudio_sys::AudioGetCurrentHostTime;
 
 pub const CHANNELS: usize = 2;
-const CAPACITY_FRAMES: usize = 16384;
+/// Claude: 2.7 s at 48 kHz. At the longest span a network source reaches, a
+/// route's fill may run up to two spans over what it renders before it resyncs.
+const CAPACITY_FRAMES: usize = 1 << 17;
 const MASK: usize = CAPACITY_FRAMES - 1;
 
 /// Claude: single-producer single-consumer FIFO of interleaved stereo f32 frames.
@@ -18,7 +20,6 @@ pub struct Ring {
     /// Claude: the head after the latest push in the high half and that push's
     /// host time in the low half, both truncated to u32 so one atomic holds them.
     last_push: AtomicU64,
-    largest_push: AtomicUsize,
     overflows: AtomicU32,
 }
 
@@ -41,7 +42,6 @@ impl Ring {
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
             last_push: AtomicU64::new(0),
-            largest_push: AtomicUsize::new(0),
             overflows: AtomicU32::new(0),
         }
     }
@@ -49,10 +49,6 @@ impl Ring {
     pub fn available(&self) -> usize {
         let tail = self.tail.load(Ordering::Acquire);
         self.head.load(Ordering::Acquire).wrapping_sub(tail)
-    }
-
-    pub fn largest_push(&self) -> usize {
-        self.largest_push.load(Ordering::Relaxed)
     }
 
     pub fn overflows(&self) -> u32 {
@@ -69,7 +65,6 @@ impl Ring {
     ) -> bool {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Acquire);
-        self.largest_push.fetch_max(frames, Ordering::Relaxed);
         if CAPACITY_FRAMES - head.wrapping_sub(tail) < frames {
             self.overflows.fetch_add(1, Ordering::Relaxed);
             return false;
@@ -151,7 +146,7 @@ mod tests {
         let mut written = 0;
         let mut read = 0;
         let mut dst = vec![0.0; 1000 * CHANNELS];
-        for _ in 0..100 {
+        while written <= CAPACITY_FRAMES * 3 {
             assert!(push_counting(&ring, written, 700));
             written += 700;
             let frames = ring.pop_into(&mut dst);
@@ -161,7 +156,6 @@ mod tests {
             read += frames;
         }
         assert_eq!(written, read + ring.available());
-        assert!(written > CAPACITY_FRAMES * 3);
     }
 
     #[test]
@@ -194,7 +188,6 @@ mod tests {
         ring.pop_into(&mut dst);
         let last = ring.last_push();
         assert_eq!((last.buffered, last.at), (120, 9));
-        assert_eq!(ring.largest_push(), 100);
     }
 
     #[test]

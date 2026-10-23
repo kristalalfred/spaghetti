@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use spaghetti_common::ipc_protocol::FlowStatus;
 
+use crate::delivery::DeliverySpan;
 use crate::flow::{FlowMeter, Link};
 use crate::ring::Ring;
 use crate::sinks::{Sinks, SourceTiming};
@@ -28,7 +29,7 @@ impl FixtureSource {
     pub fn timing(&self) -> SourceTiming {
         SourceTiming {
             sample_rate: self.sample_rate,
-            delivery_jitter: 0.0,
+            delivery: Arc::new(DeliverySpan::new(0.0)),
         }
     }
 

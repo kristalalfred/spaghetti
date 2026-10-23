@@ -59,7 +59,7 @@ WebRTC destination: the route's ring → encoder thread (every 5 ms, 960-frame c
   → one str0m Writer::write per packet, dropped until connected
 ```
 
-A source reports its `SourceTiming`: its rate, and how unevenly it pushes. `Playout` sizes its jitter buffer from it.
+A source reports its `SourceTiming`: its rate, and its `DeliverySpan`, how far behind their capture its frames may land. A tap publishes its IOProc buffer; SRT and WebRTC sources measure the span from each push's media time and arrival, growing it at once past a stall it fell short of and shedding it slowly once delivery calms. `Playout` holds the live span on top of what the resampler needs, and re-primes once when the span grows under a playing route rather than resample audibly up to it.
 
 Key files:
 - `crates/daemon/src/router.rs` — `Router`, the routing graph: sources, routes, and attaching a route's ring to its source and its output.
@@ -67,6 +67,7 @@ Key files:
 - `crates/daemon/src/device_output.rs` — `DeviceOutput`: a route's output AUHAL and `route_render_callback`.
 - `crates/daemon/src/playout.rs` — `Playout`, a route's output side: the resampler, jitter buffer and clock-drift controller between the ring and the render callback.
 - `crates/daemon/src/ring.rs` — the SPSC ring of interleaved stereo frames.
+- `crates/daemon/src/delivery.rs` — `DeliverySpan`, the span a source shares with its routes, and `DeliveryMeter`, which measures it for network sources.
 - `crates/daemon/src/sinks.rs` + `rt_slots.rs` — `Sinks`, the rings a source feeds, held in `RtSlots`, the lock-free handoff that lets routes join and leave a running capture.
 - `crates/daemon/bridge/tap_bridge.m` + `.h` — ObjC bridge for `AudioHardwareCreateProcessTap` and aggregate device creation. Compiled by `build.rs`.
 - `crates/daemon/src/srt.rs` — `SrtLink`, one SRT connection that reconnects when it drops, with its `FlowStatus`.
@@ -91,7 +92,7 @@ Key files:
 
 **`AudioConverterFillComplexBuffer` output ABL must match the destination ASBD's layout.** For non-interleaved stereo output, the output ABL needs `mNumberBuffers = 2`, each with `mNumberChannels = 1`. Sizing it from the input ABL (which might be interleaved, so `mNumberBuffers = 1`) gives `-50 paramErr`.
 
-**srt-tokio releases received packets unevenly.** Packets stamped 21.3 ms apart arrive 9 to 34 ms apart, so `SrtSource` declares 25 ms of delivery jitter and routes from it buffer that much more. The sender stamps each packet with the capture time of its audio, from the ring's push times, rather than its send time; stamping with send time added the encoder's polling and AAC batching on top.
+**srt-tokio releases received packets unevenly.** Packets stamped 21.3 ms apart arrive 9 to 34 ms apart, so 25 ms of lateness is the floor of `SrtSource`'s measured delivery span. The sender stamps each packet with the capture time of its audio, from the ring's push times, rather than its send time; stamping with send time added the encoder's polling and AAC batching on top.
 
 **The driver's activity region is system-wide.** Creating it unlinks the existing `/spaghetti.activity` first, so any process that loads the driver and creates the region replaces the live driver's, and every daemon started afterwards reads zeros until coreaudiod restarts. `Initialize` creates it only when given a host, which only coreaudiod passes; the driver tests pass none.
 
@@ -134,8 +135,8 @@ Real-time paths emit first-fire diagnostics that are invaluable for debugging fo
 - `created resampler` — tap and device rates and the resampler's delay in frames.
 - `IOProc first call` — the ABL shape the tap actually delivers.
 - `render callback first fire` — output ABL layout and the ring fill at the first render.
-- `route playout health` (debug, every 10 s) — each route's smoothed ring fill against its target, the controller's ratio correction in ppm, and glitch counters.
-- `route playout glitched since the last report` (info) — underruns (re-primes), resyncs and ring overflows since the previous report.
+- `route playout health` (debug, every 10 s) — each route's smoothed ring fill against its target, its source's delivery span (`delivery_ms`), the controller's ratio correction in ppm, and glitch counters.
+- `route playout glitched since the last report` (info) — underruns, re-primes to a grown span, resyncs and ring overflows since the previous report, and the span and target at the latest of them (`glitch_delivery_ms`, `glitch_target_ms`).
 - `SRT connected` / `SRT sender disconnected` / `SRT receiver disconnected` (info) — each SRT link's peer coming and going.
 - `SRT stream format` (info) — the AAC rate and channels of a received stream, logged when they change.
 - `route SRT health` (debug, every 10 s) — an SRT route's state, bytes and packet counters.

@@ -17,7 +17,7 @@ pub struct DeviceOutput {
     unit: OutputUnit,
     health: Arc<PlayoutHealth>,
     meter: Arc<FlowMeter>,
-    reported_glitches: [u32; 3],
+    reported_glitches: [u32; 4],
 }
 
 impl DeviceOutput {
@@ -49,17 +49,13 @@ impl DeviceOutput {
         );
         unsafe { unit.set_client_format(&dst_asbd) }?;
 
-        let playout = Playout::new(
-            source.sample_rate,
-            dst_asbd.mSampleRate,
-            unsafe { AudioGetHostClockFrequency() },
-            source.delivery_jitter,
-        )?;
+        let playout = Playout::new(&source, dst_asbd.mSampleRate, unsafe {
+            AudioGetHostClockFrequency()
+        })?;
         let health = playout.health();
         tracing::info!(
             src_rate = source.sample_rate,
             dst_rate = dst_asbd.mSampleRate,
-            delivery_jitter = source.delivery_jitter,
             delay_frames = playout.delay_frames(),
             "created resampler"
         );
@@ -70,7 +66,7 @@ impl DeviceOutput {
             unit,
             health,
             meter,
-            reported_glitches: [0; 3],
+            reported_glitches: [0; 4],
         })
     }
 
@@ -89,25 +85,35 @@ impl DeviceOutput {
 
     pub fn log_health(&mut self, route_id: u32, ring: &Ring) {
         let report = self.health.report();
-        let glitches = [report.underruns, report.resyncs, ring.overflows()];
+        let glitches = [
+            report.underruns,
+            report.reprimes,
+            report.resyncs,
+            ring.overflows(),
+        ];
         let to_ms = |frames: f64| frames * 1000.0 / self.health.source_rate;
         tracing::debug!(
             route_id,
             fill_frames = report.fill_avg_frames,
             fill_ms = to_ms(report.fill_avg_frames as f64),
             target_ms = to_ms(report.target_frames as f64),
+            delivery_ms = to_ms(report.delivery_frames),
             correction_ppm = report.correction_ppm,
             underruns = glitches[0],
-            resyncs = glitches[1],
-            overflows = glitches[2],
+            reprimes = glitches[1],
+            resyncs = glitches[2],
+            overflows = glitches[3],
             "route playout health"
         );
         if glitches != self.reported_glitches {
             tracing::info!(
                 route_id,
                 underruns = glitches[0] - self.reported_glitches[0],
-                resyncs = glitches[1] - self.reported_glitches[1],
-                overflows = glitches[2] - self.reported_glitches[2],
+                reprimes = glitches[1] - self.reported_glitches[1],
+                resyncs = glitches[2] - self.reported_glitches[2],
+                overflows = glitches[3] - self.reported_glitches[3],
+                glitch_delivery_ms = to_ms(report.glitch_span_frames as f64),
+                glitch_target_ms = to_ms(report.glitch_target_frames as f64),
                 "route playout glitched since the last report"
             );
             self.reported_glitches = glitches;

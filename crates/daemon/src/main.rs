@@ -9,6 +9,7 @@ mod activity;
 mod adts;
 mod audio;
 mod codec;
+mod delivery;
 mod device_manager;
 mod device_output;
 #[cfg(test)]

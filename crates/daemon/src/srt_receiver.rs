@@ -4,11 +4,12 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use bytes::Bytes;
-use coreaudio_sys::AudioGetCurrentHostTime;
+use coreaudio_sys::{AudioGetCurrentHostTime, AudioGetHostClockFrequency};
 use spaghetti_common::ipc_protocol::{FlowStatus, SrtSocket};
 
 use crate::adts;
 use crate::codec::{Codec, DECODED_RATE, Decoder, StreamFormat};
+use crate::delivery::{DeliveryMeter, DeliverySpan};
 use crate::ring::Ring;
 use crate::sinks::{MAX_SINKS, Sinks, SourceTiming};
 use crate::srt::{SrtEndpoint, SrtLink};
@@ -18,11 +19,13 @@ use crate::ts::TsDemuxer;
 /// up to 13 ms after their scheduled time, so decoded frames land that unevenly.
 const DELIVERY_JITTER: f64 = 0.025;
 const QUEUED_PACKETS: usize = 512;
+const PTS_RATE: f64 = 90_000.0;
 
 /// Claude: a source fed by AAC in MPEG-TS received over SRT.
 pub struct SrtSource {
     link: SrtLink,
     sinks: Arc<Sinks>,
+    delivery: Arc<DeliverySpan>,
     stop: Arc<AtomicBool>,
     decoder: Option<std::thread::JoinHandle<()>>,
     pub label: String,
@@ -33,13 +36,15 @@ impl SrtSource {
         let endpoint = SrtEndpoint::parse(spec)?;
         let (payloads, received) = std::sync::mpsc::sync_channel(QUEUED_PACKETS);
         let sinks = Arc::new(Sinks::new());
+        let meter = DeliveryMeter::new(f64::from(DECODED_RATE), DELIVERY_JITTER);
+        let delivery = meter.span();
         let stop = Arc::new(AtomicBool::new(false));
         let decoder = std::thread::Builder::new()
             .name("srt-decode".into())
             .spawn({
                 let sinks = Arc::clone(&sinks);
                 let stop = Arc::clone(&stop);
-                move || decode(received, &sinks, &stop)
+                move || decode(received, meter, &sinks, &stop)
             })
             .map_err(|e| format!("start SRT decoder: {e}"))?;
         let label = endpoint.label();
@@ -47,6 +52,7 @@ impl SrtSource {
         Ok(Self {
             link: SrtLink::receive(endpoint, payloads),
             sinks,
+            delivery,
             stop,
             decoder: Some(decoder),
             label,
@@ -56,7 +62,7 @@ impl SrtSource {
     pub fn timing(&self) -> SourceTiming {
         SourceTiming {
             sample_rate: f64::from(DECODED_RATE),
-            delivery_jitter: DELIVERY_JITTER,
+            delivery: Arc::clone(&self.delivery),
         }
     }
 
@@ -84,10 +90,15 @@ impl Drop for SrtSource {
     }
 }
 
-/// Claude: the decoder thread is the only reader of `sinks`.
-fn decode(received: Receiver<Bytes>, sinks: &Sinks, stop: &AtomicBool) {
+/// Claude: the decoder thread is the only reader of `sinks`. An access unit's
+/// media time is the PTS of the PES it starts, or follows the unit before it,
+/// so units SRT dropped as too late leave a gap in media time.
+fn decode(received: Receiver<Bytes>, mut meter: DeliveryMeter, sinks: &Sinks, stop: &AtomicBool) {
+    let ticks_per_second = unsafe { AudioGetHostClockFrequency() };
+    let rate = f64::from(DECODED_RATE);
     let mut demuxer = TsDemuxer::new();
     let mut adts = Vec::new();
+    let mut media = 0.0;
     let mut format: Option<StreamFormat> = None;
     let mut decoder: Option<Decoder> = None;
     let mut pcm = Vec::new();
@@ -97,39 +108,51 @@ fn decode(received: Receiver<Bytes>, sinks: &Sinks, stop: &AtomicBool) {
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return,
         };
-        demuxer.push(&payload, |es, _| adts.extend_from_slice(es));
-        let used = adts::parse_adts(&adts, |config, unit| {
-            if format != Some(config) {
-                format = Some(config);
-                tracing::info!(
-                    sample_rate = config.sample_rate,
-                    channels = config.channels,
-                    "SRT stream format"
-                );
-                decoder = Decoder::new(Codec::Aac, config)
-                    .inspect_err(|e| tracing::warn!(error = e, "cannot decode SRT stream"))
-                    .ok();
+        demuxer.push(&payload, |es, pts| {
+            if let Some(pts) = pts
+                && adts.is_empty()
+            {
+                media = pts as f64 / PTS_RATE;
             }
-            let Some(decoder) = &mut decoder else {
-                return;
-            };
-            pcm.clear();
-            let frames = match decoder.decode(unit, &mut pcm) {
-                Ok(frames) => frames,
-                Err(e) => {
-                    tracing::debug!(error = e, "dropped an undecodable AAC frame");
-                    return;
+            adts.extend_from_slice(es);
+            let used = adts::parse_adts(&adts, |config, unit| {
+                if format != Some(config) {
+                    format = Some(config);
+                    tracing::info!(
+                        sample_rate = config.sample_rate,
+                        channels = config.channels,
+                        "SRT stream format"
+                    );
+                    decoder = Decoder::new(Codec::Aac, config)
+                        .inspect_err(|e| tracing::warn!(error = e, "cannot decode SRT stream"))
+                        .ok();
                 }
-            };
-            let channels = usize::from(config.channels);
-            let now = unsafe { AudioGetCurrentHostTime() };
-            unsafe {
-                sinks.for_each(|ring| {
-                    ring.push_with(frames, now, |f, ch| pcm[f * channels + ch.min(channels - 1)]);
-                });
-            }
+                let Some(decoder) = &mut decoder else {
+                    return;
+                };
+                pcm.clear();
+                let frames = match decoder.decode(unit, &mut pcm) {
+                    Ok(frames) => frames,
+                    Err(e) => {
+                        tracing::debug!(error = e, "dropped an undecodable AAC frame");
+                        return;
+                    }
+                };
+                let channels = usize::from(config.channels);
+                let now = unsafe { AudioGetCurrentHostTime() };
+                let end = media + frames as f64 / rate;
+                meter.record(media..end, now as f64 / ticks_per_second);
+                media = end;
+                unsafe {
+                    sinks.for_each(|ring| {
+                        ring.push_with(frames, now, |f, ch| {
+                            pcm[f * channels + ch.min(channels - 1)]
+                        });
+                    });
+                }
+            });
+            adts.drain(..used);
         });
-        adts.drain(..used);
     }
 }
 
@@ -200,7 +223,7 @@ mod tests {
             &socket(SrtMode::Listen { port }),
             SourceTiming {
                 sample_rate: 48000.0,
-                delivery_jitter: 0.0,
+                delivery: Arc::new(DeliverySpan::new(0.0)),
             },
             Arc::clone(&sent),
             Arc::new(AtomicU32::new(1.0f32.to_bits())),

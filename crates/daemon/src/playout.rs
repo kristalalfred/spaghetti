@@ -7,15 +7,20 @@ use rubato::{
     WindowFunction,
 };
 
-use crate::ring::{CHANNELS, Ring};
+use crate::delivery::DeliverySpan;
+use crate::ring::{CHANNELS, LastPush, Ring};
+use crate::sinks::SourceTiming;
 
 pub const MAX_RENDER_FRAMES: usize = 4096;
 const MAX_RATIO_RELATIVE: f64 = 1.01;
 const SINC_LEN: usize = 128;
 const MARGIN_SECONDS: f64 = 0.003;
 const FILL_SMOOTHING_SECONDS: f64 = 1.0;
-const RESYNC_CHUNKS: usize = 4;
+const RESYNC_RENDERS: usize = 4;
 const MAX_CORRECTION: f64 = 0.005;
+/// Claude: resampling this far off shifts pitch by 5 cents, about the smallest
+/// change a listener hears.
+const AUDIBLE_CORRECTION: f64 = 0.003;
 const CONTROL_RADIANS_PER_SECOND: f64 = 0.1;
 const CONTROL_DAMPING: f64 = 1.0;
 
@@ -31,6 +36,7 @@ pub struct Playout {
     device_rate: f64,
     source_frames_per_tick: f64,
     margin_frames: usize,
+    delivery: Arc<DeliverySpan>,
     primed: bool,
     fill_avg: f64,
     controller: FillController,
@@ -65,24 +71,47 @@ impl FillController {
         self.correction = (self.kp * error_frames + self.ki * self.integral)
             .clamp(-MAX_CORRECTION, MAX_CORRECTION);
     }
+
+    /// Claude: the largest fill error the controller makes up without resampling
+    /// further off than `AUDIBLE_CORRECTION`.
+    fn inaudible_error(&self) -> f64 {
+        AUDIBLE_CORRECTION / self.kp
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Glitch {
+    Underrun,
+    Reprime,
+    Resync,
 }
 
 /// Claude: written by the render callback, read by the health logger.
 pub struct PlayoutHealth {
     pub source_rate: f64,
+    delivery: Arc<DeliverySpan>,
     fill_avg: AtomicU32,
     target: AtomicU32,
     correction_ppm: AtomicU32,
     underruns: AtomicU32,
+    reprimes: AtomicU32,
     resyncs: AtomicU32,
+    glitch_span: AtomicU32,
+    glitch_target: AtomicU32,
 }
 
 pub struct HealthReport {
     pub fill_avg_frames: f32,
     pub target_frames: u32,
+    pub delivery_frames: f64,
     pub correction_ppm: f32,
     pub underruns: u32,
+    /// Claude: re-primes on purpose, after the span grew under a playing route.
+    pub reprimes: u32,
     pub resyncs: u32,
+    /// Claude: the span and the target at the latest underrun, re-prime or resync.
+    pub glitch_span_frames: u32,
+    pub glitch_target_frames: u32,
 }
 
 impl PlayoutHealth {
@@ -90,22 +119,38 @@ impl PlayoutHealth {
         HealthReport {
             fill_avg_frames: f32::from_bits(self.fill_avg.load(Ordering::Relaxed)),
             target_frames: self.target.load(Ordering::Relaxed),
+            delivery_frames: self.delivery.frames(),
             correction_ppm: f32::from_bits(self.correction_ppm.load(Ordering::Relaxed)),
             underruns: self.underruns.load(Ordering::Relaxed),
+            reprimes: self.reprimes.load(Ordering::Relaxed),
             resyncs: self.resyncs.load(Ordering::Relaxed),
+            glitch_span_frames: self.glitch_span.load(Ordering::Relaxed),
+            glitch_target_frames: self.glitch_target.load(Ordering::Relaxed),
         }
+    }
+
+    fn glitched(&self, glitch: Glitch, span: f64, target: usize) {
+        self.glitch_span
+            .store(span.round() as u32, Ordering::Relaxed);
+        self.glitch_target.store(target as u32, Ordering::Relaxed);
+        let count = match glitch {
+            Glitch::Underrun => &self.underruns,
+            Glitch::Reprime => &self.reprimes,
+            Glitch::Resync => &self.resyncs,
+        };
+        count.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 impl Playout {
-    /// Claude: `delivery_jitter` is how late, in seconds, the producer may push
-    /// beyond its own cadence; the jitter buffer holds that much more.
+    /// Claude: the jitter buffer holds the source's delivery span on top of what
+    /// the resampler needs, following the span as the source measures it.
     pub fn new(
-        source_rate: f64,
+        source: &SourceTiming,
         device_rate: f64,
         ticks_per_second: f64,
-        delivery_jitter: f64,
     ) -> Result<Self, String> {
+        let source_rate = source.sample_rate;
         let params = SincInterpolationParameters::new(SINC_LEN, WindowFunction::BlackmanHarris2);
         let resampler = Async::<f32>::new_sinc(
             device_rate / source_rate,
@@ -123,17 +168,22 @@ impl Playout {
             indexing: Indexing::default(),
             device_rate,
             source_frames_per_tick: source_rate / ticks_per_second,
-            margin_frames: ((MARGIN_SECONDS + delivery_jitter) * source_rate).ceil() as usize,
+            margin_frames: (MARGIN_SECONDS * source_rate).ceil() as usize,
+            delivery: Arc::clone(&source.delivery),
             primed: false,
             fill_avg: 0.0,
             controller: FillController::new(source_rate),
             health: Arc::new(PlayoutHealth {
                 source_rate,
+                delivery: Arc::clone(&source.delivery),
                 fill_avg: AtomicU32::new(0),
                 target: AtomicU32::new(0),
                 correction_ppm: AtomicU32::new(0),
                 underruns: AtomicU32::new(0),
+                reprimes: AtomicU32::new(0),
                 resyncs: AtomicU32::new(0),
+                glitch_span: AtomicU32::new(0),
+                glitch_target: AtomicU32::new(0),
             }),
         })
     }
@@ -165,9 +215,12 @@ impl Playout {
         }
 
         let need = self.resampler.input_frames_next();
-        let chunk = ring.largest_push();
-        let target = need + chunk + self.margin_frames;
-        let fill = self.estimated_fill(ring, now, chunk);
+        let last = ring.last_push();
+        // Claude: read after the ring, so the span a source publishes before a push
+        // is seen with that push.
+        let span = self.delivery.frames();
+        let target = need + self.margin_frames + span.round() as usize;
+        let fill = self.estimated_fill(&last, now, span);
         self.health.target.store(target as u32, Ordering::Relaxed);
 
         if !self.primed {
@@ -179,14 +232,18 @@ impl Playout {
             self.primed = true;
             self.fill_avg = target as f64;
         } else if ring.available() < need {
-            self.primed = false;
-            self.resampler.reset();
-            self.health.underruns.fetch_add(1, Ordering::Relaxed);
-            silence(out);
+            self.reprime(Glitch::Underrun, span, target, out);
             return;
-        } else if fill > (target + RESYNC_CHUNKS * chunk.max(need)) as f64 {
+        } else if target as f64 - self.fill_avg > self.controller.inaudible_error() {
+            // Claude: the span grew under a playing route. Resampling up to the new
+            // target would be audible, so the playout re-primes to it once instead.
+            // The smoothed fill is compared because the estimate dips while a burst
+            // is still landing.
+            self.reprime(Glitch::Reprime, span, target, out);
+            return;
+        } else if fill > (target + RESYNC_RENDERS * need) as f64 + span {
             ring.discard((fill - target as f64) as usize);
-            self.health.resyncs.fetch_add(1, Ordering::Relaxed);
+            self.health.glitched(Glitch::Resync, span, target);
             self.fill_avg = target as f64;
         } else {
             let seconds = frames as f64 / self.device_rate;
@@ -214,13 +271,25 @@ impl Playout {
             .set_resample_ratio_relative(1.0 / (1.0 + self.controller.correction), true);
     }
 
+    fn reprime(
+        &mut self,
+        glitch: Glitch,
+        span: f64,
+        target: usize,
+        out: &mut [&mut [f32]; CHANNELS],
+    ) {
+        self.primed = false;
+        self.resampler.reset();
+        self.health.glitched(glitch, span, target);
+        silence(out);
+    }
+
     /// Claude: frames buffered as of the latest push, plus the frames the producer
-    /// has captured since then but not delivered yet. Unlike the raw fill this
-    /// does not jump by a whole producer chunk at each push.
-    fn estimated_fill(&self, ring: &Ring, now: u64, chunk: usize) -> f64 {
-        let last = ring.last_push();
+    /// has captured since then but not delivered yet, up to its delivery span.
+    /// Unlike the raw fill this holds steady through pushes that land late.
+    fn estimated_fill(&self, last: &LastPush, now: u64, span: f64) -> f64 {
         let since_push = (now as u32).wrapping_sub(last.at) as f64 * self.source_frames_per_tick;
-        last.buffered as f64 + since_push.min(chunk as f64)
+        last.buffered as f64 + since_push.min(span)
     }
 
     fn resample(&mut self, need: usize, out: &mut [&mut [f32]; CHANNELS]) -> bool {
@@ -249,30 +318,123 @@ fn silence(out: &mut [&mut [f32]; CHANNELS]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delivery::DeliveryMeter;
 
     const TONE_HZ: f64 = 440.0;
     const TICKS_PER_SECOND: f64 = 24_000_000.0;
     const RENDER_FRAMES: usize = 512;
+    /// Claude: resampling this much off shifts pitch by 5 cents, about the
+    /// smallest change a listener hears.
+    const INAUDIBLE_PPM: f32 = 3000.0;
+
+    /// Claude: one push as a route's ring receives it: `frames` frames of the
+    /// source's media from frame `media` on, landing `arrival` seconds in.
+    #[derive(Clone, Copy)]
+    struct Push {
+        media: usize,
+        frames: usize,
+        arrival: f64,
+    }
+
+    /// Claude: pushes of `frames` frames, each landing as its last frame is captured.
+    fn on_time(rate: f64, frames: usize, seconds: f64) -> Vec<Push> {
+        (0..)
+            .map(|i| Push {
+                media: i * frames,
+                frames,
+                arrival: ((i + 1) * frames) as f64 / rate,
+            })
+            .take_while(|push| push.arrival < seconds)
+            .collect()
+    }
+
+    /// Claude: how long Wi-Fi, str0m and the decoder take to release a held burst,
+    /// so that render callbacks land in the middle of one.
+    const BURST_SECONDS: f64 = 0.005;
+
+    /// Claude: the network holds every push due in `[start, start + seconds)` and
+    /// releases them at its end over `BURST_SECONDS`, as Wi-Fi does after it was
+    /// off-channel.
+    fn stall(pushes: &mut [Push], start: f64, seconds: f64) {
+        let held: Vec<usize> = (0..pushes.len())
+            .filter(|&i| (start..start + seconds).contains(&pushes[i].arrival))
+            .collect();
+        for (k, &i) in held.iter().enumerate() {
+            pushes[i].arrival = start + seconds + BURST_SECONDS * k as f64 / held.len() as f64;
+        }
+    }
+
+    /// Claude: the `lost` packets due from `at` on never arrive; the next one lands
+    /// `hold` late, and the source pushes the gap's concealment with it a packet at
+    /// a time, as `webrtc_receiver` does.
+    fn conceal(pushes: &mut [Push], at: f64, lost: usize, hold: f64) {
+        let first = pushes.iter().position(|push| push.arrival >= at).unwrap();
+        let arrival = pushes[first + lost].arrival + hold;
+        for push in &mut pushes[first..=first + lost] {
+            push.arrival = arrival;
+        }
+    }
+
+    /// Claude: what the simulated source tells its routes before each push: its
+    /// buffer, as a tap does, or the span a network source measures.
+    enum Source {
+        Cadence(Arc<DeliverySpan>),
+        Measured(DeliveryMeter),
+    }
+
+    impl Source {
+        fn cadence() -> Self {
+            Self::Cadence(Arc::new(DeliverySpan::new(0.0)))
+        }
+
+        /// Claude: a WebRTC source, whose floor is the jitter str0m's reorder hold allows.
+        fn webrtc() -> Self {
+            Self::Measured(DeliveryMeter::new(48000.0, 0.1))
+        }
+
+        fn span(&self) -> Arc<DeliverySpan> {
+            match self {
+                Self::Cadence(span) => Arc::clone(span),
+                Self::Measured(meter) => meter.span(),
+            }
+        }
+
+        fn publish(&mut self, push: &Push, rate: f64) {
+            match self {
+                Self::Cadence(span) => span.publish(push.frames as f64),
+                Self::Measured(meter) => meter.record(
+                    push.media as f64 / rate..(push.media + push.frames) as f64 / rate,
+                    push.arrival,
+                ),
+            }
+        }
+    }
 
     /// Claude: a producer and a device clocked independently, advanced in simulated
     /// host time. `device_ppm` makes the device run fast relative to the source.
     struct Sim {
         ring: Ring,
+        source: Source,
         playout: Playout,
         source_rate: f64,
-        push_frames: usize,
-        next_push: f64,
-        lateness: Vec<f64>,
-        pushes: usize,
+        pushes: Vec<Push>,
+        next_push: usize,
         next_render: f64,
-        produced: usize,
         rendered: Vec<f32>,
         render_period: f64,
+        worst_correction_ppm: f32,
     }
 
     impl Sim {
         fn new(source_rate: f64, device_rate: f64, push_frames: usize, device_ppm: f64) -> Self {
-            Self::late(source_rate, device_rate, push_frames, device_ppm, 0.0, &[0.0])
+            let pushes = on_time(source_rate, push_frames, 100.0);
+            Self::delivering(
+                source_rate,
+                device_rate,
+                device_ppm,
+                Source::cadence(),
+                pushes,
+            )
         }
 
         /// Claude: each push lands `lateness[i]` seconds after its regular time.
@@ -281,43 +443,97 @@ mod tests {
             device_rate: f64,
             push_frames: usize,
             device_ppm: f64,
-            delivery_jitter: f64,
+            source: Source,
             lateness: &[f64],
         ) -> Self {
+            let mut pushes = on_time(source_rate, push_frames, 100.0);
+            for (push, late) in pushes.iter_mut().zip(lateness.iter().cycle()) {
+                push.arrival += late;
+            }
+            Self::delivering(source_rate, device_rate, device_ppm, source, pushes)
+        }
+
+        fn delivering(
+            source_rate: f64,
+            device_rate: f64,
+            device_ppm: f64,
+            source: Source,
+            pushes: Vec<Push>,
+        ) -> Self {
+            let timing = SourceTiming {
+                sample_rate: source_rate,
+                delivery: source.span(),
+            };
             Self {
                 ring: Ring::new(),
-                playout: Playout::new(source_rate, device_rate, TICKS_PER_SECOND, delivery_jitter)
-                    .unwrap(),
+                playout: Playout::new(&timing, device_rate, TICKS_PER_SECOND).unwrap(),
+                source,
                 source_rate,
-                push_frames,
-                next_push: 0.0,
-                lateness: lateness.to_vec(),
-                pushes: 0,
+                pushes,
+                next_push: 0,
                 next_render: 0.0013,
-                produced: 0,
                 rendered: Vec::new(),
                 render_period: RENDER_FRAMES as f64 / (device_rate * (1.0 + device_ppm * 1e-6)),
+                worst_correction_ppm: 0.0,
             }
+        }
+
+        /// Claude: the producer stops for `seconds` and resumes where it left off.
+        fn pause_producer(&mut self, seconds: f64) {
+            for push in &mut self.pushes[self.next_push..] {
+                push.arrival += seconds;
+            }
+        }
+
+        /// Claude: gaps (underruns and re-primes to a grown target), resyncs and overflows.
+        fn glitches(&self) -> [u32; 3] {
+            let report = self.playout.health.report();
+            [
+                report.underruns + report.reprimes,
+                report.resyncs,
+                self.ring.overflows(),
+            ]
+        }
+
+        /// Claude: asserts the playout holds what it held for a source of this static
+        /// delivery jitter before sources measured their span: what it needs, the
+        /// largest push, and the margin plus that jitter. What the resampler needs
+        /// moves by a frame with the controller's ratio between renders.
+        fn holds_the_static_target(&self, delivery_jitter: f64, push_frames: usize) {
+            let report = self.playout.health.report();
+            let expected = self.playout.resampler.input_frames_next()
+                + push_frames
+                + ((MARGIN_SECONDS + delivery_jitter) * self.source_rate).ceil() as usize;
+            assert!(
+                (report.target_frames as usize).abs_diff(expected) <= 1,
+                "target {} for {expected}",
+                report.target_frames
+            );
+            let span = push_frames as f64 + delivery_jitter * self.source_rate;
+            assert!(
+                (report.delivery_frames - span).abs() < 1e-6,
+                "span {}",
+                report.delivery_frames
+            );
         }
 
         fn run(&mut self, seconds: f64) {
             let end = self.next_render + seconds;
             while self.next_render < end {
-                let push_at = self.next_push + self.lateness[self.pushes % self.lateness.len()];
-                if push_at <= self.next_render {
-                    let (rate, start) = (self.source_rate, self.produced);
-                    self.pushes += 1;
+                let due = self.pushes[self.next_push];
+                if due.arrival <= self.next_render {
+                    let rate = self.source_rate;
+                    self.next_push += 1;
+                    self.source.publish(&due, rate);
                     self.ring.push_with(
-                        self.push_frames,
-                        (push_at * TICKS_PER_SECOND) as u64,
+                        due.frames,
+                        (due.arrival * TICKS_PER_SECOND) as u64,
                         |f, _| {
-                            (0.5 * (2.0 * std::f64::consts::PI * TONE_HZ * (start + f) as f64
+                            (0.5 * (2.0 * std::f64::consts::PI * TONE_HZ * (due.media + f) as f64
                                 / rate)
                                 .sin()) as f32
                         },
                     );
-                    self.produced += self.push_frames;
-                    self.next_push += self.push_frames as f64 / self.source_rate;
                 } else {
                     let (mut left, mut right) =
                         (vec![0.0; RENDER_FRAMES], vec![0.0; RENDER_FRAMES]);
@@ -327,6 +543,8 @@ mod tests {
                     assert_eq!(left, right);
                     self.rendered.extend_from_slice(&left);
                     self.next_render += self.render_period;
+                    let correction = self.playout.health.report().correction_ppm.abs();
+                    self.worst_correction_ppm = self.worst_correction_ppm.max(correction);
                 }
             }
         }
@@ -364,11 +582,7 @@ mod tests {
                 error < 1e-3,
                 "{source} -> {device}: recurrence error {error}"
             );
-            assert_eq!(
-                sim.playout.health.report().underruns,
-                0,
-                "{source} -> {device}"
-            );
+            assert_eq!(sim.glitches(), [0; 3], "{source} -> {device}");
         }
     }
 
@@ -408,7 +622,7 @@ mod tests {
             }
             let report = sim.playout.health.report();
             let label = format!("{source} -> {device} at {device_ppm} ppm");
-            assert_eq!(report.underruns + report.resyncs, 0, "{label}");
+            assert_eq!(sim.glitches(), [0; 3], "{label}");
             assert!(
                 worst_error < 16.0,
                 "{label}: fill strays {worst_error} frames from target"
@@ -420,29 +634,300 @@ mod tests {
             );
             let steady = &sim.rendered[sim.rendered.len() - (20.0 * device) as usize..];
             assert!(worst_recurrence_error(steady, device) < 1e-3, "{label}");
+            sim.holds_the_static_target(0.0, push);
         }
     }
 
     #[test]
-    fn a_delivery_jitter_margin_absorbs_pushes_that_land_late() {
+    fn a_measured_span_absorbs_pushes_that_land_late() {
         let lateness = [0.0, 0.012, 0.004, 0.0, 0.011, 0.002, 0.0, 0.013];
-        let mut tight = Sim::late(48000.0, 48000.0, 1024, 0.0, 0.0, &lateness);
-        tight.run(20.0);
-        assert!(tight.playout.health.report().underruns > 0, "late pushes starve a tight buffer");
+        let mut cadence = Sim::late(48000.0, 48000.0, 1024, 0.0, Source::cadence(), &lateness);
+        cadence.run(20.0);
+        assert!(
+            cadence.glitches()[0] > 1,
+            "late pushes starve a buffer of one push"
+        );
 
-        let mut padded = Sim::late(48000.0, 48000.0, 1024, 0.0, 0.025, &lateness);
+        let unfloored = Source::Measured(DeliveryMeter::new(48000.0, 0.0));
+        let mut learning = Sim::late(48000.0, 48000.0, 1024, 0.0, unfloored, &lateness);
+        learning.run(1.0);
+        let adapted = learning.glitches();
+        learning.run(19.0);
+        assert!(adapted[0] <= 1, "{adapted:?}");
+        assert_eq!(learning.glitches(), adapted);
+
+        let floored = Source::Measured(DeliveryMeter::new(48000.0, 0.025));
+        let mut padded = Sim::late(48000.0, 48000.0, 1024, 0.0, floored, &lateness);
         padded.run(20.0);
-        let report = padded.playout.health.report();
-        assert_eq!(report.underruns + report.resyncs, 0);
+        assert_eq!(padded.glitches(), [0; 3]);
         let steady = &padded.rendered[padded.first_sound() + 4096..];
         assert!(worst_recurrence_error(steady, 48000.0) < 1e-3);
+    }
+
+    /// Claude: Wi-Fi with AirDrop on goes off-channel for about 0.4 s every 0.5 to
+    /// 1.5 s, then delivers what it held in one burst.
+    fn wifi_stalls(pushes: &mut [Push], from: f64, until: f64) {
+        let mut start = from;
+        let stalls = [
+            (0.36, 1.0),
+            (0.4, 0.5),
+            (0.33, 1.5),
+            (0.41, 0.8),
+            (0.38, 1.2),
+        ];
+        for (seconds, period) in stalls.iter().cycle() {
+            if start >= until {
+                break;
+            }
+            stall(pushes, start, *seconds);
+            start += period;
+        }
+    }
+
+    #[test]
+    fn rides_out_periodic_wifi_stalls_after_one_reprime() {
+        let mut pushes = on_time(48000.0, 960, 70.0);
+        wifi_stalls(&mut pushes, 2.0, 62.0);
+        let mut sim = Sim::delivering(48000.0, 48000.0, 40.0, Source::webrtc(), pushes);
+        sim.run(2.1);
+        sim.worst_correction_ppm = 0.0;
+        sim.run(0.8);
+        let adapted = sim.glitches();
+        let from = sim.rendered.len();
+        sim.run(60.0);
+        assert!(
+            adapted[0] <= 1,
+            "gaps, resyncs, overflows while adapting: {adapted:?}"
+        );
+        assert_eq!(sim.glitches(), adapted, "gaps, resyncs, overflows");
+        assert!(worst_recurrence_error(&sim.rendered[from..], 48000.0) < 1e-3);
+        assert!(
+            sim.worst_correction_ppm < INAUDIBLE_PPM,
+            "{} ppm",
+            sim.worst_correction_ppm
+        );
+    }
+
+    #[test]
+    fn concealed_losses_raise_the_target_only_until_they_stop() {
+        let mut pushes = on_time(48000.0, 960, 210.0);
+        let mut at = 2.0;
+        while at < 30.0 {
+            conceal(&mut pushes, at, 5, 0.04);
+            at += 2.0;
+        }
+        let mut sim = Sim::delivering(48000.0, 48000.0, 40.0, Source::webrtc(), pushes);
+        sim.run(2.9);
+        let adapted = sim.glitches();
+        let from = sim.rendered.len();
+        sim.worst_correction_ppm = 0.0;
+        sim.run(200.0);
+        assert!(
+            adapted[0] <= 1,
+            "gaps, resyncs, overflows while adapting: {adapted:?}"
+        );
+        assert_eq!(sim.glitches(), adapted, "gaps, resyncs, overflows");
+        assert!(worst_recurrence_error(&sim.rendered[from..], 48000.0) < 1e-3);
+        assert!(
+            sim.worst_correction_ppm < INAUDIBLE_PPM,
+            "shedding the span resampled {} ppm fast",
+            sim.worst_correction_ppm
+        );
+        sim.holds_the_static_target(0.1, 960);
+    }
+
+    #[test]
+    fn a_quiet_network_source_keeps_the_static_target() {
+        let mut pushes = on_time(48000.0, 960, 30.0);
+        let lateness = [0.0, 0.003, 0.001, 0.004, 0.0, 0.002];
+        for (push, late) in pushes.iter_mut().zip(lateness.iter().cycle()) {
+            push.arrival += late;
+        }
+        let mut sim = Sim::delivering(48000.0, 48000.0, 40.0, Source::webrtc(), pushes);
+        sim.run(25.0);
+        assert_eq!(sim.glitches(), [0; 3]);
+        sim.holds_the_static_target(0.1, 960);
+    }
+
+    #[test]
+    fn the_ring_holds_the_burst_after_a_stall_at_the_largest_span() {
+        let mut pushes = on_time(48000.0, 960, 50.0);
+        let mut start = 2.0;
+        while start < 44.0 {
+            stall(&mut pushes, start, 0.75);
+            start += 2.0;
+        }
+        let mut sim = Sim::delivering(48000.0, 48000.0, 40.0, Source::webrtc(), pushes);
+        sim.run(3.9);
+        let adapted = sim.glitches();
+        sim.run(42.0);
+        assert!(
+            adapted[0] <= 1,
+            "gaps, resyncs, overflows while adapting: {adapted:?}"
+        );
+        assert_eq!(sim.glitches(), adapted, "gaps, resyncs, overflows");
+    }
+
+    /// Claude: 0.4 s stalls `every` seconds for five minutes, as background Wi-Fi
+    /// scans or a roam make them, cost the first stall's re-prime and no more.
+    fn rides_out_rare_stalls(every: f64) {
+        let mut pushes = on_time(48000.0, 960, 310.0);
+        let mut start = 2.0;
+        let mut stalls = 0;
+        while start < 300.0 {
+            stall(&mut pushes, start, 0.4);
+            start += every;
+            stalls += 1;
+        }
+        let mut sim = Sim::delivering(48000.0, 48000.0, 40.0, Source::webrtc(), pushes);
+        sim.run(2.1);
+        sim.worst_correction_ppm = 0.0;
+        sim.run(0.8);
+        let adapted = sim.glitches();
+        sim.run(300.0);
+        let label = format!("{stalls} stalls {every} s apart");
+        assert!(adapted[0] <= 1, "{label}, while adapting: {adapted:?}");
+        assert_eq!(sim.glitches(), adapted, "{label}: gaps, resyncs, overflows");
+        assert!(
+            sim.worst_correction_ppm < INAUDIBLE_PPM,
+            "{label}: {} ppm",
+            sim.worst_correction_ppm
+        );
+    }
+
+    #[test]
+    fn rides_out_stalls_15_s_apart() {
+        rides_out_rare_stalls(15.0);
+    }
+
+    #[test]
+    fn rides_out_stalls_30_s_apart() {
+        rides_out_rare_stalls(30.0);
+    }
+
+    #[test]
+    fn rides_out_stalls_60_s_apart() {
+        rides_out_rare_stalls(60.0);
+    }
+
+    /// Claude: the relay pin's Wi-Fi: stalls of about 0.1 s every 0.45 s, with one
+    /// of about 0.4 s a minute.
+    #[test]
+    fn rides_out_large_stalls_a_minute_apart_among_small_ones() {
+        let mut pushes = on_time(48000.0, 960, 310.0);
+        let mut small = 2.0;
+        while small < 300.0 {
+            stall(&mut pushes, small, 0.1);
+            small += 0.45;
+        }
+        let mut large = 5.0;
+        while large < 300.0 {
+            stall(&mut pushes, large, 0.38);
+            large += 60.0;
+        }
+        let mut sim = Sim::delivering(48000.0, 48000.0, 40.0, Source::webrtc(), pushes);
+        sim.run(5.1);
+        sim.worst_correction_ppm = 0.0;
+        sim.run(1.0);
+        let adapted = sim.glitches();
+        sim.run(298.0);
+        assert!(
+            adapted[0] <= 2,
+            "gaps, resyncs, overflows while adapting: {adapted:?}"
+        );
+        assert_eq!(sim.glitches(), adapted, "gaps, resyncs, overflows");
+        assert!(
+            sim.worst_correction_ppm < INAUDIBLE_PPM,
+            "{} ppm",
+            sim.worst_correction_ppm
+        );
+    }
+
+    /// Claude: after stalls the span covers, one that outlasts it by `excess` costs
+    /// one re-prime, and the controller never has to make up a grown target.
+    #[test]
+    fn a_stall_just_past_the_span_reprimes_once() {
+        for excess in [0.002, 0.005, 0.012] {
+            let mut pushes = on_time(48000.0, 960, 60.0);
+            let mut start = 2.0;
+            while start < 30.0 {
+                stall(&mut pushes, start, 0.36);
+                start += 1.0;
+            }
+            let mut sim = Sim::delivering(48000.0, 48000.0, 40.0, Source::webrtc(), pushes);
+            sim.run(30.9);
+            let covered = sim.glitches();
+            let span = sim.playout.health.report().delivery_frames / 48000.0;
+            let next = sim.next_push;
+            // Claude: the first packet held from 31 s on waits the stall plus its own 20 ms.
+            stall(&mut sim.pushes[next..], 31.0, span + excess - 0.02);
+            sim.worst_correction_ppm = 0.0;
+            sim.run(25.0);
+            let [gaps, resyncs, overflows] = sim.glitches();
+            let label = format!("{excess} s past a span of {span} s");
+            assert_eq!(covered, [1, 0, 0], "{label}: before the stall");
+            assert_eq!(
+                [gaps - covered[0], resyncs, overflows],
+                [1, 0, 0],
+                "{label}: gaps, resyncs, overflows"
+            );
+            assert!(
+                sim.worst_correction_ppm < INAUDIBLE_PPM,
+                "{label}: {} ppm",
+                sim.worst_correction_ppm
+            );
+        }
+    }
+
+    #[test]
+    fn single_losses_at_the_floor_leave_the_target_alone() {
+        let mut pushes = on_time(48000.0, 960, 70.0);
+        let mut at = 2.0;
+        while at < 60.0 {
+            conceal(&mut pushes, at, 1, 0.04);
+            at += 3.0;
+        }
+        let mut sim = Sim::delivering(48000.0, 48000.0, 40.0, Source::webrtc(), pushes);
+        sim.run(1.0);
+        sim.worst_correction_ppm = 0.0;
+        let floor = sim.playout.health.report().target_frames;
+        let mut highest = floor;
+        for _ in 0..120 {
+            sim.run(0.5);
+            highest = highest.max(sim.playout.health.report().target_frames);
+        }
+        assert_eq!(sim.glitches(), [0; 3]);
+        assert!(
+            highest <= floor + 1,
+            "target rose from {floor} to {highest}"
+        );
+        assert!(
+            sim.worst_correction_ppm < INAUDIBLE_PPM,
+            "{} ppm",
+            sim.worst_correction_ppm
+        );
+    }
+
+    #[test]
+    fn a_fast_source_at_the_largest_span_resyncs_before_the_ring_overflows() {
+        let mut pushes = on_time(48000.0, 960, 100.0);
+        let mut start = 2.0;
+        while start < 98.0 {
+            stall(&mut pushes, start, 0.75);
+            start += 2.0;
+        }
+        let mut sim = Sim::delivering(48000.0, 48000.0, -30_000.0, Source::webrtc(), pushes);
+        sim.run(95.0);
+        let [_, resyncs, overflows] = sim.glitches();
+        assert!(resyncs > 0, "the fill never ran past the span");
+        assert_eq!(overflows, 0);
     }
 
     #[test]
     fn reprimes_after_the_producer_stalls() {
         let mut sim = Sim::new(48000.0, 48000.0, 512, 0.0);
         sim.run(1.0);
-        sim.next_push += 0.1;
+        sim.pause_producer(0.1);
         sim.run(1.0);
         let report = sim.playout.health.report();
         assert_eq!(report.underruns, 1);

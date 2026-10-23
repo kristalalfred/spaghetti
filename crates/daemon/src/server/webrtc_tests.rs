@@ -306,18 +306,17 @@ fn assert_tone(pcm: &[f32], label: &str) {
 }
 
 /// Claude: renders `ring` for `seconds` the way a 48 kHz device route would, in
-/// real time, and returns the left channel and the playout's health.
-async fn play(ring: &Arc<Ring>, timing: SourceTiming, seconds: f64) -> (Vec<f32>, HealthReport) {
+/// real time, and returns the left channel, the playout's health and the largest
+/// correction its controller made, in ppm.
+async fn play(
+    ring: &Arc<Ring>,
+    timing: SourceTiming,
+    seconds: f64,
+) -> (Vec<f32>, HealthReport, f32) {
     let ring = Arc::clone(ring);
     tokio::task::spawn_blocking(move || {
         let ticks_per_second = unsafe { AudioGetHostClockFrequency() };
-        let mut playout = Playout::new(
-            timing.sample_rate,
-            48000.0,
-            ticks_per_second,
-            timing.delivery_jitter,
-        )
-        .unwrap();
+        let mut playout = Playout::new(&timing, 48000.0, ticks_per_second).unwrap();
         let health = playout.health();
         let frames = 512;
         let period = Duration::from_secs_f64(frames as f64 / 48000.0);
@@ -325,6 +324,7 @@ async fn play(ring: &Arc<Ring>, timing: SourceTiming, seconds: f64) -> (Vec<f32>
         let mut out = Vec::new();
         let start = Instant::now();
         let mut renders = 0u32;
+        let mut worst_correction_ppm = 0.0f32;
         while start.elapsed().as_secs_f64() < seconds {
             let due = start + period * renders;
             if let Some(wait) = due.checked_duration_since(Instant::now()) {
@@ -335,8 +335,9 @@ async fn play(ring: &Arc<Ring>, timing: SourceTiming, seconds: f64) -> (Vec<f32>
             });
             out.extend_from_slice(&left);
             renders += 1;
+            worst_correction_ppm = worst_correction_ppm.max(health.report().correction_ppm.abs());
         }
-        (out, health.report())
+        (out, health.report(), worst_correction_ppm)
     })
     .await
     .unwrap()
@@ -1102,21 +1103,24 @@ async fn concealment_keeps_a_lossy_reordered_stream_continuous() {
         unreachable!()
     };
     let (ring, timing) = daemon.sink(source_id);
-    assert!((timing.delivery_jitter - 0.1).abs() < 1e-9, "{timing:?}");
 
     let shim = Shim::exchange(&daemon, route, source, Impairment::LossAndReorder).await;
     daemon
         .wait_for(source, FlowState::Flowing, Duration::from_secs(5))
         .await;
 
-    let (rendered, health) = play(&ring, timing, 20.0).await;
+    let (rendered, health, worst_correction_ppm) = play(&ring, timing, 20.0).await;
     let dropped = shim.dropped.load(Ordering::Relaxed);
     let concealed = daemon.status(source).await.packets_lost;
     assert!(dropped >= 18, "the shim dropped {dropped} packets");
     assert_eq!(
-        health.underruns, 0,
-        "the playout re-primed {} times",
-        health.underruns
+        [health.underruns, health.reprimes],
+        [0, 0],
+        "the playout underran or re-primed"
+    );
+    assert!(
+        worst_correction_ppm < 3000.0,
+        "single losses moved the target: {worst_correction_ppm} ppm"
     );
     assert!(
         concealed.abs_diff(dropped) <= 1,

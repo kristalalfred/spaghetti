@@ -10,6 +10,7 @@ use coreaudio_sys::*;
 use spaghetti_common::ipc_protocol::{AppInfo, FlowStatus, TapMode};
 
 use crate::abl;
+use crate::delivery::DeliverySpan;
 use crate::flow::{FlowMeter, Link};
 use crate::ring::{CHANNELS, Ring};
 use crate::sinks::{MAX_SINKS, Sinks, SourceTiming};
@@ -91,9 +92,12 @@ impl Drop for ProcessTap {
 }
 
 /// Claude: what the IOProc reads. It outlives every IOProc that points at it.
+/// A tap's frames land in its rings a buffer at a time as the IOProc captures
+/// them, so the IOProc publishes its buffer as the tap's delivery span.
 struct CaptureState {
     sinks: Sinks,
     meter: FlowMeter,
+    delivery: Arc<DeliverySpan>,
     logged_once: AtomicBool,
 }
 
@@ -187,6 +191,7 @@ impl TapSource {
             state: Arc::new(CaptureState {
                 sinks: Sinks::new(),
                 meter: FlowMeter::new(),
+                delivery: Arc::new(DeliverySpan::new(0.0)),
                 logged_once: AtomicBool::new(false),
             }),
             process_tap,
@@ -225,7 +230,7 @@ impl TapSource {
     pub fn timing(&self) -> SourceTiming {
         SourceTiming {
             sample_rate: self.sample_rate,
-            delivery_jitter: 0.0,
+            delivery: Arc::clone(&self.state.delivery),
         }
     }
 
@@ -283,24 +288,34 @@ unsafe fn query_device_stream_format(
 
 /// Claude: `buffers` must be the ABL the HAL handed to the IOProc. Taps deliver
 /// interleaved stereo in practice whatever their ASBD says, so both layouts are accepted.
-fn push_buffers(ring: &Ring, buffers: &[AudioBuffer], now: u64) -> usize {
-    let Some(first) = buffers.first() else {
-        return 0;
-    };
-    if let [left, right, ..] = buffers {
-        let frames =
-            left.mDataByteSize.min(right.mDataByteSize) as usize / std::mem::size_of::<f32>();
-        let planes = unsafe { [abl::samples(left), abl::samples(right)] };
-        ring.push_with(frames, now, |f, ch| planes[ch].map_or(0.0, |s| s[f]));
-        frames
-    } else {
-        let channels = first.mNumberChannels.max(1) as usize;
-        let frames = first.mDataByteSize as usize / (channels * std::mem::size_of::<f32>());
-        let samples = unsafe { abl::samples(first) };
-        ring.push_with(frames, now, |f, ch| {
-            samples.map_or(0.0, |s| s[f * channels + ch.min(channels - 1)])
-        });
-        frames
+fn buffer_frames(buffers: &[AudioBuffer]) -> usize {
+    match buffers {
+        [] => 0,
+        [left, right, ..] => {
+            left.mDataByteSize.min(right.mDataByteSize) as usize / std::mem::size_of::<f32>()
+        }
+        [only] => {
+            only.mDataByteSize as usize
+                / (only.mNumberChannels.max(1) as usize * std::mem::size_of::<f32>())
+        }
+    }
+}
+
+fn push_buffers(ring: &Ring, buffers: &[AudioBuffer], now: u64) {
+    let frames = buffer_frames(buffers);
+    match buffers {
+        [] => {}
+        [left, right, ..] => {
+            let planes = unsafe { [abl::samples(left), abl::samples(right)] };
+            ring.push_with(frames, now, |f, ch| planes[ch].map_or(0.0, |s| s[f]));
+        }
+        [only] => {
+            let channels = only.mNumberChannels.max(1) as usize;
+            let samples = unsafe { abl::samples(only) };
+            ring.push_with(frames, now, |f, ch| {
+                samples.map_or(0.0, |s| s[f * channels + ch.min(channels - 1)])
+            });
+        }
     }
 }
 
@@ -320,8 +335,11 @@ unsafe extern "C" fn capture_ioproc(
     let now = unsafe { AudioGetCurrentHostTime() };
     let state = unsafe { &*(in_client_data as *const CaptureState) };
     let buffers = unsafe { abl::buffers(in_input_data) };
-    let mut frames = 0;
-    unsafe { state.sinks.for_each(|ring| frames = push_buffers(ring, buffers, now)) };
+    let frames = buffer_frames(buffers);
+    if frames > 0 {
+        state.delivery.publish(frames as f64);
+    }
+    unsafe { state.sinks.for_each(|ring| push_buffers(ring, buffers, now)) };
     state
         .meter
         .record((frames * CHANNELS * std::mem::size_of::<f32>()) as u64, now);
