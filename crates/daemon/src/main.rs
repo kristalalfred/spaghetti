@@ -27,6 +27,7 @@ mod srt_sender;
 mod stun;
 mod tap;
 mod ts;
+mod turn;
 mod webrtc;
 mod webrtc_receiver;
 mod webrtc_sender;

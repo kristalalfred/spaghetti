@@ -3,9 +3,9 @@ mod daemon_mgmt;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use spaghetti_common::ipc_protocol::{
-    ActivityInfo, AppInfo, Destination, DeviceInfo, FlowState, PeerRef, PeerRole, Request,
+    ActivityInfo, AppInfo, Destination, DeviceInfo, FlowState, FlowStatus, PeerRef, PeerRole, Request,
     Response, RouteInfo, SourceInfo, SourceSpec, SrtMode, SrtSocket, SystemDeviceInfo, TapMode,
-    WebRtcPeer,
+    TurnServer, WebRtcPeer,
 };
 use std::io::{IsTerminal, Read, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -194,25 +194,48 @@ struct WebRtcArgs {
     /// STUN server for a webrtc peer, repeatable
     #[arg(long, value_name = "HOST:PORT")]
     stun: Vec<String>,
+    /// TURN server for a webrtc peer, repeatable
+    #[arg(long, value_name = "HOST:PORT,USERNAME,CREDENTIAL")]
+    turn: Vec<String>,
 }
 
 impl WebRtcArgs {
     fn is_set(&self) -> bool {
-        !self.stun.is_empty()
+        !self.stun.is_empty() || !self.turn.is_empty()
     }
 
     /// Claude: a peer of a link this CLI names itself; its first generation.
-    fn peer(&self, role: PeerRole) -> WebRtcPeer {
+    fn peer(&self, role: PeerRole) -> Result<WebRtcPeer, String> {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos());
-        WebRtcPeer {
+        Ok(WebRtcPeer {
             link: format!("cli-{nanos:x}"),
             generation: 1,
             role,
             stun: self.stun.clone(),
-            turn: Vec::new(),
+            turn: self
+                .turn
+                .iter()
+                .map(|server| turn_server(server))
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+/// Claude: the error never repeats the value; it holds the credential.
+fn turn_server(value: &str) -> Result<TurnServer, String> {
+    match value.splitn(3, ',').collect::<Vec<_>>()[..] {
+        [address, username, credential]
+            if !address.is_empty() && !username.is_empty() && !credential.is_empty() =>
+        {
+            Ok(TurnServer {
+                address: address.to_string(),
+                username: username.to_string(),
+                credential: credential.to_string(),
+            })
         }
+        _ => Err("--turn takes HOST:PORT,USERNAME,CREDENTIAL".to_string()),
     }
 }
 
@@ -292,6 +315,15 @@ fn flow_label(state: FlowState) -> &'static str {
     }
 }
 
+fn state_label(webrtc: bool, status: &FlowStatus) -> String {
+    let state = flow_label(status.state);
+    match (webrtc, &status.peer) {
+        (true, Some(_)) if status.relayed => format!("{state} (relayed)"),
+        (true, Some(_)) => format!("{state} (direct)"),
+        _ => state.to_string(),
+    }
+}
+
 fn srt_label(socket: &SrtSocket) -> String {
     match &socket.mode {
         SrtMode::Listen { port } => format!("srt://:{port}"),
@@ -331,7 +363,7 @@ fn print_sources(sources: &[SourceInfo]) {
             source.source_id,
             kind,
             source.label,
-            flow_label(source.status.state)
+            state_label(matches!(source.spec, SourceSpec::WebRtc(_)), &source.status)
         );
     }
 }
@@ -361,7 +393,10 @@ fn print_routes(routes: &[RouteInfo]) {
             route.source_id,
             destination,
             route.volume,
-            flow_label(route.status.state)
+            state_label(
+                matches!(route.destination, Destination::WebRtc(_)),
+                &route.status
+            )
         );
     }
 }
@@ -578,9 +613,12 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
                     print_error("--latency and --passphrase apply only to srt:// sources");
                     std::process::exit(1);
                 }
-                SourceSpec::WebRtc(webrtc.peer(PeerRole::Answer))
+                SourceSpec::WebRtc(webrtc.peer(PeerRole::Answer).unwrap_or_else(|e| {
+                    print_error(&e);
+                    std::process::exit(1);
+                }))
             } else if webrtc.is_set() {
-                print_error("--stun applies only to webrtc sources");
+                print_error("--stun and --turn apply only to webrtc sources");
                 std::process::exit(1);
             } else {
                 SourceSpec::Srt(srt.socket(&url).unwrap_or_else(|e| {
@@ -632,7 +670,7 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
             if webrtc.is_set() && destination != "webrtc" {
-                print_error("--stun applies only to webrtc destinations");
+                print_error("--stun and --turn apply only to webrtc destinations");
                 std::process::exit(1);
             }
             let destination = if destination.starts_with("srt://") {
@@ -641,7 +679,10 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }))
             } else if destination == "webrtc" {
-                Destination::WebRtc(webrtc.peer(PeerRole::Offer))
+                Destination::WebRtc(webrtc.peer(PeerRole::Offer).unwrap_or_else(|e| {
+                    print_error(&e);
+                    std::process::exit(1);
+                }))
             } else {
                 Destination::Device { uid: destination }
             };
@@ -954,6 +995,39 @@ fn main() {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_turn_server_takes_its_credential_whole_and_never_repeats_it() {
+        let cli = Cli::parse_from([
+            "spaghetti",
+            "route",
+            "4",
+            "webrtc",
+            "--turn",
+            "turn.example.net:3478,1767225600:link,se,cr,et",
+            "--turn",
+            "192.0.2.1:3478,user,pass",
+        ]);
+        let Some(Command::Route { webrtc, .. }) = cli.command else {
+            panic!("not a route");
+        };
+        let peer = webrtc.peer(PeerRole::Offer).unwrap();
+        assert_eq!(peer.turn.len(), 2);
+        assert_eq!(peer.turn[0].address, "turn.example.net:3478");
+        assert_eq!(peer.turn[0].username, "1767225600:link");
+        assert_eq!(peer.turn[0].credential, "se,cr,et");
+        assert_eq!(peer.turn[1].credential, "pass");
+
+        for value in ["turn.example.net:3478,hunter2", "turn.example.net:3478,,hunter2"] {
+            let error = turn_server(value).unwrap_err();
+            assert!(!error.contains("hunter2"), "{error}");
         }
     }
 }

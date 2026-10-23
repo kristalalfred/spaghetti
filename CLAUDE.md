@@ -71,9 +71,10 @@ Key files:
 - `crates/daemon/bridge/tap_bridge.m` + `.h` — ObjC bridge for `AudioHardwareCreateProcessTap` and aggregate device creation. Compiled by `build.rs`.
 - `crates/daemon/src/srt.rs` — `SrtLink`, one SRT connection that reconnects when it drops, with its `FlowStatus`.
 - `crates/daemon/src/srt_receiver.rs` + `srt_sender.rs` — `SrtSource` (decode thread) and `SrtOutput` (encode thread).
-- `crates/daemon/src/webrtc.rs` — `PeerLink`, one str0m peer connection on its own UDP socket (default-route IPv4) run by a tokio task: STUN on that socket before the SDP, the offer or answer exchanged whole through `SetRemoteDescription` and `local_description`, its status, and close on drop.
+- `crates/daemon/src/webrtc.rs` — `PeerLink`, one str0m peer connection on its own UDP socket (default-route IPv4) run by a tokio task: STUN and TURN allocation on that socket before the SDP (one 2 s bound), the offer or answer exchanged whole through `SetRemoteDescription` and `local_description`, transmits from a relayed address sent through TURN, its status (including whether recent datagrams came through a relay), and close on drop.
+- `crates/daemon/src/turn.rs` — `Relays`, a link's TURN allocations without I/O of their own: Allocate with the long-term credential (401 challenge, 438 stale nonce), Refresh at half the granted lifetime, CreatePermission for the remote's candidates, Send and Data indications, and release on close.
 - `crates/daemon/src/webrtc_receiver.rs` + `webrtc_sender.rs` — `WebRtcSource` (decode thread, gap concealment) and `WebRtcOutput` (encode thread).
-- `crates/daemon/src/stun.rs` — STUN binding requests and responses, by transaction.
+- `crates/daemon/src/stun.rs` — STUN messages: building and parsing them, XOR addresses, and long-term MESSAGE-INTEGRITY.
 - `crates/daemon/src/codec.rs` — `Encoder` and `Decoder` over AudioToolbox's `AudioConverter` for each `Codec` (AAC-LC, Opus). Every stream decodes to 48 kHz.
 - `crates/daemon/src/adts.rs` + `ts.rs` — ADTS framing of AAC access units, and a single-stream MPEG-TS muxer and demuxer.
 - `crates/daemon/src/flow.rs` — `FlowMeter`, which every source and output uses to report idle, connecting, connected, flowing or stalled.

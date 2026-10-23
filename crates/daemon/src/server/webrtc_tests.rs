@@ -21,6 +21,8 @@ use crate::ring::{CHANNELS, Ring};
 use crate::sinks::{Sinks, SourceTiming};
 use crate::stun;
 
+mod turn;
+
 const TONE_HZ: f64 = 1000.0;
 const LEFT: f32 = 0.5;
 const RIGHT: f32 = 0.25;
@@ -600,6 +602,7 @@ async fn an_offered_route_and_an_answering_source_carry_a_stereo_tone() {
     assert_eq!(received.packets_lost, 0);
     assert_eq!(received.peer, Some(host_candidate(&offer).to_string()));
     assert_eq!(sent.peer, Some(host_candidate(&answer).to_string()));
+    assert!(!sent.relayed && !received.relayed);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -796,10 +799,21 @@ async fn an_unanswered_offer_describes_itself_after_the_stun_deadline_and_stays_
         matches!(&not_ready, Response::Error { message } if message.contains("not ready")),
         "{not_ready:?}"
     );
-    let offer = daemon.description(route).await;
+    let latest = Duration::from_secs(4);
+    let offer = loop {
+        if let Some(sdp) = daemon.listed(route).await.1 {
+            break sdp;
+        }
+        assert!(
+            created.elapsed() < latest,
+            "not described after {:?}",
+            created.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
     let described_after = created.elapsed();
     assert!(
-        (Duration::from_millis(950)..Duration::from_millis(1500)).contains(&described_after),
+        (Duration::from_millis(1950)..latest).contains(&described_after),
         "described after {described_after:?}"
     );
     assert!(

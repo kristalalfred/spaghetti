@@ -187,6 +187,9 @@ pub struct FlowStatus {
     pub bytes: u64,
     /// The connected SRT or WebRTC peer.
     pub peer: Option<String>,
+    /// Claude: most of a connected WebRTC flow's recent datagrams came through
+    /// a TURN relay: this end's, or the remote's at one of this link's servers.
+    pub relayed: bool,
     pub packets_lost: u64,
     pub packets_retransmitted: u64,
 }
@@ -335,6 +338,7 @@ mod tests {
             state: FlowState::Connecting,
             bytes: 0,
             peer: None,
+            relayed: false,
             packets_lost: 0,
             packets_retransmitted: 0,
         }
@@ -405,7 +409,7 @@ mod tests {
                 local_description: Some("v=0\r\n".into()),
             },
             &format!(
-                r#"{{"source_id":4,"spec":{{"WebRtc":{ANSWERING}}},"tag":null,"label":"link-7","status":{{"state":"Connecting","bytes":0,"peer":null,"packets_lost":0,"packets_retransmitted":0}},"local_description":"v=0\r\n"}}"#
+                r#"{{"source_id":4,"spec":{{"WebRtc":{ANSWERING}}},"tag":null,"label":"link-7","status":{{"state":"Connecting","bytes":0,"peer":null,"relayed":false,"packets_lost":0,"packets_retransmitted":0}},"local_description":"v=0\r\n"}}"#
             ),
         );
         golden(
@@ -415,16 +419,17 @@ mod tests {
                 destination: Destination::WebRtc(offering()),
                 volume: 0.5,
                 status: FlowStatus {
-                    state: FlowState::Lost,
+                    state: FlowState::Flowing,
                     bytes: 1200,
-                    peer: Some("10.0.0.2:50000".into()),
+                    peer: Some("203.0.113.1:3478".into()),
+                    relayed: true,
                     packets_lost: 3,
                     packets_retransmitted: 0,
                 },
                 local_description: None,
             },
             &format!(
-                r#"{{"route_id":9,"source_id":4,"destination":{{"WebRtc":{OFFERING}}},"volume":0.5,"status":{{"state":"Lost","bytes":1200,"peer":"10.0.0.2:50000","packets_lost":3,"packets_retransmitted":0}},"local_description":null}}"#
+                r#"{{"route_id":9,"source_id":4,"destination":{{"WebRtc":{OFFERING}}},"volume":0.5,"status":{{"state":"Flowing","bytes":1200,"peer":"203.0.113.1:3478","relayed":true,"packets_lost":3,"packets_retransmitted":0}},"local_description":null}}"#
             ),
         );
     }

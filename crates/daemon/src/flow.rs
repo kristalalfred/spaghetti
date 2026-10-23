@@ -75,6 +75,7 @@ impl FlowMeter {
             state,
             bytes: self.bytes(),
             peer,
+            relayed: false,
             packets_lost,
             packets_retransmitted,
         }

@@ -1,11 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use coreaudio_sys::AudioGetCurrentHostTime;
-use spaghetti_common::ipc_protocol::{FlowState, FlowStatus, PeerRole, WebRtcPeer};
+use spaghetti_common::ipc_protocol::{FlowState, FlowStatus, PeerRole, TurnServer, WebRtcPeer};
 use str0m::change::{SdpAnswer, SdpOffer, SdpPendingOffer};
 use str0m::format::{Codec, FormatParams};
 use str0m::media::{Direction, Frequency, MediaKind, MediaTime, Mid, Pt};
@@ -17,9 +17,14 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::flow::FlowMeter;
 use crate::stun;
+use crate::turn::{Received, Relays};
 
-const STUN_DEADLINE: Duration = Duration::from_secs(1);
+/// Claude: covers DNS, STUN and a TURN allocation's two round trips, the
+/// challenge and the signed request.
+const GATHER_DEADLINE: Duration = Duration::from_secs(2);
 const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
+const PATH_WINDOW: Duration = Duration::from_secs(2);
+const RELEASE_WAIT: Duration = Duration::from_millis(500);
 /// Claude: how long str0m holds the packets behind a lost one. Its default, a
 /// second over 15 packets, stalls audio up to 280 ms after every loss.
 pub const REORDER_TIMEOUT: Duration = Duration::from_millis(40);
@@ -85,6 +90,7 @@ impl Phase {
 struct State {
     phase: Phase,
     peer: Option<SocketAddr>,
+    relayed: bool,
     local_description: Option<String>,
     remote_description: Option<String>,
 }
@@ -114,12 +120,18 @@ impl Shared {
 struct Offered {
     offer: SdpOffer,
     mid: Mid,
+    peers: Vec<IpAddr>,
+}
+
+struct Answered {
+    answer: SdpAnswer,
+    peers: Vec<IpAddr>,
 }
 
 /// Claude: how the controller's remote description reaches the session: an
 /// offerer takes an answer, an answerer an offer.
 enum Signal {
-    Answer(mpsc::UnboundedSender<SdpAnswer>),
+    Answer(mpsc::UnboundedSender<Answered>),
     Offer(mpsc::UnboundedSender<Offered>),
 }
 
@@ -147,13 +159,6 @@ impl PeerLink {
                 return Err(format!("TURN server '{}' is not host:port", server.address));
             }
         }
-        if !spec.turn.is_empty() {
-            tracing::warn!(
-                link = spec.link,
-                servers = spec.turn.len(),
-                "TURN relays are not supported yet; offering no relayed candidate"
-            );
-        }
         let socket = std::net::UdpSocket::bind((default_route_ipv4()?, 0))
             .and_then(|socket| socket.set_nonblocking(true).map(|()| socket))
             .map_err(|e| format!("bind a WebRTC socket: {e}"))?;
@@ -170,6 +175,7 @@ impl PeerLink {
             state: Mutex::new(State {
                 phase: Phase::Connecting,
                 peer: None,
+                relayed: false,
                 local_description: None,
                 remote_description: None,
             }),
@@ -181,7 +187,9 @@ impl PeerLink {
             socket,
             local,
             host,
+            relay_only: relay_only(&spec.link),
             stun: spec.stun.clone(),
+            turn: spec.turn.clone(),
             media,
             shared: Arc::clone(&shared),
             closing: closing.clone(),
@@ -236,6 +244,7 @@ impl PeerLink {
                 ))
             };
         }
+        let peers = candidate_ips(&sdp);
         let sent = match &self.signal {
             Signal::Answer(answers) => {
                 if state.local_description.is_none() {
@@ -248,7 +257,7 @@ impl PeerLink {
                     lines.map(|line| (line.typ.to_string(), line.direction(), line.mid())),
                     self.sending,
                 )?;
-                answers.send(answer).is_ok()
+                answers.send(Answered { answer, peers }).is_ok()
             }
             Signal::Offer(offers) => {
                 let offer = SdpOffer::from_sdp_string(&sdp)
@@ -258,7 +267,7 @@ impl PeerLink {
                     lines.map(|line| (line.typ.to_string(), line.direction(), line.mid())),
                     self.sending,
                 )?;
-                offers.send(Offered { offer, mid }).is_ok()
+                offers.send(Offered { offer, mid, peers }).is_ok()
             }
         };
         if !sent {
@@ -288,6 +297,7 @@ impl PeerLink {
                 .peer
                 .filter(|_| connected)
                 .map(|peer| peer.to_string()),
+            relayed: connected && state.relayed,
             packets_lost: 0,
             packets_retransmitted: 0,
         }
@@ -298,6 +308,34 @@ fn is_host_port(server: &str) -> bool {
     server
         .rsplit_once(':')
         .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
+}
+
+fn candidate_ips(sdp: &str) -> Vec<IpAddr> {
+    sdp.lines()
+        .filter_map(|line| line.strip_prefix("a="))
+        .filter(|attribute| attribute.starts_with("candidate:"))
+        .filter_map(|attribute| Candidate::from_sdp_string(attribute).ok())
+        .map(|candidate| candidate.addr().ip())
+        .collect()
+}
+
+/// Claude: test-only; these links offer only relayed candidates, so one host
+/// can force the path through a TURN server.
+#[cfg(test)]
+pub static RELAY_ONLY: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn relay_only(link: &str) -> bool {
+    RELAY_ONLY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .any(|forced| forced == link)
+}
+
+#[cfg(not(test))]
+fn relay_only(_: &str) -> bool {
+    false
 }
 
 /// Claude: the mid of the remote's audio line, given its media lines as (kind,
@@ -324,7 +362,7 @@ fn audio_mid(
 
 /// Claude: the address this host reaches the internet from. Connecting a UDP
 /// socket only picks the route; nothing is sent.
-fn default_route_ipv4() -> Result<Ipv4Addr, String> {
+pub fn default_route_ipv4() -> Result<Ipv4Addr, String> {
     let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         .and_then(|probe| {
             probe
@@ -363,63 +401,90 @@ fn rtc_config() -> RtcConfig {
 struct Gathered {
     issued: HashSet<stun::Transaction>,
     mapped: Vec<SocketAddrV4>,
+    relays: Relays,
 }
 
 /// Claude: asks every STUN server, from the media socket itself, how the
-/// internet sees it. Ends when all have answered or `STUN_DEADLINE` passed.
-async fn gather(socket: &UdpSocket, servers: &[String], link: &str) -> Gathered {
-    let mut gathered = Gathered {
-        issued: HashSet::new(),
-        mapped: Vec::new(),
-    };
-    if servers.is_empty() {
-        return gathered;
-    }
-    let deadline = tokio::time::Instant::now() + STUN_DEADLINE;
-    let resolved = tokio::time::timeout_at(
-        deadline,
-        futures::future::join_all(servers.iter().map(|server| resolve(server))),
+/// internet sees it, and every TURN server for an allocation on it. Ends when
+/// all have answered or `GATHER_DEADLINE` passed.
+async fn gather(
+    socket: &UdpSocket,
+    stun_servers: &[String],
+    turn_servers: &[TurnServer],
+    link: &str,
+) -> Gathered {
+    let deadline = Instant::now() + GATHER_DEADLINE;
+    let (stun_addresses, turn_addresses) = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        futures::future::join(
+            futures::future::join_all(stun_servers.iter().map(|server| resolve(server))),
+            futures::future::join_all(turn_servers.iter().map(|server| resolve(&server.address))),
+        ),
     )
     .await
     .unwrap_or_default();
+    // Claude: tokio refuses `try_send_to` on a new socket until its reactor
+    // has seen it writable.
+    if let Err(e) = socket.writable().await {
+        tracing::warn!(link, error = %e, "the WebRTC socket is not writable");
+    }
+    let mut issued = HashSet::new();
     let mut waiting = Vec::new();
-    for (server, address) in servers.iter().zip(resolved) {
+    for (server, address) in stun_servers.iter().zip(stun_addresses) {
         let Some(address) = address else {
             tracing::warn!(link, server, "cannot resolve STUN server");
             continue;
         };
         let transaction = stun::transaction_id();
-        match socket
-            .send_to(&stun::binding_request(transaction), address)
-            .await
-        {
-            Ok(_) => {
-                gathered.issued.insert(transaction);
-                waiting.push(transaction);
-            }
-            Err(e) => tracing::warn!(link, server, error = %e, "STUN request failed"),
+        if send(socket, address, &stun::binding_request(transaction), link) {
+            issued.insert(transaction);
+            waiting.push(transaction);
+        } else {
+            tracing::warn!(link, server, "STUN request failed");
         }
     }
+    let mut turn = Vec::new();
+    for (server, address) in turn_servers.iter().zip(turn_addresses) {
+        match address {
+            Some(address) => turn.push((address, server)),
+            None => tracing::info!(
+                link,
+                server = server.address,
+                "cannot resolve TURN server; no relayed candidate"
+            ),
+        }
+    }
+    let mut relays = Relays::new(link, turn, Instant::now());
+    let mut mapped = Vec::new();
     let mut buffer = [0u8; DATAGRAM_MAX];
-    while !waiting.is_empty() {
-        let Ok(received) = tokio::time::timeout_at(deadline, socket.recv_from(&mut buffer)).await
-        else {
+    loop {
+        let now = Instant::now();
+        relays.handle_timeout(now);
+        flush(socket, &mut relays, link);
+        if (waiting.is_empty() && relays.settled()) || now >= deadline {
             break;
-        };
-        let Ok((len, _)) = received else { continue };
-        let response = &buffer[..len];
-        let Some(transaction) = stun::transaction(response) else {
+        }
+        let wake = relays.timeout().map_or(deadline, |at| at.min(deadline));
+        let Ok(Ok((len, from))) = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(wake),
+            socket.recv_from(&mut buffer),
+        )
+        .await
+        else {
             continue;
         };
-        let Some(index) = waiting.iter().position(|t| *t == transaction) else {
+        let datagram = &buffer[..len];
+        let answered = stun::transaction(datagram)
+            .and_then(|transaction| waiting.iter().position(|t| *t == transaction));
+        let Some(index) = answered else {
+            relays.receive(datagram, from, Instant::now());
             continue;
         };
-        let Some(mapped) = stun::mapped_address(response, transaction) else {
-            continue;
-        };
-        waiting.swap_remove(index);
-        if !gathered.mapped.contains(&mapped) {
-            gathered.mapped.push(mapped);
+        if let Some(address) = stun::mapped_address(datagram, waiting[index]) {
+            waiting.swap_remove(index);
+            if !mapped.contains(&address) {
+                mapped.push(address);
+            }
         }
     }
     if !waiting.is_empty() {
@@ -429,9 +494,31 @@ async fn gather(socket: &UdpSocket, servers: &[String], link: &str) -> Gathered 
             "STUN servers did not answer in time"
         );
     }
-    gathered
+    relays.abandon_unanswered();
+    Gathered {
+        issued,
+        mapped,
+        relays,
+    }
 }
 
+fn send(socket: &UdpSocket, to: SocketAddr, datagram: &[u8], link: &str) -> bool {
+    match socket.try_send_to(datagram, to) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::debug!(link, destination = %to, error = %e, "WebRTC send failed");
+            false
+        }
+    }
+}
+
+fn flush(socket: &UdpSocket, relays: &mut Relays, link: &str) {
+    while let Some((server, datagram)) = relays.poll_transmit() {
+        send(socket, server, &datagram, link);
+    }
+}
+
+/// Claude: IPv4 only, like the media socket.
 async fn resolve(server: &str) -> Option<SocketAddr> {
     tokio::net::lookup_host(server)
         .await
@@ -446,16 +533,18 @@ struct Gathering {
     socket: UdpSocket,
     local: SocketAddr,
     host: Candidate,
+    relay_only: bool,
     stun: Vec<String>,
+    turn: Vec<TurnServer>,
     media: Media,
     shared: Arc<Shared>,
     closing: CancellationToken,
 }
 
 impl Gathering {
-    async fn offer(self, answers: mpsc::UnboundedReceiver<SdpAnswer>) {
-        let gathered = gather(&self.socket, &self.stun, &self.link).await;
-        let mut rtc = self.rtc(&gathered.mapped);
+    async fn offer(self, answers: mpsc::UnboundedReceiver<Answered>) {
+        let gathered = gather(&self.socket, &self.stun, &self.turn, &self.link).await;
+        let mut rtc = self.rtc(&gathered);
         let direction = if self.media.is_send() {
             Direction::SendOnly
         } else {
@@ -464,7 +553,7 @@ impl Gathering {
         let mut changes = rtc.sdp_api();
         let mid = changes.add_media(MediaKind::Audio, direction, None, None, None);
         let (offer, pending) = changes.apply().expect("new media needs an offer");
-        let mut session = self.into_session(rtc, gathered.issued, mid);
+        let mut session = self.into_session(rtc, gathered, mid);
         session.pending = Some(pending);
         session.answers = Some(answers);
         session.publish(offer.to_sdp_string());
@@ -473,7 +562,7 @@ impl Gathering {
 
     async fn answer(mut self, mut offers: mpsc::UnboundedReceiver<Offered>) {
         let mut buffer = [0u8; DATAGRAM_MAX];
-        let Offered { offer, mid } = loop {
+        let Offered { offer, mid, peers } = loop {
             tokio::select! {
                 () = self.closing.cancelled() => return,
                 offered = offers.recv() => match offered {
@@ -484,49 +573,59 @@ impl Gathering {
                 Some(_) = self.media.outgoing() => {}
             }
         };
-        let gathered = gather(&self.socket, &self.stun, &self.link).await;
-        let mut rtc = self.rtc(&gathered.mapped);
+        let gathered = gather(&self.socket, &self.stun, &self.turn, &self.link).await;
+        let mut rtc = self.rtc(&gathered);
         let accepted = rtc.sdp_api().accept_offer(offer);
-        let mut session = self.into_session(rtc, gathered.issued, mid);
+        let mut session = self.into_session(rtc, gathered, mid);
         match accepted {
             Ok(answer) => {
+                session.permit(&peers);
                 session.publish(answer.to_sdp_string());
                 session.run().await;
             }
             Err(e) => {
                 session.end(Phase::Lost, &format!("the offer was not accepted: {e}"));
-                session.close();
+                session.close().await;
             }
         }
     }
 
-    fn rtc(&self, mapped: &[SocketAddrV4]) -> Rtc {
+    fn rtc(&self, gathered: &Gathered) -> Rtc {
         let mut rtc = rtc_config().build(Instant::now());
-        rtc.add_local_candidate(self.host.clone());
-        for &address in mapped {
-            let address = SocketAddr::V4(address);
-            if address == self.local {
-                continue;
+        let mut candidates = Vec::new();
+        if !self.relay_only {
+            candidates.push(Ok(self.host.clone()));
+            for &address in &gathered.mapped {
+                let address = SocketAddr::V4(address);
+                if address != self.local {
+                    candidates.push(Candidate::server_reflexive(address, self.local, "udp"));
+                }
             }
-            match Candidate::server_reflexive(address, self.local, "udp") {
+        }
+        for address in gathered.relays.relayed() {
+            candidates.push(Candidate::relayed(address, self.local, "udp"));
+        }
+        for candidate in candidates {
+            match candidate {
                 Ok(candidate) => {
                     rtc.add_local_candidate(candidate);
                 }
                 Err(e) => {
-                    tracing::debug!(link = self.link, %address, error = %e, "skipped a reflexive candidate")
+                    tracing::debug!(link = self.link, error = %e, "skipped a candidate")
                 }
             }
         }
         rtc
     }
 
-    fn into_session(self, rtc: Rtc, issued: HashSet<stun::Transaction>, mid: Mid) -> Session {
+    fn into_session(self, rtc: Rtc, gathered: Gathered, mid: Mid) -> Session {
         Session {
             link: self.link,
             rtc,
             socket: self.socket,
             local: self.local,
-            issued,
+            issued: gathered.issued,
+            relays: gathered.relays,
             mid,
             media: self.media,
             shared: self.shared,
@@ -535,9 +634,31 @@ impl Gathering {
             answers: None,
             connect_by: None,
             connected: false,
-            peer: None,
+            paths: RecentPaths::default(),
             pt: None,
         }
+    }
+}
+
+/// Claude: most datagrams accepted within `PATH_WINDOW` decide, so a path
+/// change shows within it and a stray check on another pair does not.
+#[derive(Default)]
+struct RecentPaths {
+    arrivals: VecDeque<(Instant, bool)>,
+    relayed: usize,
+}
+
+impl RecentPaths {
+    fn record(&mut self, now: Instant, relayed: bool) -> bool {
+        self.arrivals.push_back((now, relayed));
+        self.relayed += usize::from(relayed);
+        while let Some(&(at, was_relayed)) = self.arrivals.front()
+            && now.duration_since(at) > PATH_WINDOW
+        {
+            self.arrivals.pop_front();
+            self.relayed -= usize::from(was_relayed);
+        }
+        self.relayed * 2 > self.arrivals.len()
     }
 }
 
@@ -550,17 +671,18 @@ struct Session {
     local: SocketAddr,
     /// Claude: our own STUN transactions; their replies never reach str0m.
     issued: HashSet<stun::Transaction>,
+    relays: Relays,
     mid: Mid,
     media: Media,
     shared: Arc<Shared>,
     closing: CancellationToken,
     /// Claude: an offerer's offer until its answer arrives on `answers`.
     pending: Option<SdpPendingOffer>,
-    answers: Option<mpsc::UnboundedReceiver<SdpAnswer>>,
+    answers: Option<mpsc::UnboundedReceiver<Answered>>,
     /// Claude: an offerer that applied its answer must connect by then.
     connect_by: Option<Instant>,
     connected: bool,
-    peer: Option<SocketAddr>,
+    paths: RecentPaths,
     pt: Option<Pt>,
 }
 
@@ -583,7 +705,10 @@ impl Session {
             if self.shared.state().phase.is_final() {
                 break;
             }
-            let wake = self.connect_by.map_or(timeout, |by| by.min(timeout));
+            let wake = [self.connect_by, self.relays.timeout()]
+                .into_iter()
+                .flatten()
+                .fold(timeout, Instant::min);
             tokio::select! {
                 () = self.closing.cancelled() => break,
                 Some(answer) = next(&mut self.answers) => self.accept_answer(answer),
@@ -595,7 +720,7 @@ impl Session {
                 () = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => self.tick(),
             }
         }
-        self.close();
+        self.close().await;
     }
 
     /// Claude: hands str0m's pending transmits to the socket and acts on its
@@ -613,15 +738,20 @@ impl Session {
     /// Claude: every datagram str0m sends leaves here, by the local address it
     /// names as its source.
     fn transmit(&self, transmit: Transmit) {
-        if transmit.source != self.local {
-            tracing::debug!(link = self.link, source = %transmit.source, "no WebRTC socket at that local address");
-            return;
-        }
-        if let Err(e) = self
-            .socket
-            .try_send_to(&transmit.contents, transmit.destination)
+        if transmit.source == self.local {
+            send(
+                &self.socket,
+                transmit.destination,
+                &transmit.contents,
+                &self.link,
+            );
+        } else if let Some((server, indication)) =
+            self.relays
+                .indication(transmit.source, transmit.destination, &transmit.contents)
         {
-            tracing::debug!(link = self.link, destination = %transmit.destination, error = %e, "WebRTC send failed");
+            send(&self.socket, server, &indication, &self.link);
+        } else {
+            tracing::debug!(link = self.link, source = %transmit.source, "no WebRTC socket or TURN allocation at that local address");
         }
     }
 
@@ -666,7 +796,15 @@ impl Session {
         {
             return;
         }
-        self.deliver(datagram, from, self.local);
+        match self.relays.receive(datagram, from, Instant::now()) {
+            Received::Other => self.deliver(datagram, from, self.local),
+            Received::Data {
+                relayed,
+                peer,
+                payload,
+            } => self.deliver(payload, peer, relayed),
+            Received::Consumed => flush(&self.socket, &mut self.relays, &self.link),
+        }
     }
 
     /// Claude: hands str0m a datagram from `from`, received at the local address `to`.
@@ -675,8 +813,9 @@ impl Session {
             tracing::debug!(link = self.link, %from, "dropped a datagram that is not WebRTC");
             return;
         };
+        let now = Instant::now();
         let input = Input::Receive(
-            Instant::now(),
+            now,
             Receive {
                 proto: Protocol::Udp,
                 source: from,
@@ -684,10 +823,15 @@ impl Session {
                 contents,
             },
         );
-        if self.connected && self.peer != Some(from) && self.rtc.accepts(&input) {
-            self.peer = Some(from);
-            self.shared.state().peer = Some(from);
-            tracing::debug!(link = self.link, peer = %from, "WebRTC peer address");
+        if self.connected && self.rtc.accepts(&input) {
+            let through_relay = to != self.local || self.relays.relays(from);
+            let relayed = self.paths.record(now, through_relay);
+            let mut state = self.shared.state();
+            if state.peer != Some(from) || state.relayed != relayed {
+                tracing::debug!(link = self.link, peer = %from, relayed, "WebRTC path");
+            }
+            state.peer = Some(from);
+            state.relayed = relayed;
         }
         if let Err(e) = self.rtc.handle_input(input) {
             tracing::debug!(link = self.link, %from, error = %e, "str0m refused a datagram");
@@ -703,12 +847,19 @@ impl Session {
             );
             return;
         }
+        self.relays.handle_timeout(now);
+        flush(&self.socket, &mut self.relays, &self.link);
         if let Err(e) = self.rtc.handle_input(Input::Timeout(now)) {
             self.end(Phase::Lost, &format!("str0m failed: {e}"));
         }
     }
 
-    fn accept_answer(&mut self, answer: SdpAnswer) {
+    fn permit(&mut self, peers: &[IpAddr]) {
+        self.relays.permit(peers, Instant::now());
+        flush(&self.socket, &mut self.relays, &self.link);
+    }
+
+    fn accept_answer(&mut self, Answered { answer, peers }: Answered) {
         self.answers = None;
         let Some(pending) = self.pending.take() else {
             return;
@@ -716,6 +867,7 @@ impl Session {
         match self.rtc.sdp_api().accept_answer(pending, answer) {
             Ok(()) => {
                 self.connect_by = Some(Instant::now() + CONNECT_DEADLINE);
+                self.permit(&peers);
                 tracing::info!(link = self.link, "WebRTC answer applied");
             }
             Err(e) => self.end(Phase::Lost, &format!("the answer was not accepted: {e}")),
@@ -770,7 +922,7 @@ impl Session {
 
     /// Claude: tells the remote the connection is over and sends what that
     /// produces before the socket goes.
-    fn close(&mut self) {
+    async fn close(&mut self) {
         if let Err(e) = self.rtc.close() {
             tracing::debug!(link = self.link, error = %e, "WebRTC close failed");
         }
@@ -784,6 +936,31 @@ impl Session {
                 .is_err()
             {
                 break;
+            }
+        }
+        self.release().await;
+    }
+
+    /// Claude: awaits the answers because a release can meet a stale nonce.
+    async fn release(&mut self) {
+        let deadline = Instant::now() + RELEASE_WAIT;
+        self.relays.close(Instant::now());
+        let mut buffer = [0u8; DATAGRAM_MAX];
+        loop {
+            let now = Instant::now();
+            self.relays.handle_timeout(now);
+            flush(&self.socket, &mut self.relays, &self.link);
+            if self.relays.idle() || now >= deadline {
+                break;
+            }
+            let wake = self.relays.timeout().map_or(deadline, |at| at.min(deadline));
+            if let Ok(Ok((len, from))) = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(wake),
+                self.socket.recv_from(&mut buffer),
+            )
+            .await
+            {
+                self.relays.receive(&buffer[..len], from, Instant::now());
             }
         }
     }
