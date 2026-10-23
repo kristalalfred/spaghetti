@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -92,7 +93,9 @@ impl Drop for SrtSource {
 
 /// Claude: the decoder thread is the only reader of `sinks`. An access unit's
 /// media time is the PTS of the PES it starts, or follows the unit before it,
-/// so units SRT dropped as too late leave a gap in media time.
+/// so units SRT dropped as too late leave a gap in media time. A gap the
+/// routes' span outlasts is filled with silence, so the rings stay in step with
+/// media time.
 fn decode(received: Receiver<Bytes>, mut meter: DeliveryMeter, sinks: &Sinks, stop: &AtomicBool) {
     let ticks_per_second = unsafe { AudioGetHostClockFrequency() };
     let rate = f64::from(DECODED_RATE);
@@ -139,13 +142,16 @@ fn decode(received: Receiver<Bytes>, mut meter: DeliveryMeter, sinks: &Sinks, st
                     }
                 };
                 let channels = usize::from(config.channels);
-                let now = unsafe { AudioGetCurrentHostTime() };
+                let arrival = unsafe { AudioGetCurrentHostTime() } as f64 / ticks_per_second;
+                if let Some(gap) = meter.gap_before(media).filter(|_| frames > 0) {
+                    fill_silence(&mut meter, sinks, gap, frames, arrival, ticks_per_second);
+                }
                 let end = media + frames as f64 / rate;
-                meter.record(media..end, now as f64 / ticks_per_second);
+                let stamp = (meter.record(media..end, arrival) * ticks_per_second) as u64;
                 media = end;
                 unsafe {
                     sinks.for_each(|ring| {
-                        ring.push_with(frames, now, |f, ch| {
+                        ring.push_with(frames, stamp, |f, ch| {
                             pcm[f * channels + ch.min(channels - 1)]
                         });
                     });
@@ -153,6 +159,33 @@ fn decode(received: Receiver<Bytes>, mut meter: DeliveryMeter, sinks: &Sinks, st
             });
             adts.drain(..used);
         });
+    }
+}
+
+/// Claude: pushes silence over `gap` in pieces no longer than a unit, each
+/// recorded as the late delivery it is, as WebRTC concealment does.
+fn fill_silence(
+    meter: &mut DeliveryMeter,
+    sinks: &Sinks,
+    gap: Range<f64>,
+    unit_frames: usize,
+    arrival: f64,
+    ticks_per_second: f64,
+) {
+    let rate = f64::from(DECODED_RATE);
+    let mut left = ((gap.end - gap.start) * rate).round() as usize;
+    let mut start = gap.start;
+    while left > 0 {
+        let frames = left.min(unit_frames);
+        let end = start + frames as f64 / rate;
+        let stamp = (meter.record(start..end, arrival) * ticks_per_second) as u64;
+        unsafe {
+            sinks.for_each(|ring| {
+                ring.push_with(frames, stamp, |_, _| 0.0);
+            });
+        }
+        start = end;
+        left -= frames;
     }
 }
 
@@ -164,9 +197,85 @@ mod tests {
     use spaghetti_common::ipc_protocol::{FlowState, SrtMode};
 
     use super::*;
+    use crate::codec::Encoder;
     use crate::codec::tests::{measure, tone};
+    use crate::delivery::SMALLEST_GAP;
     use crate::ring::CHANNELS;
     use crate::srt_sender::SrtOutput;
+    use crate::ts::{PACKET_LEN, TsMuxer};
+
+    /// Claude: a tone as `SrtOutput` sends it: AAC units in ADTS and MPEG-TS,
+    /// each unit's PTS from its index, cut into SRT messages.
+    fn srt_messages(rate: u32, units: usize) -> (StreamFormat, Vec<Vec<u8>>, Vec<Bytes>) {
+        let mut encoder = Encoder::new(Codec::Aac, rate).unwrap();
+        let format = encoder.format();
+        let per_unit = encoder.frames_per_packet();
+        let pcm = tone(f64::from(rate), 1000.0, 0.5, units * per_unit);
+        let mut muxer = TsMuxer::new();
+        let (mut access_units, mut messages) = (Vec::new(), Vec::new());
+        for chunk in pcm.chunks(per_unit * CHANNELS) {
+            encoder
+                .encode(chunk, |unit| {
+                    let mut adts = Vec::new();
+                    adts::adts_frame(format, unit, &mut adts).unwrap();
+                    let pts = access_units.len() as u64 * per_unit as u64 * 90_000
+                        / u64::from(format.sample_rate);
+                    let mut stream = Vec::new();
+                    muxer.mux(&adts, pts, &mut stream);
+                    messages.extend(stream.chunks(PACKET_LEN * 7).map(Bytes::copy_from_slice));
+                    access_units.push(unit.to_vec());
+                })
+                .unwrap();
+        }
+        (format, access_units, messages)
+    }
+
+    /// Claude: the decoder resamples 44.1 kHz AAC to 48 kHz. If its output per
+    /// unit wandered by a millisecond, the end of one unit would fall short of
+    /// the next unit's PTS, and `decode` would fill the step with silence: a
+    /// click every few units on a 44.1 kHz source.
+    #[test]
+    fn a_44_1_khz_stream_decodes_with_no_step_to_fill_after_its_first_unit() {
+        let (format, access_units, messages) = srt_messages(44100, 100);
+        assert!(access_units.len() >= 95, "{} units", access_units.len());
+        let mut decoder = Decoder::new(Codec::Aac, format).unwrap();
+        let mut pcm = Vec::new();
+        let decoded: Vec<usize> = access_units
+            .iter()
+            .map(|unit| decoder.decode(unit, &mut pcm).unwrap())
+            .collect();
+        let rate = f64::from(DECODED_RATE);
+        let media = |unit: usize| (unit * 1024 * 90_000 / 44100) as f64 / PTS_RATE;
+        let step = |unit: usize| media(unit + 1) - (media(unit) + decoded[unit] as f64 / rate);
+        for (unit, frames) in decoded.iter().enumerate().take(decoded.len() - 1).skip(1) {
+            assert!(
+                step(unit) <= SMALLEST_GAP,
+                "unit {unit} decoded to {frames} frames and ends {:.2} ms short of the next",
+                step(unit) * 1000.0
+            );
+        }
+
+        let (payloads, received) = std::sync::mpsc::sync_channel(messages.len());
+        for message in messages {
+            payloads.send(message).unwrap();
+        }
+        drop(payloads);
+        let sinks = Sinks::new();
+        let ring = Arc::new(Ring::new());
+        assert!(sinks.insert(Box::new(Arc::clone(&ring))).is_ok());
+        let meter = DeliveryMeter::new(rate, DELIVERY_JITTER);
+        decode(received, meter, &sinks, &AtomicBool::new(false));
+        let filled = ring.available() - decoded.iter().sum::<usize>();
+        let first = if step(0) > SMALLEST_GAP {
+            (step(0) * rate).round() as usize
+        } else {
+            0
+        };
+        assert_eq!(
+            filled, first,
+            "frames of silence filled, against the first unit's step"
+        );
+    }
 
     fn free_port() -> u16 {
         std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()

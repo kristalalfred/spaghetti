@@ -122,7 +122,7 @@ fn decode(
     stop: &AtomicBool,
 ) {
     let ticks_per_second = unsafe { AudioGetHostClockFrequency() };
-    let delivery = meter.span();
+    let rate = f64::from(DECODED_RATE);
     let mut pcm = Vec::new();
     let mut last: Option<u64> = None;
     while !stop.load(Ordering::Relaxed) {
@@ -137,7 +137,7 @@ fn decode(
             None => 0,
         };
         pcm.clear();
-        let bridged = if (missing * PACKET_FRAMES) as f64 <= delivery.frames() {
+        let bridged = if meter.gap_before(packet.rtp_time as f64 / rate).is_some() {
             missing
         } else {
             0
@@ -151,19 +151,16 @@ fn decode(
             conceal(&mut decoder, &mut pcm);
         }
         last = Some(packet.rtp_time);
-        let now = unsafe { AudioGetCurrentHostTime() };
-        let rate = f64::from(DECODED_RATE);
+        let arrival = unsafe { AudioGetCurrentHostTime() } as f64 / ticks_per_second;
         let first = packet.rtp_time - bridged * PACKET_FRAMES;
         for (slot, slot_pcm) in pcm.chunks(PACKET_FRAMES as usize * CHANNELS).enumerate() {
             let frames = slot_pcm.len() / CHANNELS;
             let start = (first + slot as u64 * PACKET_FRAMES) as f64 / rate;
-            meter.record(
-                start..start + frames as f64 / rate,
-                now as f64 / ticks_per_second,
-            );
+            let due = meter.record(start..start + frames as f64 / rate, arrival);
+            let stamp = (due * ticks_per_second) as u64;
             unsafe {
                 sinks.for_each(|ring| {
-                    ring.push_with(frames, now, |f, ch| slot_pcm[f * CHANNELS + ch]);
+                    ring.push_with(frames, stamp, |f, ch| slot_pcm[f * CHANNELS + ch]);
                 });
             }
         }

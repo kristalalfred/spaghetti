@@ -18,6 +18,9 @@ const MAX_SPAN: f64 = 1.0;
 /// Claude: how fast the fastest transit may rise, so that a sender clock up to
 /// 1000 ppm slow against the host clock does not read as ever later delivery.
 const DRIFT: f64 = 0.001;
+/// Claude: a step in media time between two pushes shorter than this is
+/// timestamp rounding, not media that never arrived.
+pub const SMALLEST_GAP: f64 = 0.001;
 
 /// Claude: how many frames, at the source's rate, a frame may land in a route's
 /// ring after it was captured, beyond the source's fastest delivery: the source's
@@ -63,6 +66,8 @@ pub struct DeliveryMeter {
 
 struct Arrival {
     at: f64,
+    /// Claude: where the push's media ended.
+    end: f64,
     /// Claude: the shortest time from the end of a push's media to its arrival.
     fastest: f64,
 }
@@ -84,9 +89,22 @@ impl DeliveryMeter {
         Arc::clone(&self.span)
     }
 
+    /// Claude: the media between the latest push and one starting at `start`
+    /// that never arrived, when the routes' span outlasts it. The source fills it
+    /// and records the fill as a late push, so the gap costs its own length
+    /// instead of the routes' buffer.
+    pub fn gap_before(&self, start: f64) -> Option<Range<f64>> {
+        let end = self.latest.as_ref()?.end;
+        let gap = start - end;
+        (gap > SMALLEST_GAP && gap <= self.seconds).then_some(end..start)
+    }
+
     /// Claude: a push of the media `media` covers, in seconds, that arrived at
-    /// `arrival` seconds. Its first frame is the one that waited longest.
-    pub fn record(&mut self, media: Range<f64>, arrival: f64) {
+    /// `arrival` seconds. Its first frame is the one that waited longest. Returns
+    /// when it would have arrived at the fastest transit; a ring push stamped with
+    /// that time shows the routes how far behind its media the source still is,
+    /// however a burst is spread out.
+    pub fn record(&mut self, media: Range<f64>, arrival: f64) -> f64 {
         let transit = arrival - media.end;
         let fastest = match &self.latest {
             Some(latest) => (latest.fastest + DRIFT * (arrival - latest.at)).min(transit),
@@ -113,9 +131,11 @@ impl DeliveryMeter {
         self.seconds = span;
         self.latest = Some(Arrival {
             at: arrival,
+            end: media.end,
             fastest,
         });
         self.span.publish(self.seconds * self.sample_rate);
+        media.end + fastest
     }
 }
 

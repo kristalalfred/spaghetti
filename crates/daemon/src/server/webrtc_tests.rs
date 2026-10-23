@@ -1116,7 +1116,9 @@ async fn concealment_keeps_a_lossy_reordered_stream_continuous() {
     assert_eq!(
         [health.underruns, health.reprimes],
         [0, 0],
-        "the playout underran or re-primed"
+        "the playout underran or re-primed at a span of {} frames, now {}",
+        health.glitch_span_frames,
+        health.delivery_frames
     );
     assert!(
         worst_correction_ppm < 3000.0,

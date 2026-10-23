@@ -37,6 +37,8 @@ pub struct Playout {
     source_frames_per_tick: f64,
     margin_frames: usize,
     delivery: Arc<DeliverySpan>,
+    /// Claude: the span at the previous render.
+    span: f64,
     primed: bool,
     fill_avg: f64,
     controller: FillController,
@@ -170,6 +172,7 @@ impl Playout {
             source_frames_per_tick: source_rate / ticks_per_second,
             margin_frames: (MARGIN_SECONDS * source_rate).ceil() as usize,
             delivery: Arc::clone(&source.delivery),
+            span: source.delivery.frames(),
             primed: false,
             fill_avg: 0.0,
             controller: FillController::new(source_rate),
@@ -219,6 +222,8 @@ impl Playout {
         // Claude: read after the ring, so the span a source publishes before a push
         // is seen with that push.
         let span = self.delivery.frames();
+        let grown = span - self.span > self.controller.inaudible_error();
+        self.span = span;
         let target = need + self.margin_frames + span.round() as usize;
         let fill = self.estimated_fill(&last, now, span);
         self.health.target.store(target as u32, Ordering::Relaxed);
@@ -234,11 +239,9 @@ impl Playout {
         } else if ring.available() < need {
             self.reprime(Glitch::Underrun, span, target, out);
             return;
-        } else if target as f64 - self.fill_avg > self.controller.inaudible_error() {
+        } else if grown {
             // Claude: the span grew under a playing route. Resampling up to the new
             // target would be audible, so the playout re-primes to it once instead.
-            // The smoothed fill is compared because the estimate dips while a burst
-            // is still landing.
             self.reprime(Glitch::Reprime, span, target, out);
             return;
         } else if fill > (target + RESYNC_RENDERS * need) as f64 + span {
@@ -288,7 +291,9 @@ impl Playout {
     /// has captured since then but not delivered yet, up to its delivery span.
     /// Unlike the raw fill this holds steady through pushes that land late.
     fn estimated_fill(&self, last: &LastPush, now: u64, span: f64) -> f64 {
-        let since_push = (now as u32).wrapping_sub(last.at) as f64 * self.source_frames_per_tick;
+        // Claude: a push that lands after `now` was read is stamped later than it.
+        let ticks = ((now as u32).wrapping_sub(last.at) as i32).max(0);
+        let since_push = f64::from(ticks) * self.source_frames_per_tick;
         last.buffered as f64 + since_push.min(span)
     }
 
@@ -356,23 +361,67 @@ mod tests {
     /// releases them at its end over `BURST_SECONDS`, as Wi-Fi does after it was
     /// off-channel.
     fn stall(pushes: &mut [Push], start: f64, seconds: f64) {
+        stall_released_over(pushes, start, seconds, BURST_SECONDS);
+    }
+
+    /// Claude: a stall whose held pushes land over `release` after its end, as
+    /// srt-tokio's release timer and SRT retransmissions spread them.
+    fn stall_released_over(pushes: &mut [Push], start: f64, seconds: f64, release: f64) {
         let held: Vec<usize> = (0..pushes.len())
             .filter(|&i| (start..start + seconds).contains(&pushes[i].arrival))
             .collect();
         for (k, &i) in held.iter().enumerate() {
-            pushes[i].arrival = start + seconds + BURST_SECONDS * k as f64 / held.len() as f64;
+            pushes[i].arrival = start + seconds + release * k as f64 / held.len() as f64;
         }
     }
 
-    /// Claude: the `lost` packets due from `at` on never arrive; the next one lands
-    /// `hold` late, and the source pushes the gap's concealment with it a packet at
-    /// a time, as `webrtc_receiver` does.
-    fn conceal(pushes: &mut [Push], at: f64, lost: usize, hold: f64) {
+    /// Claude: the `lost` units due from `at` on never arrive, and the ones after
+    /// them arrive on time, as SRT drops what a stall made too late to retransmit.
+    fn drop_units(pushes: &mut Vec<Push>, at: f64, lost: usize) {
         let first = pushes.iter().position(|push| push.arrival >= at).unwrap();
-        let arrival = pushes[first + lost].arrival + hold;
-        for push in &mut pushes[first..=first + lost] {
-            push.arrival = arrival;
+        pushes.drain(first..first + lost);
+    }
+
+    /// Claude: a fixed sequence of uniform numbers, so a random-looking path
+    /// replays the same way every run.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn uniform(&mut self, low: f64, high: f64) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            low + (high - low) * (self.0 >> 11) as f64 / (1u64 << 53) as f64
         }
+    }
+
+    /// Claude: the field's hotspot path, a home Wi-Fi hop and a phone hotspot hop:
+    /// each stalls for 50 to 300 ms every 0.3 to 4 s and releases what it held
+    /// over up to 100 ms, and every packet lands up to 15 ms late on top.
+    fn hotspot_path(pushes: &mut [Push], seconds: f64, seed: u64) {
+        let mut random = Lcg(seed);
+        for _hop in 0..2 {
+            let mut start = random.uniform(1.0, 3.0);
+            while start < seconds {
+                let length = random.uniform(0.05, 0.3);
+                let release = random.uniform(0.005, 0.1);
+                stall_released_over(pushes, start, length, release);
+                start += length + random.uniform(0.3, 4.0);
+            }
+        }
+        for push in pushes.iter_mut() {
+            push.arrival += random.uniform(0.0, 0.015);
+        }
+    }
+
+    /// Claude: the `lost` packets due from `at` on never arrive and the next one
+    /// lands `hold` late, as str0m holds it. The source conceals the gap when that
+    /// one arrives.
+    fn conceal(pushes: &mut Vec<Push>, at: f64, lost: usize, hold: f64) {
+        let first = pushes.iter().position(|push| push.arrival >= at).unwrap();
+        pushes[first + lost].arrival += hold;
+        pushes.drain(first..first + lost);
     }
 
     /// Claude: what the simulated source tells its routes before each push: its
@@ -392,6 +441,11 @@ mod tests {
             Self::Measured(DeliveryMeter::new(48000.0, 0.1))
         }
 
+        /// Claude: an SRT source, whose floor is srt-tokio's coarse release timer.
+        fn srt() -> Self {
+            Self::Measured(DeliveryMeter::new(48000.0, 0.025))
+        }
+
         fn span(&self) -> Arc<DeliverySpan> {
             match self {
                 Self::Cadence(span) => Arc::clone(span),
@@ -399,14 +453,41 @@ mod tests {
             }
         }
 
-        fn publish(&mut self, push: &Push, rate: f64) {
+        /// Claude: returns the host time, in seconds, the ring push is stamped with.
+        fn publish(&mut self, push: &Push, rate: f64) -> f64 {
             match self {
-                Self::Cadence(span) => span.publish(push.frames as f64),
+                Self::Cadence(span) => {
+                    span.publish(push.frames as f64);
+                    push.arrival
+                }
                 Self::Measured(meter) => meter.record(
                     push.media as f64 / rate..(push.media + push.frames) as f64 / rate,
                     push.arrival,
                 ),
             }
+        }
+
+        /// Claude: the media a network source fills before `push`, in pushes of at
+        /// most its length.
+        fn gap_before(&self, push: &Push, rate: f64) -> Vec<Push> {
+            let Self::Measured(meter) = self else {
+                return Vec::new();
+            };
+            let Some(gap) = meter.gap_before(push.media as f64 / rate) else {
+                return Vec::new();
+            };
+            let mut media = (gap.start * rate).round() as usize;
+            let mut fill = Vec::new();
+            while media < push.media {
+                let frames = push.frames.min(push.media - media);
+                fill.push(Push {
+                    media,
+                    frames,
+                    arrival: push.arrival,
+                });
+                media += frames;
+            }
+            fill
         }
     }
 
@@ -520,20 +601,13 @@ mod tests {
         fn run(&mut self, seconds: f64) {
             let end = self.next_render + seconds;
             while self.next_render < end {
-                let due = self.pushes[self.next_push];
-                if due.arrival <= self.next_render {
-                    let rate = self.source_rate;
+                let due = self.pushes.get(self.next_push).copied();
+                if let Some(due) = due.filter(|due| due.arrival <= self.next_render) {
                     self.next_push += 1;
-                    self.source.publish(&due, rate);
-                    self.ring.push_with(
-                        due.frames,
-                        (due.arrival * TICKS_PER_SECOND) as u64,
-                        |f, _| {
-                            (0.5 * (2.0 * std::f64::consts::PI * TONE_HZ * (due.media + f) as f64
-                                / rate)
-                                .sin()) as f32
-                        },
-                    );
+                    for fill in self.source.gap_before(&due, self.source_rate) {
+                        self.push(fill);
+                    }
+                    self.push(due);
                 } else {
                     let (mut left, mut right) =
                         (vec![0.0; RENDER_FRAMES], vec![0.0; RENDER_FRAMES]);
@@ -547,6 +621,18 @@ mod tests {
                     self.worst_correction_ppm = self.worst_correction_ppm.max(correction);
                 }
             }
+        }
+
+        /// Claude: the tone at the push's media time. A gap the source fills gets the
+        /// tone too, so the tone shows whether playout ever skipped.
+        fn push(&mut self, push: Push) {
+            let rate = self.source_rate;
+            let stamp = self.source.publish(&push, rate);
+            self.ring
+                .push_with(push.frames, (stamp * TICKS_PER_SECOND) as u64, |f, _| {
+                    (0.5 * (2.0 * std::f64::consts::PI * TONE_HZ * (push.media + f) as f64 / rate)
+                        .sin()) as f32
+                });
         }
 
         fn first_sound(&self) -> usize {
@@ -906,6 +992,144 @@ mod tests {
             "{} ppm",
             sim.worst_correction_ppm
         );
+    }
+
+    /// Claude: srt-tokio and SRT retransmission release a held burst over tens to
+    /// hundreds of milliseconds. Covered stalls released that slowly cost nothing,
+    /// and one that outlasts the span costs one re-prime.
+    #[test]
+    fn slowly_released_bursts_reprime_only_when_the_span_grows() {
+        for release in [0.05, 0.1, 0.2, 0.3] {
+            let mut pushes = on_time(48000.0, 960, 50.0);
+            let mut start = 2.0;
+            while start < 40.0 {
+                if start != 21.0 {
+                    stall_released_over(&mut pushes, start, 0.36, release);
+                }
+                start += 1.0;
+            }
+            let mut sim = Sim::delivering(48000.0, 48000.0, 40.0, Source::webrtc(), pushes);
+            sim.run(2.95);
+            let adapted = sim.glitches();
+            sim.worst_correction_ppm = 0.0;
+            sim.run(17.9);
+            let covered = sim.glitches();
+            let span = sim.playout.health.report().delivery_frames / 48000.0;
+            let next = sim.next_push;
+            // Claude: the first packet held from 21 s on waits the stall plus its own 20 ms.
+            stall_released_over(&mut sim.pushes[next..], 21.0, span + 0.005 - 0.02, release);
+            sim.run(25.0);
+            let label = format!("released over {release} s");
+            assert_eq!(adapted, [1, 0, 0], "{label}: the first stall");
+            assert_eq!(covered, adapted, "{label}: covered stalls");
+            assert_eq!(
+                sim.glitches(),
+                [2, 0, 0],
+                "{label}: a stall that outlasts the span"
+            );
+            assert!(
+                sim.worst_correction_ppm < INAUDIBLE_PPM,
+                "{label}: {} ppm",
+                sim.worst_correction_ppm
+            );
+        }
+    }
+
+    /// Claude: holes SRT leaves in media time cost the silence of their own
+    /// length once the span covers them. At the floor a unit's hole is covered; a
+    /// two-unit hole starves the ring for three units, so the first one costs a
+    /// gap and grows the span, and later ones cost nothing.
+    #[test]
+    fn srt_holes_cost_their_own_length_once_the_span_covers_them() {
+        let mut pushes = on_time(48000.0, 1024, 70.0);
+        let mut at = 5.0;
+        for lost in [1, 2, 1, 2, 1, 2] {
+            drop_units(&mut pushes, at, lost);
+            at += 10.0;
+        }
+        let mut sim = Sim::delivering(48000.0, 48000.0, 40.0, Source::srt(), pushes);
+        sim.run(1.0);
+        let floor = sim.playout.health.report().delivery_frames;
+        sim.worst_correction_ppm = 0.0;
+        sim.run(13.9);
+        assert_eq!(sim.glitches(), [0, 0, 0], "a hole of one unit at the floor");
+        sim.run(2.0);
+        assert_eq!(sim.glitches(), [1, 0, 0], "the first hole of two units");
+        let from = sim.rendered.len();
+        sim.run(52.0);
+        assert_eq!(
+            sim.glitches(),
+            [1, 0, 0],
+            "holes after the span covers them"
+        );
+        assert!(sim.playout.health.report().delivery_frames > floor);
+        assert!(worst_recurrence_error(&sim.rendered[from..], 48000.0) < 1e-3);
+        assert!(
+            sim.worst_correction_ppm < INAUDIBLE_PPM,
+            "{} ppm",
+            sim.worst_correction_ppm
+        );
+    }
+
+    /// Claude: three minutes over the hotspot path. Every re-prime comes with a
+    /// grown span, and a few seconds after any gap the controller is back inside
+    /// what a listener cannot hear.
+    #[test]
+    fn a_hotspot_path_reprimes_only_on_growth_and_settles_after_each_gap() {
+        for seed in [1, 2, 3] {
+            let mut pushes = on_time(48000.0, 960, 190.0);
+            hotspot_path(&mut pushes, 185.0, seed);
+            let mut sim = Sim::delivering(48000.0, 48000.0, 40.0, Source::webrtc(), pushes);
+            let label = format!("seed {seed}");
+            let (mut report, mut last_gap) = (sim.playout.health.report(), 0.0);
+            while sim.next_render < 180.0 {
+                sim.run(0.01);
+                let now = sim.playout.health.report();
+                if now.reprimes > report.reprimes {
+                    assert!(
+                        now.delivery_frames > report.delivery_frames,
+                        "{label}: re-primed at {:.2} s at an unchanged span of {} frames",
+                        sim.next_render,
+                        report.delivery_frames
+                    );
+                }
+                if now.underruns + now.reprimes > report.underruns + report.reprimes {
+                    last_gap = sim.next_render;
+                } else if sim.next_render > last_gap + 3.0 {
+                    assert!(
+                        now.correction_ppm.abs() < INAUDIBLE_PPM,
+                        "{label}: {} ppm at {:.2} s, {:.2} s after a gap",
+                        now.correction_ppm,
+                        sim.next_render,
+                        sim.next_render - last_gap
+                    );
+                }
+                report = now;
+            }
+            assert_eq!(sim.glitches()[1..], [0, 0], "{label}: resyncs, overflows");
+        }
+    }
+
+    /// Claude: a push can land between the render reading the host time and
+    /// reading the ring, stamped just after that time. It is owed nothing yet,
+    /// so it must not count as a whole span of captured media.
+    #[test]
+    fn a_push_stamped_after_the_render_is_owed_nothing() {
+        let timing = SourceTiming {
+            sample_rate: 48000.0,
+            delivery: Arc::new(DeliverySpan::new(4800.0)),
+        };
+        let mut playout = Playout::new(&timing, 48000.0, TICKS_PER_SECOND).unwrap();
+        let ring = Ring::new();
+        let now = (10.0 * TICKS_PER_SECOND) as u64;
+        ring.push_with(960, now + 1, |_, _| 0.25);
+        let (mut left, mut right) = (vec![0.0; RENDER_FRAMES], vec![0.0; RENDER_FRAMES]);
+        playout.render(&ring, &mut [&mut left, &mut right], now);
+        assert!(
+            !playout.is_playing(),
+            "primed on 960 frames against a span of 4800"
+        );
+        assert_eq!(ring.available(), 960);
     }
 
     #[test]
