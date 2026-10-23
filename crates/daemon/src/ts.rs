@@ -345,12 +345,14 @@ fn pmt_adts_pid(section: &[u8]) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aac::{self, AacConfig, AacDecoder};
+    use crate::adts;
+    use crate::codec::tests::measure;
+    use crate::codec::{Codec, Decoder, StreamFormat};
 
     fn adts(n: usize, len: usize) -> Vec<u8> {
         let mut out = Vec::new();
         let unit: Vec<u8> = (0..len).map(|i| (i + n) as u8).collect();
-        aac::adts_frame(AacConfig { sample_rate: 48000, channels: 2 }, &unit, &mut out).unwrap();
+        adts::adts_frame(StreamFormat { sample_rate: 48000, channels: 2 }, &unit, &mut out).unwrap();
         out
     }
 
@@ -453,22 +455,22 @@ mod tests {
     fn an_ffmpeg_stream_demuxes_and_decodes_to_its_tone() {
         let stream = include_bytes!("../testdata/tone-1khz-48k-mono.ts");
         let mut demuxer = TsDemuxer::new();
-        let mut decoder: Option<AacDecoder> = None;
+        let mut decoder: Option<Decoder> = None;
         let mut configs = Vec::new();
         let mut pcm = Vec::new();
         let mut carry = Vec::new();
         demuxer.push(stream, |payload, _| {
             carry.extend_from_slice(payload);
-            let used = aac::parse_adts(&carry, |config, unit| {
+            let used = adts::parse_adts(&carry, |config, unit| {
                 configs.push(config);
-                let decoder = decoder.get_or_insert_with(|| AacDecoder::new(config, 48000.0).unwrap());
+                let decoder = decoder.get_or_insert_with(|| Decoder::new(Codec::Aac, config).unwrap());
                 decoder.decode(unit, &mut pcm).unwrap();
             });
             carry.drain(..used);
         });
         assert!(!configs.is_empty(), "found an ADTS stream");
-        assert!(configs.iter().all(|&c| c == AacConfig { sample_rate: 48000, channels: 1 }));
-        let (hz, _) = aac::tests::measure(&pcm[pcm.len() / 4..pcm.len() * 3 / 4], 1, 48000.0);
+        assert!(configs.iter().all(|&c| c == StreamFormat { sample_rate: 48000, channels: 1 }));
+        let (hz, _) = measure(&pcm[pcm.len() / 4..pcm.len() * 3 / 4], 1, 48000.0);
         assert!((hz - 1000.0).abs() < 5.0, "{hz} Hz");
     }
 }

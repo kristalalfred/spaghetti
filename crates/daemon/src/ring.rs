@@ -1,5 +1,8 @@
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use coreaudio_sys::AudioGetCurrentHostTime;
 
 pub const CHANNELS: usize = 2;
 const CAPACITY_FRAMES: usize = 16384;
@@ -93,6 +96,19 @@ impl Ring {
             buffered: ((packed >> 32) as u32).wrapping_sub(tail) as usize,
             at: packed as u32,
         }
+    }
+
+    /// Claude: consumer only. When the oldest frame in the ring was captured, from
+    /// the host time of the latest push and the frames buffered since. Stamping
+    /// packets with it makes the receiver release them at the source's cadence,
+    /// not the encoder's.
+    pub fn captured_at(&self, sample_rate: f64, ticks_per_second: f64) -> Instant {
+        let last = self.last_push();
+        let now = Instant::now();
+        let since_push = (unsafe { AudioGetCurrentHostTime() } as u32).wrapping_sub(last.at) as f64
+            / ticks_per_second;
+        let age = since_push + last.buffered as f64 / sample_rate;
+        now.checked_sub(Duration::from_secs_f64(age)).unwrap_or(now)
     }
 
     /// Claude: consumer only. Fills `dst` with up to `dst.len() / CHANNELS` frames

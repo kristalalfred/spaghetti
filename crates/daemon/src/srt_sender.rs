@@ -3,17 +3,17 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use coreaudio_sys::{AudioGetCurrentHostTime, AudioGetHostClockFrequency};
+use coreaudio_sys::AudioGetHostClockFrequency;
 use spaghetti_common::ipc_protocol::{FlowStatus, SrtSocket};
 
-use crate::aac::{self, AacEncoder, FRAMES_PER_PACKET};
+use crate::adts;
+use crate::codec::{Codec, Encoder};
 use crate::mixer;
 use crate::ring::{CHANNELS, Ring};
 use crate::sinks::SourceTiming;
 use crate::srt::{SrtEndpoint, SrtLink};
 use crate::ts::{PACKET_LEN, TsMuxer};
 
-const BITRATE: u32 = 256_000;
 /// Claude: SRT live mode carries at most 1316 payload bytes, seven TS packets.
 const PACKETS_PER_MESSAGE: usize = 7;
 const QUEUED_MESSAGES: usize = 64;
@@ -36,7 +36,7 @@ impl SrtOutput {
         volume: Arc<AtomicU32>,
     ) -> Result<Self, String> {
         let endpoint = SrtEndpoint::parse(spec)?;
-        let encoder = AacEncoder::new(source.sample_rate.round() as u32, BITRATE)?;
+        let encoder = Encoder::new(Codec::Aac, source.sample_rate.round() as u32)?;
         let (messages, queued) = tokio::sync::mpsc::channel(QUEUED_MESSAGES);
         let stop = Arc::new(AtomicBool::new(false));
         let encoder = std::thread::Builder::new()
@@ -90,47 +90,36 @@ impl Drop for SrtOutput {
     }
 }
 
-/// Claude: when the oldest frame in `ring` was captured, from the host time of
-/// the latest push and the frames buffered since. Stamping packets with it
-/// makes the receiver release them at the source's cadence, not the encoder's.
-fn captured_at(ring: &Ring, sample_rate: f64, ticks_per_second: f64) -> Instant {
-    let last = ring.last_push();
-    let now = Instant::now();
-    let since_push = (unsafe { AudioGetCurrentHostTime() } as u32).wrapping_sub(last.at) as f64
-        / ticks_per_second;
-    let age = since_push + last.buffered as f64 / sample_rate;
-    now.checked_sub(Duration::from_secs_f64(age)).unwrap_or(now)
-}
-
 fn encode(
-    mut encoder: AacEncoder,
+    mut encoder: Encoder,
     source_rate: f64,
     ring: &Ring,
     volume: &AtomicU32,
     messages: &tokio::sync::mpsc::Sender<(Instant, Bytes)>,
     stop: &AtomicBool,
 ) {
-    let config = encoder.config();
+    let format = encoder.format();
+    let frames_per_packet = encoder.frames_per_packet();
     let ticks_per_second = unsafe { AudioGetHostClockFrequency() };
-    let ticks_per_unit = FRAMES_PER_PACKET as u64 * 90_000;
-    let mut pcm = vec![0.0; FRAMES_PER_PACKET * CHANNELS];
+    let ticks_per_unit = frames_per_packet as u64 * 90_000;
+    let mut pcm = vec![0.0; frames_per_packet * CHANNELS];
     let mut muxer = TsMuxer::new();
     let (mut adts, mut stream) = (Vec::new(), Vec::new());
     let mut units = 0u64;
     let mut closed = false;
     while !stop.load(Ordering::Relaxed) && !closed {
-        while ring.available() >= FRAMES_PER_PACKET && !closed {
-            let origin = captured_at(ring, source_rate, ticks_per_second);
+        while ring.available() >= frames_per_packet && !closed {
+            let origin = ring.captured_at(source_rate, ticks_per_second);
             ring.pop_into(&mut pcm);
             mixer::apply_volume(&mut pcm, f32::from_bits(volume.load(Ordering::Relaxed)));
             let encoded = encoder.encode(&pcm, |unit| {
                 adts.clear();
-                if let Err(e) = aac::adts_frame(config, unit, &mut adts) {
+                if let Err(e) = adts::adts_frame(format, unit, &mut adts) {
                     tracing::warn!(error = e, "AAC frame does not fit ADTS");
                     return;
                 }
                 stream.clear();
-                muxer.mux(&adts, units * ticks_per_unit / u64::from(config.sample_rate), &mut stream);
+                muxer.mux(&adts, units * ticks_per_unit / u64::from(format.sample_rate), &mut stream);
                 units += 1;
                 for message in stream.chunks(PACKET_LEN * PACKETS_PER_MESSAGE) {
                     if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) =

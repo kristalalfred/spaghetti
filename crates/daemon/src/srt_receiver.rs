@@ -7,15 +7,13 @@ use bytes::Bytes;
 use coreaudio_sys::AudioGetCurrentHostTime;
 use spaghetti_common::ipc_protocol::{FlowStatus, SrtSocket};
 
-use crate::aac::{self, AacConfig, AacDecoder};
+use crate::adts;
+use crate::codec::{Codec, DECODED_RATE, Decoder, StreamFormat};
 use crate::ring::Ring;
 use crate::sinks::{MAX_SINKS, Sinks, SourceTiming};
 use crate::srt::{SrtEndpoint, SrtLink};
 use crate::ts::TsDemuxer;
 
-/// Claude: every received stream is decoded at this rate, so routes can be
-/// set up before the first packet says what the stream's rate is.
-const OUTPUT_RATE: f64 = 48000.0;
 /// Claude: srt-tokio releases received packets on a coarse timer, measured as
 /// up to 13 ms after their scheduled time, so decoded frames land that unevenly.
 const DELIVERY_JITTER: f64 = 0.025;
@@ -57,7 +55,7 @@ impl SrtSource {
 
     pub fn timing(&self) -> SourceTiming {
         SourceTiming {
-            sample_rate: OUTPUT_RATE,
+            sample_rate: f64::from(DECODED_RATE),
             delivery_jitter: DELIVERY_JITTER,
         }
     }
@@ -90,8 +88,8 @@ impl Drop for SrtSource {
 fn decode(received: Receiver<Bytes>, sinks: &Sinks, stop: &AtomicBool) {
     let mut demuxer = TsDemuxer::new();
     let mut adts = Vec::new();
-    let mut format: Option<AacConfig> = None;
-    let mut decoder: Option<AacDecoder> = None;
+    let mut format: Option<StreamFormat> = None;
+    let mut decoder: Option<Decoder> = None;
     let mut pcm = Vec::new();
     while !stop.load(Ordering::Relaxed) {
         let payload = match received.recv_timeout(Duration::from_millis(100)) {
@@ -100,7 +98,7 @@ fn decode(received: Receiver<Bytes>, sinks: &Sinks, stop: &AtomicBool) {
             Err(RecvTimeoutError::Disconnected) => return,
         };
         demuxer.push(&payload, |es, _| adts.extend_from_slice(es));
-        let used = aac::parse_adts(&adts, |config, unit| {
+        let used = adts::parse_adts(&adts, |config, unit| {
             if format != Some(config) {
                 format = Some(config);
                 tracing::info!(
@@ -108,7 +106,7 @@ fn decode(received: Receiver<Bytes>, sinks: &Sinks, stop: &AtomicBool) {
                     channels = config.channels,
                     "SRT stream format"
                 );
-                decoder = AacDecoder::new(config, OUTPUT_RATE)
+                decoder = Decoder::new(Codec::Aac, config)
                     .inspect_err(|e| tracing::warn!(error = e, "cannot decode SRT stream"))
                     .ok();
             }
@@ -143,7 +141,7 @@ mod tests {
     use spaghetti_common::ipc_protocol::{FlowState, SrtMode};
 
     use super::*;
-    use crate::aac::tests::{measure, tone};
+    use crate::codec::tests::{measure, tone};
     use crate::ring::CHANNELS;
     use crate::srt_sender::SrtOutput;
 

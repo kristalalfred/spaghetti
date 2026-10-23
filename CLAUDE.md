@@ -63,7 +63,8 @@ Key files:
 - `crates/daemon/bridge/tap_bridge.m` + `.h` — ObjC bridge for `AudioHardwareCreateProcessTap` and aggregate device creation. Compiled by `build.rs`.
 - `crates/daemon/src/srt.rs` — `SrtLink`, one SRT connection that reconnects when it drops, with its `FlowStatus`.
 - `crates/daemon/src/srt_receiver.rs` + `srt_sender.rs` — `SrtSource` (decode thread) and `SrtOutput` (encode thread).
-- `crates/daemon/src/aac.rs` + `ts.rs` — the AudioToolbox AAC codec, ADTS framing, and a single-stream MPEG-TS muxer and demuxer.
+- `crates/daemon/src/codec.rs` — `Encoder` and `Decoder` over AudioToolbox's `AudioConverter` for each `Codec` (AAC-LC, Opus). Every stream decodes to 48 kHz.
+- `crates/daemon/src/adts.rs` + `ts.rs` — ADTS framing of AAC access units, and a single-stream MPEG-TS muxer and demuxer.
 - `crates/daemon/src/flow.rs` — `FlowMeter`, which every source and output uses to report idle, connecting, connected, flowing or stalled.
 
 ## Core Audio gotchas (learned the hard way)
