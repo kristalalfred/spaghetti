@@ -42,20 +42,26 @@ impl FlowMeter {
         self.last_at.store(0, Ordering::Relaxed);
     }
 
-    pub fn status(&self, link: Link) -> FlowStatus {
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Claude: what a connected end's media did lately.
+    pub fn progress(&self) -> FlowState {
         let last_at = self.last_at.load(Ordering::Relaxed);
-        let progress = || {
-            if last_at == 0 {
-                return FlowState::Connected;
-            }
-            let now = unsafe { AudioGetCurrentHostTime() };
-            let age = now.saturating_sub(last_at) as f64 / unsafe { AudioGetHostClockFrequency() };
-            if age > STALL_AFTER_SECONDS {
-                FlowState::Stalled
-            } else {
-                FlowState::Flowing
-            }
-        };
+        if last_at == 0 {
+            return FlowState::Connected;
+        }
+        let now = unsafe { AudioGetCurrentHostTime() };
+        let age = now.saturating_sub(last_at) as f64 / unsafe { AudioGetHostClockFrequency() };
+        if age > STALL_AFTER_SECONDS {
+            FlowState::Stalled
+        } else {
+            FlowState::Flowing
+        }
+    }
+
+    pub fn status(&self, link: Link) -> FlowStatus {
         let (state, peer, packets_lost, packets_retransmitted) = match link {
             Link::Idle => (FlowState::Idle, None, 0, 0),
             Link::Connecting => (FlowState::Connecting, None, 0, 0),
@@ -63,11 +69,11 @@ impl FlowMeter {
                 peer,
                 packets_lost,
                 packets_retransmitted,
-            } => (progress(), peer, packets_lost, packets_retransmitted),
+            } => (self.progress(), peer, packets_lost, packets_retransmitted),
         };
         FlowStatus {
             state,
-            bytes: self.bytes.load(Ordering::Relaxed),
+            bytes: self.bytes(),
             peer,
             packets_lost,
             packets_retransmitted,

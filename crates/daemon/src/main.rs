@@ -11,6 +11,8 @@ mod audio;
 mod codec;
 mod device_manager;
 mod device_output;
+#[cfg(test)]
+mod fixture;
 mod flow;
 mod mixer;
 mod playout;
@@ -22,8 +24,12 @@ mod sinks;
 mod srt;
 mod srt_receiver;
 mod srt_sender;
+mod stun;
 mod tap;
 mod ts;
+mod webrtc;
+mod webrtc_receiver;
+mod webrtc_sender;
 
 fn init_logging() {
     tracing_subscriber::fmt()

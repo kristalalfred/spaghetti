@@ -7,7 +7,7 @@
     <key>CFBundleName</key>
     <string>spaghettid</string>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>Spaghetti sends and receives audio over SRT with computers on your network.</string>
+    <string>Spaghetti sends and receives audio over SRT and WebRTC with computers on your network.</string>
     <key>NSAudioCaptureUsageDescription</key>
     <string>Spaghetti captures the audio of the apps you route.</string>
 </dict>

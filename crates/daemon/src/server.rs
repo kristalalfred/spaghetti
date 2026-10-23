@@ -17,6 +17,9 @@ const ACTIVITY_FRESHNESS_NS: u64 = 200_000_000;
 
 const HEALTH_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
+#[cfg(test)]
+mod webrtc_tests;
+
 /// Shared daemon state accessible by all client handlers.
 pub struct DaemonState {
     pub router: Router,
@@ -195,6 +198,17 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
         Request::SetVolume { route_id, volume } => {
             let mut st = lock_state(state);
             match st.router.set_volume(route_id, volume) {
+                Ok(()) => Response::Ok,
+                Err(message) => Response::Error { message },
+            }
+        }
+        Request::SetRemoteDescription {
+            peer,
+            generation,
+            sdp,
+        } => {
+            let st = lock_state(state);
+            match st.router.set_remote_description(peer, generation, sdp) {
                 Ok(()) => Response::Ok,
                 Err(message) => Response::Error { message },
             }

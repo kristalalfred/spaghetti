@@ -22,7 +22,7 @@ impl TapMode {
 
 /// Claude: changes whenever a request or response changes shape, so a client
 /// can refuse a daemon it does not speak.
-pub const IPC_VERSION: u32 = 2;
+pub const IPC_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
@@ -38,6 +38,8 @@ pub enum Request {
     DestroyRoute { route_id: u32 },
     ListRoutes,
     SetVolume { route_id: u32, volume: f32 },
+    /// Hand a WebRTC peer the answer to its offer, or the offer it answers.
+    SetRemoteDescription { peer: PeerRef, generation: u32, sdp: String },
     CreateDevice { name: String, channels: Option<u32> },
     DestroyDevice { device_uid: String },
     ListDevices,
@@ -69,6 +71,8 @@ pub enum SourceSpec {
     Tap { pids: Vec<u32>, mode: TapMode },
     /// AAC in MPEG-TS received over SRT.
     Srt(SrtSocket),
+    /// Opus received from one WebRTC peer, decoded to 48 kHz stereo.
+    WebRtc(WebRtcPeer),
 }
 
 /// Where a route sends its source's audio.
@@ -78,6 +82,55 @@ pub enum Destination {
     Device { uid: String },
     /// AAC in MPEG-TS sent over SRT.
     Srt(SrtSocket),
+    /// Opus sent to one WebRTC peer: 48 kHz stereo in 20 ms packets.
+    WebRtc(WebRtcPeer),
+}
+
+/// One end of a WebRTC peer link.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebRtcPeer {
+    /// The controller's id for the link, opaque to spaghetti.
+    pub link: String,
+    /// Bumped by the controller whenever the link must start over.
+    pub generation: u32,
+    pub role: PeerRole,
+    /// STUN servers as host:port; empty for host candidates only.
+    pub stun: Vec<String>,
+    /// TURN servers, each adding a relayed candidate; empty for none.
+    pub turn: Vec<TurnServer>,
+}
+
+/// A UDP TURN server and the credentials to allocate a relay on it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnServer {
+    /// host:port
+    pub address: String,
+    pub username: String,
+    pub credential: String,
+}
+
+impl std::fmt::Debug for TurnServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnServer")
+            .field("address", &self.address)
+            .field("username", &self.username)
+            .field("credential", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The side of the offer/answer exchange a peer takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerRole {
+    Offer,
+    Answer,
+}
+
+/// A WebRTC peer, by the source or route it belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerRef {
+    Source(u32),
+    Route(u32),
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,14 +174,18 @@ pub enum FlowState {
     Flowing,
     /// Media moved before but not within the last few seconds.
     Stalled,
+    /// The peer was never reached. Final until the spec changes.
+    Unreachable,
+    /// The connection to the peer ended. Final until the spec changes.
+    Lost,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlowStatus {
     pub state: FlowState,
-    /// Payload bytes moved so far: encoded bytes for SRT, PCM bytes otherwise.
+    /// Payload bytes moved so far: encoded bytes for SRT and WebRTC, PCM bytes otherwise.
     pub bytes: u64,
-    /// The connected SRT peer.
+    /// The connected SRT or WebRTC peer.
     pub peer: Option<String>,
     pub packets_lost: u64,
     pub packets_retransmitted: u64,
@@ -157,9 +214,11 @@ pub struct SourceInfo {
     pub source_id: u32,
     pub spec: SourceSpec,
     pub tag: Option<String>,
-    /// The tapped app's name, or the SRT endpoint.
+    /// The tapped app's name, the SRT endpoint, or the WebRTC link.
     pub label: String,
     pub status: FlowStatus,
+    /// A WebRTC peer's offer or answer, once it has one.
+    pub local_description: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -169,6 +228,8 @@ pub struct RouteInfo {
     pub destination: Destination,
     pub volume: f32,
     pub status: FlowStatus,
+    /// A WebRTC peer's offer or answer, once it has one.
+    pub local_description: Option<String>,
 }
 
 /// Snapshot of driver-side audio activity, derived from the shared-memory region.
@@ -229,4 +290,142 @@ pub fn read_message<R: Read, T: serde::de::DeserializeOwned>(reader: &mut R) -> 
     reader.read_exact(&mut buf)?;
     serde_json::from_slice(&buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Claude: `value` serializes to exactly `json`, and `json` reads back to it.
+    fn golden<T: Serialize + serde::de::DeserializeOwned>(value: &T, json: &str) {
+        assert_eq!(serde_json::to_string(value).unwrap(), json);
+        let read: T = serde_json::from_str(json).unwrap();
+        assert_eq!(serde_json::to_string(&read).unwrap(), json);
+    }
+
+    fn answering() -> WebRtcPeer {
+        WebRtcPeer {
+            link: "link-7".into(),
+            generation: 2,
+            role: PeerRole::Answer,
+            stun: vec!["stun.l.google.com:19302".into(), "203.0.113.9:3478".into()],
+            turn: vec![TurnServer {
+                address: "turn.example.net:3478".into(),
+                username: "1767225600:link-7".into(),
+                credential: "c2VjcmV0".into(),
+            }],
+        }
+    }
+
+    fn offering() -> WebRtcPeer {
+        WebRtcPeer {
+            link: "link-7".into(),
+            generation: 3,
+            role: PeerRole::Offer,
+            stun: Vec::new(),
+            turn: Vec::new(),
+        }
+    }
+
+    const ANSWERING: &str = r#"{"link":"link-7","generation":2,"role":"Answer","stun":["stun.l.google.com:19302","203.0.113.9:3478"],"turn":[{"address":"turn.example.net:3478","username":"1767225600:link-7","credential":"c2VjcmV0"}]}"#;
+    const OFFERING: &str = r#"{"link":"link-7","generation":3,"role":"Offer","stun":[],"turn":[]}"#;
+
+    fn connecting() -> FlowStatus {
+        FlowStatus {
+            state: FlowState::Connecting,
+            bytes: 0,
+            peer: None,
+            packets_lost: 0,
+            packets_retransmitted: 0,
+        }
+    }
+
+    #[test]
+    fn webrtc_specs_have_a_fixed_wire_shape() {
+        golden(&answering(), ANSWERING);
+        golden(&offering(), OFFERING);
+        golden(&SourceSpec::WebRtc(answering()), &format!(r#"{{"WebRtc":{ANSWERING}}}"#));
+        golden(&Destination::WebRtc(offering()), &format!(r#"{{"WebRtc":{OFFERING}}}"#));
+        golden(
+            &answering().turn[0],
+            r#"{"address":"turn.example.net:3478","username":"1767225600:link-7","credential":"c2VjcmV0"}"#,
+        );
+        golden(&PeerRole::Offer, r#""Offer""#);
+        golden(&PeerRole::Answer, r#""Answer""#);
+        golden(&PeerRef::Source(4), r#"{"Source":4}"#);
+        golden(&PeerRef::Route(9), r#"{"Route":9}"#);
+        golden(&FlowState::Unreachable, r#""Unreachable""#);
+        golden(&FlowState::Lost, r#""Lost""#);
+    }
+
+    #[test]
+    fn a_turn_credential_stays_out_of_debug_output() {
+        let debug = format!("{:?}", answering());
+        assert!(debug.contains("turn.example.net:3478"), "{debug}");
+        assert!(debug.contains("1767225600:link-7"), "{debug}");
+        assert!(!debug.contains("c2VjcmV0"), "{debug}");
+    }
+
+    #[test]
+    fn webrtc_requests_have_a_fixed_wire_shape() {
+        golden(
+            &Request::SetRemoteDescription {
+                peer: PeerRef::Route(9),
+                generation: 3,
+                sdp: "v=0\r\no=- 1 2 IN IP4 0.0.0.0\r\n".into(),
+            },
+            r#"{"SetRemoteDescription":{"peer":{"Route":9},"generation":3,"sdp":"v=0\r\no=- 1 2 IN IP4 0.0.0.0\r\n"}}"#,
+        );
+        golden(
+            &Request::CreateSource {
+                source: SourceSpec::WebRtc(answering()),
+                tag: Some("mic".into()),
+            },
+            &format!(r#"{{"CreateSource":{{"source":{{"WebRtc":{ANSWERING}}},"tag":"mic"}}}}"#),
+        );
+        golden(
+            &Request::CreateRoute {
+                source_id: 4,
+                destination: Destination::WebRtc(offering()),
+                volume: 1.0,
+            },
+            &format!(r#"{{"CreateRoute":{{"source_id":4,"destination":{{"WebRtc":{OFFERING}}},"volume":1.0}}}}"#),
+        );
+    }
+
+    #[test]
+    fn listings_carry_the_local_description() {
+        golden(
+            &SourceInfo {
+                source_id: 4,
+                spec: SourceSpec::WebRtc(answering()),
+                tag: None,
+                label: "link-7".into(),
+                status: connecting(),
+                local_description: Some("v=0\r\n".into()),
+            },
+            &format!(
+                r#"{{"source_id":4,"spec":{{"WebRtc":{ANSWERING}}},"tag":null,"label":"link-7","status":{{"state":"Connecting","bytes":0,"peer":null,"packets_lost":0,"packets_retransmitted":0}},"local_description":"v=0\r\n"}}"#
+            ),
+        );
+        golden(
+            &RouteInfo {
+                route_id: 9,
+                source_id: 4,
+                destination: Destination::WebRtc(offering()),
+                volume: 0.5,
+                status: FlowStatus {
+                    state: FlowState::Lost,
+                    bytes: 1200,
+                    peer: Some("10.0.0.2:50000".into()),
+                    packets_lost: 3,
+                    packets_retransmitted: 0,
+                },
+                local_description: None,
+            },
+            &format!(
+                r#"{{"route_id":9,"source_id":4,"destination":{{"WebRtc":{OFFERING}}},"volume":0.5,"status":{{"state":"Lost","bytes":1200,"peer":"10.0.0.2:50000","packets_lost":3,"packets_retransmitted":0}},"local_description":null}}"#
+            ),
+        );
+    }
 }

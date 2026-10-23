@@ -16,7 +16,6 @@ const DRAINED: OSStatus = 0x64726e64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
     Aac,
-    #[cfg_attr(not(test), expect(dead_code))]
     Opus,
 }
 

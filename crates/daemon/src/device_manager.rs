@@ -364,6 +364,21 @@ fn temp_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
+impl DeviceManager {
+    /// Claude: a manager over its own config file at `path`, so a test never
+    /// touches the one the plugin reads.
+    pub fn at(path: &Path, lookup: DeviceLookup) -> Self {
+        let cfg = default_config();
+        persist(path, &cfg).unwrap();
+        Self {
+            config_path: path.to_path_buf(),
+            file: RwLock::new(cfg),
+            lookup,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{
@@ -376,14 +391,7 @@ mod tests {
     }
 
     fn mgr_with_path(tmp: &Path, lookup: DeviceLookup) -> DeviceManager {
-        // Bootstrap the file ourselves so we can place it at `tmp`.
-        let cfg = default_config();
-        persist(tmp, &cfg).unwrap();
-        DeviceManager {
-            config_path: tmp.to_path_buf(),
-            file: RwLock::new(cfg),
-            lookup,
-        }
+        DeviceManager::at(tmp, lookup)
     }
 
     #[tokio::test]

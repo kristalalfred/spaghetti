@@ -26,6 +26,8 @@ rubato = { version = "5.0.1", default-features = false }
 srt-tokio = "0.4.4"
 bytes = "1"
 futures = "0.3"
+str0m = { version = "=0.24.1", default-features = false, features = ["aws-lc-rs"] }
+getrandom = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -2,19 +2,29 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use spaghetti_common::ipc_protocol::{Destination, FlowStatus, RouteInfo, SourceInfo, SourceSpec};
+use spaghetti_common::ipc_protocol::{
+    Destination, FlowStatus, PeerRef, RouteInfo, SourceInfo, SourceSpec,
+};
 
 use crate::audio;
 use crate::device_output::DeviceOutput;
+#[cfg(test)]
+use crate::fixture::FixtureSource;
 use crate::ring::Ring;
 use crate::sinks::SourceTiming;
 use crate::srt_receiver::SrtSource;
 use crate::srt_sender::SrtOutput;
 use crate::tap::TapSource;
+use crate::webrtc::PeerLink;
+use crate::webrtc_receiver::WebRtcSource;
+use crate::webrtc_sender::WebRtcOutput;
 
 enum Source {
     Tap(TapSource),
     Srt(SrtSource),
+    WebRtc(WebRtcSource),
+    #[cfg(test)]
+    Fixture(FixtureSource),
 }
 
 impl Source {
@@ -22,6 +32,7 @@ impl Source {
         match spec {
             SourceSpec::Tap { pids, mode } => TapSource::create(source_id, pids, *mode).map(Self::Tap),
             SourceSpec::Srt(socket) => SrtSource::open(socket).map(Self::Srt),
+            SourceSpec::WebRtc(peer) => WebRtcSource::open(peer).map(Self::WebRtc),
         }
     }
 
@@ -29,6 +40,9 @@ impl Source {
         match self {
             Self::Tap(tap) => tap.timing(),
             Self::Srt(srt) => srt.timing(),
+            Self::WebRtc(webrtc) => webrtc.timing(),
+            #[cfg(test)]
+            Self::Fixture(fixture) => fixture.timing(),
         }
     }
 
@@ -36,6 +50,9 @@ impl Source {
         match self {
             Self::Tap(tap) => tap.add_sink(ring),
             Self::Srt(srt) => srt.add_sink(ring),
+            Self::WebRtc(webrtc) => webrtc.add_sink(ring),
+            #[cfg(test)]
+            Self::Fixture(fixture) => fixture.add_sink(ring),
         }
     }
 
@@ -43,6 +60,9 @@ impl Source {
         match self {
             Self::Tap(tap) => tap.remove_sink(slot),
             Self::Srt(srt) => srt.remove_sink(slot),
+            Self::WebRtc(webrtc) => webrtc.remove_sink(slot),
+            #[cfg(test)]
+            Self::Fixture(fixture) => fixture.remove_sink(slot),
         }
     }
 
@@ -50,6 +70,9 @@ impl Source {
         match self {
             Self::Tap(tap) => &tap.label,
             Self::Srt(srt) => &srt.label,
+            Self::WebRtc(webrtc) => &webrtc.label,
+            #[cfg(test)]
+            Self::Fixture(_) => "fixture",
         }
     }
 
@@ -57,6 +80,16 @@ impl Source {
         match self {
             Self::Tap(tap) => tap.status(),
             Self::Srt(srt) => srt.status(),
+            Self::WebRtc(webrtc) => webrtc.status(),
+            #[cfg(test)]
+            Self::Fixture(fixture) => fixture.status(),
+        }
+    }
+
+    fn peer(&self) -> Option<&PeerLink> {
+        match self {
+            Self::WebRtc(webrtc) => Some(webrtc.peer()),
+            _ => None,
         }
     }
 }
@@ -64,6 +97,7 @@ impl Source {
 enum Output {
     Device(DeviceOutput),
     Srt(SrtOutput),
+    WebRtc(WebRtcOutput),
 }
 
 impl Output {
@@ -80,13 +114,16 @@ impl Output {
                 unsafe { DeviceOutput::open(device, source, ring, volume) }.map(Self::Device)
             }
             Destination::Srt(socket) => SrtOutput::open(socket, source, ring, volume).map(Self::Srt),
+            Destination::WebRtc(peer) => {
+                WebRtcOutput::open(peer, source, ring, volume).map(Self::WebRtc)
+            }
         }
     }
 
     fn start(&self) -> Result<(), String> {
         match self {
             Self::Device(device) => device.start(),
-            Self::Srt(_) => Ok(()),
+            Self::Srt(_) | Self::WebRtc(_) => Ok(()),
         }
     }
 
@@ -94,6 +131,7 @@ impl Output {
         match self {
             Self::Device(device) => device.status(),
             Self::Srt(srt) => srt.status(),
+            Self::WebRtc(webrtc) => webrtc.status(),
         }
     }
 
@@ -101,6 +139,14 @@ impl Output {
         match self {
             Self::Device(device) => device.log_health(route_id, ring),
             Self::Srt(srt) => srt.log_health(route_id, ring),
+            Self::WebRtc(webrtc) => webrtc.log_health(route_id, ring),
+        }
+    }
+
+    fn peer(&self) -> Option<&PeerLink> {
+        match self {
+            Self::WebRtc(webrtc) => Some(webrtc.peer()),
+            _ => None,
         }
     }
 }
@@ -191,8 +237,34 @@ impl Router {
                 tag: entry.tag.clone(),
                 label: entry.source.label().to_string(),
                 status: entry.source.status(),
+                local_description: entry.source.peer().and_then(PeerLink::local_description),
             })
             .collect()
+    }
+
+    pub fn set_remote_description(
+        &self,
+        peer: PeerRef,
+        generation: u32,
+        sdp: String,
+    ) -> Result<(), String> {
+        let link = match peer {
+            PeerRef::Source(id) => self
+                .sources
+                .get(&id)
+                .ok_or_else(|| format!("source {id} not found"))?
+                .source
+                .peer()
+                .ok_or_else(|| format!("source {id} is not a WebRTC peer"))?,
+            PeerRef::Route(id) => self
+                .routes
+                .get(&id)
+                .ok_or_else(|| format!("route {id} not found"))?
+                .output
+                .peer()
+                .ok_or_else(|| format!("route {id} is not a WebRTC peer"))?,
+        };
+        link.set_remote_description(generation, sdp)
     }
 
     pub fn source_count(&self) -> u32 {
@@ -283,6 +355,7 @@ impl Router {
                 destination: r.destination.clone(),
                 volume: f32::from_bits(r.volume.load(Ordering::Relaxed)),
                 status: r.output.status(),
+                local_description: r.output.peer().and_then(PeerLink::local_description),
             })
             .collect()
     }
@@ -304,5 +377,43 @@ impl Router {
             .filter(|(_, r)| matches!(&r.destination, Destination::Device { uid } if uid == device_uid))
             .map(|(&id, _)| id)
             .collect()
+    }
+}
+
+#[cfg(test)]
+impl Router {
+    /// Claude: a source the test feeds through the returned sinks. No spec
+    /// describes it, so it is stored as a tap of no processes.
+    pub fn create_fixture_source(&mut self, sample_rate: f64) -> (u32, Arc<crate::sinks::Sinks>) {
+        let id = self.next_source_id;
+        self.next_source_id += 1;
+        let fixture = FixtureSource::new(sample_rate);
+        let sinks = fixture.sinks();
+        let spec = SourceSpec::Tap {
+            pids: Vec::new(),
+            mode: spaghetti_common::ipc_protocol::TapMode::Mirror,
+        };
+        self.sources.insert(
+            id,
+            SourceEntry {
+                spec,
+                tag: None,
+                source: Source::Fixture(fixture),
+            },
+        );
+        (id, sinks)
+    }
+
+    /// Claude: a ring the source feeds, which the test reads the way a route's
+    /// output would, with the timing such an output is built for.
+    pub fn attach_fixture_sink(&mut self, source_id: u32) -> (Arc<Ring>, SourceTiming) {
+        let source = &mut self.sources.get_mut(&source_id).expect("the source exists").source;
+        let ring = Arc::new(Ring::new());
+        source.add_sink(Arc::clone(&ring)).expect("a free sink");
+        (ring, source.timing())
+    }
+
+    pub fn route_ring(&self, route_id: u32) -> Arc<Ring> {
+        Arc::clone(&self.routes.get(&route_id).expect("the route exists").ring)
     }
 }

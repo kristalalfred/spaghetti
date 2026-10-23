@@ -1,12 +1,12 @@
 # Spaghetti
 
-macOS audio routing tool. Routes a source (a tapped app, or a stream received over SRT) to destinations (any output device, or an SRT peer). Ships as a virtual Core Audio driver, a daemon, and a CLI.
+macOS audio routing tool. Routes a source (a tapped app, or a stream received over SRT or WebRTC) to destinations (any output device, an SRT peer, or a WebRTC peer). Ships as a virtual Core Audio driver, a daemon, and a CLI.
 
 ## Crates
 
 - **`crates/asp-driver/`** — user-space Core Audio HAL plugin. Registers a virtual output device (`SpaghettiDevice_UID`) the system can target. Info.plist configures the bundle.
 - **`crates/daemon/`** (`spaghettid`) — long-running process. Owns the audio routing graph, source and route lifecycles, and an IPC control socket. Managed as a macOS LaunchAgent (`com.spaghetti.daemon`).
-- **`crates/cli/`** (`spaghetti`) — user-facing CLI. `spaghetti tap <app>`, `spaghetti receive srt://...`, `spaghetti route <source_id> <device_uid|srt://...>`, `spaghetti daemon install/restart/logs`, etc.
+- **`crates/cli/`** (`spaghetti`) — user-facing CLI. `spaghetti tap <app>`, `spaghetti receive srt://...|webrtc`, `spaghetti route <source_id> <device_uid|srt://...|webrtc>`, `spaghetti sdp|accept source|route <id>` to signal a WebRTC peer by hand, `spaghetti daemon install/restart/logs`, etc.
 - **`crates/common/`** — IPC protocol definitions (`ipc_protocol.rs`) and shared types.
 
 ## Build + install
@@ -41,7 +41,7 @@ target app
   → destination device
 ```
 
-SRT ends replace either side:
+SRT and WebRTC ends replace either side:
 
 ```
 SRT source: srt-tokio receive → TsDemuxer → ADTS → AudioToolbox AAC decode at 48 kHz
@@ -49,6 +49,14 @@ SRT source: srt-tokio receive → TsDemuxer → ADTS → AudioToolbox AAC decode
 
 SRT destination: the route's ring → encoder thread (every 5 ms, 1024-frame chunks)
   → AudioToolbox AAC-LC 256 kb/s → ADTS → TsMuxer → 1316-byte messages → srt-tokio send
+
+WebRTC source: str0m MediaData (40 ms reorder timeout) → decoder thread: one AudioToolbox
+  Opus decode per packet, an empty-packet concealment per missing 20 ms of RTP time
+  → 48 kHz stereo into the same per route rings
+
+WebRTC destination: the route's ring → encoder thread (every 5 ms, 960-frame chunks)
+  → AudioToolbox Opus 48 kHz stereo, 20 ms packets, RTP time +960 each, wallclock = capture time
+  → one str0m Writer::write per packet, dropped until connected
 ```
 
 A source reports its `SourceTiming`: its rate, and how unevenly it pushes. `Playout` sizes its jitter buffer from it.
@@ -63,6 +71,9 @@ Key files:
 - `crates/daemon/bridge/tap_bridge.m` + `.h` — ObjC bridge for `AudioHardwareCreateProcessTap` and aggregate device creation. Compiled by `build.rs`.
 - `crates/daemon/src/srt.rs` — `SrtLink`, one SRT connection that reconnects when it drops, with its `FlowStatus`.
 - `crates/daemon/src/srt_receiver.rs` + `srt_sender.rs` — `SrtSource` (decode thread) and `SrtOutput` (encode thread).
+- `crates/daemon/src/webrtc.rs` — `PeerLink`, one str0m peer connection on its own UDP socket (default-route IPv4) run by a tokio task: STUN on that socket before the SDP, the offer or answer exchanged whole through `SetRemoteDescription` and `local_description`, its status, and close on drop.
+- `crates/daemon/src/webrtc_receiver.rs` + `webrtc_sender.rs` — `WebRtcSource` (decode thread, gap concealment) and `WebRtcOutput` (encode thread).
+- `crates/daemon/src/stun.rs` — STUN binding requests and responses, by transaction.
 - `crates/daemon/src/codec.rs` — `Encoder` and `Decoder` over AudioToolbox's `AudioConverter` for each `Codec` (AAC-LC, Opus). Every stream decodes to 48 kHz.
 - `crates/daemon/src/adts.rs` + `ts.rs` — ADTS framing of AAC access units, and a single-stream MPEG-TS muxer and demuxer.
 - `crates/daemon/src/flow.rs` — `FlowMeter`, which every source and output uses to report idle, connecting, connected, flowing or stalled.

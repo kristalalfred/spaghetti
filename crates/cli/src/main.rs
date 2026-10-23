@@ -1,12 +1,14 @@
 mod client;
 mod daemon_mgmt;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use spaghetti_common::ipc_protocol::{
-    ActivityInfo, AppInfo, Destination, DeviceInfo, FlowState, Request, Response, RouteInfo,
-    SourceInfo, SourceSpec, SrtMode, SrtSocket, SystemDeviceInfo, TapMode,
+    ActivityInfo, AppInfo, Destination, DeviceInfo, FlowState, PeerRef, PeerRole, Request,
+    Response, RouteInfo, SourceInfo, SourceSpec, SrtMode, SrtSocket, SystemDeviceInfo, TapMode,
+    WebRtcPeer,
 };
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -67,12 +69,14 @@ enum Command {
         #[arg(short, long)]
         mute: bool,
     },
-    /// Receive AAC in MPEG-TS over SRT as a source
+    /// Receive AAC in MPEG-TS over SRT, or Opus over WebRTC, as a source
     Receive {
-        /// srt://:PORT to listen, srt://HOST:PORT to call
+        /// srt://:PORT to listen, srt://HOST:PORT to call, or webrtc to answer an offer
         url: String,
         #[command(flatten)]
         srt: SrtArgs,
+        #[command(flatten)]
+        webrtc: WebRtcArgs,
     },
     /// Remove a source and its routes
     Unsource {
@@ -81,11 +85,11 @@ enum Command {
     },
     /// List sources
     Sources,
-    /// Route a source to an output device or an SRT peer
+    /// Route a source to an output device, an SRT peer or a WebRTC peer
     Route {
         /// Source ID to route
         source_id: u32,
-        /// Output device UID, or srt://:PORT to listen, srt://HOST:PORT to call
+        /// Output device UID, srt://:PORT to listen, srt://HOST:PORT to call, or webrtc to offer
         #[arg(default_value = "SpaghettiDevice_UID")]
         destination: String,
         /// Initial volume (0.0-2.0)
@@ -93,6 +97,21 @@ enum Command {
         volume: f32,
         #[command(flatten)]
         srt: SrtArgs,
+        #[command(flatten)]
+        webrtc: WebRtcArgs,
+    },
+    /// Print a WebRTC peer's offer or answer
+    Sdp {
+        peer: PeerKind,
+        /// Source or route ID
+        id: u32,
+    },
+    /// Give a WebRTC peer the remote offer or answer, from a file or - for stdin
+    Accept {
+        peer: PeerKind,
+        /// Source or route ID
+        id: u32,
+        file: String,
     },
     /// Remove a route
     Unroute {
@@ -170,6 +189,41 @@ impl SrtArgs {
     }
 }
 
+#[derive(clap::Args)]
+struct WebRtcArgs {
+    /// STUN server for a webrtc peer, repeatable
+    #[arg(long, value_name = "HOST:PORT")]
+    stun: Vec<String>,
+}
+
+impl WebRtcArgs {
+    fn is_set(&self) -> bool {
+        !self.stun.is_empty()
+    }
+
+    /// Claude: a peer of a link this CLI names itself; its first generation.
+    fn peer(&self, role: PeerRole) -> WebRtcPeer {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        WebRtcPeer {
+            link: format!("cli-{nanos:x}"),
+            generation: 1,
+            role,
+            stun: self.stun.clone(),
+            turn: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PeerKind {
+    Source,
+    Route,
+}
+
+const LOCAL_DESCRIPTION_WAIT: Duration = Duration::from_secs(3);
+
 #[derive(Subcommand)]
 enum DaemonAction {
     /// Install the LaunchAgent so the daemon starts at login
@@ -233,6 +287,8 @@ fn flow_label(state: FlowState) -> &'static str {
         FlowState::Connected => "connected",
         FlowState::Flowing => "flowing",
         FlowState::Stalled => "stalled",
+        FlowState::Unreachable => "unreachable",
+        FlowState::Lost => "lost",
     }
 }
 
@@ -243,6 +299,13 @@ fn srt_label(socket: &SrtSocket) -> String {
     }
 }
 
+fn role_label(role: PeerRole) -> &'static str {
+    match role {
+        PeerRole::Offer => "offer",
+        PeerRole::Answer => "answer",
+    }
+}
+
 fn print_sources(sources: &[SourceInfo]) {
     if sources.is_empty() {
         println!("No sources.");
@@ -250,16 +313,21 @@ fn print_sources(sources: &[SourceInfo]) {
     }
     let mut sources: Vec<_> = sources.iter().collect();
     sources.sort_by_key(|s| s.source_id);
-    let label_w = col_width(sources.iter().map(|s| s.label.as_str()), 24);
-    println!("{:<6} {:<12} {:<label_w$} STATE", "ID", "KIND", "LABEL");
-    println!("{}", "-".repeat(label_w + 32));
-    for source in sources {
-        let kind = match &source.spec {
+    let kinds: Vec<String> = sources
+        .iter()
+        .map(|source| match &source.spec {
             SourceSpec::Tap { mode, .. } => format!("tap ({})", mode.label()),
             SourceSpec::Srt(_) => "srt".to_string(),
-        };
+            SourceSpec::WebRtc(peer) => format!("webrtc ({})", role_label(peer.role)),
+        })
+        .collect();
+    let kind_w = col_width(kinds.iter().map(String::as_str), 12);
+    let label_w = col_width(sources.iter().map(|s| s.label.as_str()), 24);
+    println!("{:<6} {:<kind_w$} {:<label_w$} STATE", "ID", "KIND", "LABEL");
+    println!("{}", "-".repeat(kind_w + label_w + 20));
+    for (source, kind) in sources.into_iter().zip(&kinds) {
         println!(
-            "{:<6} {:<12} {:<label_w$} {}",
+            "{:<6} {:<kind_w$} {:<label_w$} {}",
             source.source_id,
             kind,
             source.label,
@@ -280,6 +348,7 @@ fn print_routes(routes: &[RouteInfo]) {
         .map(|route| match &route.destination {
             Destination::Device { uid } => uid.clone(),
             Destination::Srt(socket) => srt_label(socket),
+            Destination::WebRtc(peer) => format!("webrtc {} ({})", peer.link, role_label(peer.role)),
         })
         .collect();
     let dest_w = col_width(destinations.iter().map(String::as_str), 30);
@@ -503,12 +572,23 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
             create_source(&mut stream, source)?;
         }
 
-        Command::Receive { url, srt } => {
-            let socket = srt.socket(&url).unwrap_or_else(|e| {
-                print_error(&e);
+        Command::Receive { url, srt, webrtc } => {
+            let source = if url == "webrtc" {
+                if srt.is_set() {
+                    print_error("--latency and --passphrase apply only to srt:// sources");
+                    std::process::exit(1);
+                }
+                SourceSpec::WebRtc(webrtc.peer(PeerRole::Answer))
+            } else if webrtc.is_set() {
+                print_error("--stun applies only to webrtc sources");
                 std::process::exit(1);
-            });
-            create_source(&mut stream, SourceSpec::Srt(socket))?;
+            } else {
+                SourceSpec::Srt(srt.socket(&url).unwrap_or_else(|e| {
+                    print_error(&e);
+                    std::process::exit(1);
+                }))
+            };
+            create_source(&mut stream, source)?;
         }
 
         Command::Unsource { source_id } => {
@@ -541,9 +621,18 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
             destination,
             volume,
             srt,
+            webrtc,
         } => {
             if !(0.0..=2.0).contains(&volume) {
                 print_error("volume must be between 0.0 and 2.0");
+                std::process::exit(1);
+            }
+            if srt.is_set() && !destination.starts_with("srt://") {
+                print_error("--latency and --passphrase apply only to srt:// destinations");
+                std::process::exit(1);
+            }
+            if webrtc.is_set() && destination != "webrtc" {
+                print_error("--stun applies only to webrtc destinations");
                 std::process::exit(1);
             }
             let destination = if destination.starts_with("srt://") {
@@ -551,11 +640,14 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
                     print_error(&e);
                     std::process::exit(1);
                 }))
-            } else if srt.is_set() {
-                print_error("--latency and --passphrase apply only to srt:// destinations");
-                std::process::exit(1);
+            } else if destination == "webrtc" {
+                Destination::WebRtc(webrtc.peer(PeerRole::Offer))
             } else {
                 Destination::Device { uid: destination }
+            };
+            let link = match &destination {
+                Destination::WebRtc(peer) => format!(" link={}", peer.link),
+                _ => String::new(),
             };
             let response = client::send_request(
                 &mut stream,
@@ -567,8 +659,55 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
             )?;
             match response {
                 Response::RouteCreated { route_id } => {
-                    println!("Route created: id={route_id}");
+                    println!("Route created: id={route_id}{link}");
                 }
+                Response::Error { message } => {
+                    print_error(&message);
+                    std::process::exit(1);
+                }
+                _ => print_error("unexpected response from daemon"),
+            }
+        }
+
+        Command::Sdp { peer, id } => {
+            let deadline = Instant::now() + LOCAL_DESCRIPTION_WAIT;
+            loop {
+                let (_, description) = find_peer(&mut stream, peer, id)?;
+                if let Some(sdp) = description {
+                    print!("{sdp}");
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    print_error(&format!("{} {id} has no local description yet", peer_noun(peer)));
+                    std::process::exit(1);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        Command::Accept { peer, id, file } => {
+            let mut sdp = String::new();
+            let read = if file == "-" {
+                std::io::stdin().read_to_string(&mut sdp).map(|_| ())
+            } else {
+                std::fs::read_to_string(&file).map(|text| sdp = text)
+            };
+            if let Err(e) = read {
+                print_error(&format!("cannot read {file}: {e}"));
+                std::process::exit(1);
+            }
+            let (generation, _) = find_peer(&mut stream, peer, id)?;
+            let peer = match peer {
+                PeerKind::Source => PeerRef::Source(id),
+                PeerKind::Route => PeerRef::Route(id),
+            };
+            let request = Request::SetRemoteDescription {
+                peer,
+                generation,
+                sdp,
+            };
+            match client::send_request(&mut stream, &request)? {
+                Response::Ok => println!("Remote description applied."),
                 Response::Error { message } => {
                     print_error(&message);
                     std::process::exit(1);
@@ -711,12 +850,70 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn peer_noun(peer: PeerKind) -> &'static str {
+    match peer {
+        PeerKind::Source => "source",
+        PeerKind::Route => "route",
+    }
+}
+
+/// Claude: a WebRTC source's or route's generation and local description, or
+/// an exit with the reason it is not one.
+fn find_peer(
+    stream: &mut std::os::unix::net::UnixStream,
+    peer: PeerKind,
+    id: u32,
+) -> Result<(u32, Option<String>), Box<dyn std::error::Error>> {
+    let found = match (peer, client::send_request(stream, &request_listing(peer))?) {
+        (PeerKind::Source, Response::Sources(sources)) => {
+            sources.into_iter().find(|s| s.source_id == id).map(|s| match s.spec {
+                SourceSpec::WebRtc(spec) => Some((spec.generation, s.local_description)),
+                _ => None,
+            })
+        }
+        (PeerKind::Route, Response::Routes(routes)) => {
+            routes.into_iter().find(|r| r.route_id == id).map(|r| match r.destination {
+                Destination::WebRtc(spec) => Some((spec.generation, r.local_description)),
+                _ => None,
+            })
+        }
+        (_, Response::Error { message }) => {
+            print_error(&message);
+            std::process::exit(1);
+        }
+        _ => return Err("unexpected response from daemon".into()),
+    };
+    let noun = peer_noun(peer);
+    match found {
+        Some(Some(found)) => Ok(found),
+        Some(None) => {
+            print_error(&format!("{noun} {id} is not a WebRTC peer"));
+            std::process::exit(1);
+        }
+        None => {
+            print_error(&format!("{noun} {id} not found"));
+            std::process::exit(1);
+        }
+    }
+}
+
+fn request_listing(peer: PeerKind) -> Request {
+    match peer {
+        PeerKind::Source => Request::ListSources,
+        PeerKind::Route => Request::ListRoutes,
+    }
+}
+
 fn create_source(
     stream: &mut std::os::unix::net::UnixStream,
     source: SourceSpec,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let link = match &source {
+        SourceSpec::WebRtc(peer) => format!(" link={}", peer.link),
+        _ => String::new(),
+    };
     match client::send_request(stream, &Request::CreateSource { source, tag: None })? {
-        Response::SourceCreated { source_id } => println!("Source created: id={source_id}"),
+        Response::SourceCreated { source_id } => println!("Source created: id={source_id}{link}"),
         Response::Error { message } => {
             print_error(&message);
             std::process::exit(1);
