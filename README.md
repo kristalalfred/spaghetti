@@ -1,5 +1,7 @@
 # Spaghetti
 
+<p align="center"><img src="assets/spaghetti.svg" width="240" alt="A fork twirling spaghetti"></p>
+
 Route macOS app audio to physical or virtual output devices, or to other machines over SRT, from the CLI.
 
 Requires macOS, Rust, and Xcode Command Line Tools.
