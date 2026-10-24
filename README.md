@@ -1,6 +1,6 @@
 # Spaghetti
 
-Route macOS app audio to physical or virtual output devices, or to other machines over SRT, from the CLI.
+Route macOS app audio to physical or virtual output devices, or to other machines over SRT or WebRTC, from the CLI.
 
 Requires macOS, Rust, and Xcode Command Line Tools.
 
