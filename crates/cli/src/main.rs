@@ -11,39 +11,7 @@ use std::io::{IsTerminal, Write};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_logo() {
-    // Color codes
-    let y = "\x1b[38;2;245;195;60m";   // golden pasta
-    let y2 = "\x1b[38;2;220;170;40m";  // darker pasta
-    let y3 = "\x1b[38;2;255;210;80m";  // bright pasta highlight
-    let r = "\x1b[38;2;200;45;25m";    // tomato sauce
-    let r2 = "\x1b[38;2;160;30;15m";   // darker sauce
-    let g = "\x1b[38;2;60;160;50m";    // basil green
-    let w = "\x1b[38;5;253m";          // plate rim
-    let d = "\x1b[38;5;243m";          // plate shadow
-    let f = "\x1b[38;5;249m";          // fork silver
-    let f2 = "\x1b[38;5;253m";         // fork highlight
-    let dim = "\x1b[2m";               // dim
-    let b = "\x1b[1m";                 // bold
-    let res = "\x1b[0m";               // reset
-
-    let art = format!(
-        r#"
-{f2}        ┃{res}
-{f}       ━╋━{res}       {y3}╭─╮{y}╭──╮  ╭─╮{res}
-{f}        ┃{res}      {y}╭─╯{y3}╰╯{y2}╭╮╰╮╭╯ ╰╮{res}
-{f}        ┃{res}     {y2}╰╮ ╭╯{y}╰╯ ╰╯{y3}╭╯╭─╯{res}
-{f}        ┃{res}      {y}╰╮╰─╮{y2}╭──╮{y3}╰╮│{y}╭╮{res}
-{f}        ┃{res}     {y3}╭─╯{y2}╭╯╰╮{y}╭╯{y2}╭╯╰╯{y}╰╮{res}
-{f}        ┃{res}     {y}│{y2}╭╯{r}▓▓{y}╰╯{r}▓▓▓{y2}╰╮{y3}╭─╯{res}
-{f2}       ╭┸╮{res}   {y2}╰╯{r}▓▓▓▓▓▓▓▓▓{y}╰╯{res}
-{f}       ┃ ┃{res}    {r}▓▓▓{r2}▓▓{g}❦{r}▓▓▓▓▓▓{res}
-{f}       ┃ ┃{res}   {w}╭───────────────╮{res}
-{f}       ┃ ┃{res}   {w}│{r}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓{w}│{res}   {b}Spaghetti{res} {dim}{VERSION}{res}
-{f}       ┃ ┃{res}   {w}╰┬─────────────┬╯{res}   {dim}route audio any way you like{res}
-{f}       ╰━╯{res}    {d}╰─────────────╯{res}
-"#
-    );
-    print!("{art}");
+    print!("\n{}", include_str!("logo.ans").replace("{version}", VERSION));
 }
 
 #[derive(Parser)]
