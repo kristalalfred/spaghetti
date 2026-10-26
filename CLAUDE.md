@@ -6,7 +6,7 @@ macOS audio routing tool. Routes a source (a tapped app, or a stream received ov
 
 - **`crates/asp-driver/`** — user-space Core Audio HAL plugin. Registers a virtual output device (`SpaghettiDevice_UID`) the system can target. Info.plist configures the bundle.
 - **`crates/daemon/`** (`spaghettid`) — long-running process. Owns the audio routing graph, source and route lifecycles, and an IPC control socket. Managed as a macOS LaunchAgent (`com.spaghetti.daemon`).
-- **`crates/cli/`** (`spaghetti`) — user-facing CLI. `spaghetti tap <app>`, `spaghetti receive srt://...|webrtc`, `spaghetti route <source_id> <device_uid|srt://...|webrtc>`, `spaghetti sdp|accept source|route <id>` to signal a WebRTC peer by hand, `spaghetti daemon install/restart/logs`, etc.
+- **`crates/cli/`** (`spaghetti`) — user-facing CLI. `spaghetti tap <app>`, `spaghetti receive srt://...`, `spaghetti route <source_id> <device_uid|srt://...>`, `spaghetti daemon install/restart/logs`, etc. WebRTC peers come only from a signaling controller over IPC, such as `weave-adapter-spaghetti`; the CLI lists them but cannot create them.
 - **`crates/common/`** — IPC protocol definitions (`ipc_protocol.rs`) and shared types.
 
 ## Build + install
