@@ -124,7 +124,7 @@ enum Command {
     Volume {
         /// Route ID
         route_id: u32,
-        /// Volume level (0.0-1.0)
+        /// Volume level (0.0-2.0)
         level: f32,
     },
     /// Manage virtual devices
