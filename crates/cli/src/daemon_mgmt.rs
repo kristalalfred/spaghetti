@@ -220,7 +220,10 @@ pub fn status() -> Result<(), String> {
     let mut state = None;
     let mut last_exit = None;
     for line in text.lines() {
-        let trimmed = line.trim();
+        let Some(property) = line.strip_prefix('\t').filter(|p| !p.starts_with('\t')) else {
+            continue;
+        };
+        let trimmed = property.trim();
         if let Some(rest) = trimmed.strip_prefix("pid = ") {
             pid = Some(rest.trim().to_string());
         } else if let Some(rest) = trimmed.strip_prefix("state = ") {
