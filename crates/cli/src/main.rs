@@ -532,7 +532,7 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
         if e.kind() == std::io::ErrorKind::ConnectionRefused
             || e.kind() == std::io::ErrorKind::NotFound
         {
-            "Daemon not running. Start it with: spaghettid".to_string()
+            "Daemon not running. Start it with: spaghetti daemon start".to_string()
         } else {
             format!("Failed to connect to daemon: {e}")
         }
