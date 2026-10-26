@@ -9,6 +9,10 @@ macOS audio routing tool. Routes a source (a tapped app, or a stream received ov
 - **`crates/cli/`** (`spaghetti`) — user-facing CLI. `spaghetti tap <app>`, `spaghetti receive srt://...`, `spaghetti route <source_id> <device_uid|srt://...>`, `spaghetti daemon install/restart/logs`, etc. WebRTC peers come only from a signaling controller over IPC, such as `weave-adapter-spaghetti`; the CLI lists them but cannot create them.
 - **`crates/common/`** — IPC protocol definitions (`ipc_protocol.rs`) and shared types.
 
+## Boundaries
+
+Spaghetti stands on its own. Add a capability only when it is general: useful to anyone using the driver, daemon, CLI or engine, and designed the way it would be without any particular consumer. Behavior that serves one program built on spaghetti belongs in that program. Do not shape APIs, defaults, the IPC protocol or data formats around one consumer, and do not reference closed-source consumers anywhere in this repository.
+
 ## Build + install
 
 Daemon is installed system-wide. Standard loop after editing `crates/daemon/`:
