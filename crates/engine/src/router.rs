@@ -380,6 +380,12 @@ impl Router {
     }
 }
 
+impl Default for Router {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 impl Router {
     /// Claude: a source the test feeds through the returned sinks. No spec

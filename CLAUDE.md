@@ -5,7 +5,8 @@ macOS audio routing tool. Routes a source (a tapped app, or a stream received ov
 ## Crates
 
 - **`crates/asp-driver/`** — user-space Core Audio HAL plugin. Registers a virtual output device (`SpaghettiDevice_UID`) the system can target. Info.plist configures the bundle.
-- **`crates/daemon/`** (`spaghettid`) — long-running process. Owns the audio routing graph, source and route lifecycles, and an IPC control socket. Managed as a macOS LaunchAgent (`com.spaghetti.daemon`).
+- **`crates/engine/`** (`spaghetti-engine`) — the audio engine as a library: the routing graph (`Router`), app and device listing, the virtual device registry (`DeviceManager`) and the driver's activity reader. A program can embed it instead of talking to the daemon.
+- **`crates/daemon/`** (`spaghettid`) — long-running process. Owns an engine, source and route lifecycles, and an IPC control socket. Managed as a macOS LaunchAgent (`com.spaghetti.daemon`).
 - **`crates/cli/`** (`spaghetti`) — user-facing CLI. `spaghetti tap <app>`, `spaghetti receive srt://...`, `spaghetti route <source_id> <device_uid|srt://...>`, `spaghetti daemon install/restart/logs`, etc. WebRTC peers come only from a signaling controller over IPC, such as `weave-adapter-spaghetti`; the CLI lists them but cannot create them.
 - **`crates/common/`** — IPC protocol definitions (`ipc_protocol.rs`) and shared types.
 
@@ -15,7 +16,7 @@ Spaghetti stands on its own. Add a capability only when it is general: useful to
 
 ## Build + install
 
-Daemon is installed system-wide. Standard loop after editing `crates/daemon/`:
+Daemon is installed system-wide. Standard loop after editing `crates/engine/` or `crates/daemon/`:
 
 ```bash
 sudo chown -R $USER target/release
@@ -66,23 +67,23 @@ WebRTC destination: the route's ring → encoder thread (every 5 ms, 960-frame c
 A source reports its `SourceTiming`: its rate, and its `DeliverySpan`, how far behind their capture its frames may land. A tap publishes its IOProc buffer; SRT and WebRTC sources measure the span from each push's media time and arrival, growing it at once past a stall it fell short of and shedding it slowly once delivery calms. `Playout` holds the live span on top of what the resampler needs, and re-primes once when the span grows under a playing route rather than resample audibly up to it.
 
 Key files:
-- `crates/daemon/src/router.rs` — `Router`, the routing graph: sources, routes, and attaching a route's ring to its source and its output.
-- `crates/daemon/src/tap.rs` — `TapSource`: a process tap, its private aggregate device and the capture IOProc (`capture_ioproc`) that pushes into every attached route's ring. FFI wrappers around the ObjC bridge, and `list_audio_apps`.
-- `crates/daemon/src/device_output.rs` — `DeviceOutput`: a route's output AUHAL and `route_render_callback`.
-- `crates/daemon/src/playout.rs` — `Playout`, a route's output side: the resampler, jitter buffer and clock-drift controller between the ring and the render callback.
-- `crates/daemon/src/ring.rs` — the SPSC ring of interleaved stereo frames.
-- `crates/daemon/src/delivery.rs` — `DeliverySpan`, the span a source shares with its routes, and `DeliveryMeter`, which measures it for network sources.
-- `crates/daemon/src/sinks.rs` + `rt_slots.rs` — `Sinks`, the rings a source feeds, held in `RtSlots`, the lock-free handoff that lets routes join and leave a running capture.
-- `crates/daemon/bridge/tap_bridge.m` + `.h` — ObjC bridge for `AudioHardwareCreateProcessTap` and aggregate device creation. Compiled by `build.rs`.
-- `crates/daemon/src/srt.rs` — `SrtLink`, one SRT connection that reconnects when it drops, with its `FlowStatus`.
-- `crates/daemon/src/srt_receiver.rs` + `srt_sender.rs` — `SrtSource` (decode thread) and `SrtOutput` (encode thread).
-- `crates/daemon/src/webrtc.rs` — `PeerLink`, one str0m peer connection on its own UDP socket (default-route IPv4) run by a tokio task: STUN and TURN allocation on that socket before the SDP (one 2 s bound), the offer or answer exchanged whole through `SetRemoteDescription` and `local_description`, transmits from a relayed address sent through TURN, its status (including whether recent datagrams came through a relay), and close on drop.
-- `crates/daemon/src/turn.rs` — `Relays`, a link's TURN allocations without I/O of their own: Allocate with the long-term credential (401 challenge, 438 stale nonce), Refresh at half the granted lifetime, CreatePermission for the remote's candidates, Send and Data indications, and release on close.
-- `crates/daemon/src/webrtc_receiver.rs` + `webrtc_sender.rs` — `WebRtcSource` (decode thread, gap concealment) and `WebRtcOutput` (encode thread).
-- `crates/daemon/src/stun.rs` — STUN messages: building and parsing them, XOR addresses, and long-term MESSAGE-INTEGRITY.
-- `crates/daemon/src/codec.rs` — `Encoder` and `Decoder` over AudioToolbox's `AudioConverter` for each `Codec` (AAC-LC, Opus). Every stream decodes to 48 kHz.
-- `crates/daemon/src/adts.rs` + `ts.rs` — ADTS framing of AAC access units, and a single-stream MPEG-TS muxer and demuxer.
-- `crates/daemon/src/flow.rs` — `FlowMeter`, which every source and output uses to report idle, connecting, connected, flowing or stalled.
+- `crates/engine/src/router.rs` — `Router`, the routing graph: sources, routes, and attaching a route's ring to its source and its output.
+- `crates/engine/src/tap.rs` — `TapSource`: a process tap, its private aggregate device and the capture IOProc (`capture_ioproc`) that pushes into every attached route's ring. FFI wrappers around the ObjC bridge, and `list_audio_apps`.
+- `crates/engine/src/device_output.rs` — `DeviceOutput`: a route's output AUHAL and `route_render_callback`.
+- `crates/engine/src/playout.rs` — `Playout`, a route's output side: the resampler, jitter buffer and clock-drift controller between the ring and the render callback.
+- `crates/engine/src/ring.rs` — the SPSC ring of interleaved stereo frames.
+- `crates/engine/src/delivery.rs` — `DeliverySpan`, the span a source shares with its routes, and `DeliveryMeter`, which measures it for network sources.
+- `crates/engine/src/sinks.rs` + `rt_slots.rs` — `Sinks`, the rings a source feeds, held in `RtSlots`, the lock-free handoff that lets routes join and leave a running capture.
+- `crates/engine/bridge/tap_bridge.m` + `.h` — ObjC bridge for `AudioHardwareCreateProcessTap` and aggregate device creation. Compiled by `build.rs`.
+- `crates/engine/src/srt.rs` — `SrtLink`, one SRT connection that reconnects when it drops, with its `FlowStatus`.
+- `crates/engine/src/srt_receiver.rs` + `srt_sender.rs` — `SrtSource` (decode thread) and `SrtOutput` (encode thread).
+- `crates/engine/src/webrtc.rs` — `PeerLink`, one str0m peer connection on its own UDP socket (default-route IPv4) run by a tokio task: STUN and TURN allocation on that socket before the SDP (one 2 s bound), the offer or answer exchanged whole through `SetRemoteDescription` and `local_description`, transmits from a relayed address sent through TURN, its status (including whether recent datagrams came through a relay), and close on drop.
+- `crates/engine/src/turn.rs` — `Relays`, a link's TURN allocations without I/O of their own: Allocate with the long-term credential (401 challenge, 438 stale nonce), Refresh at half the granted lifetime, CreatePermission for the remote's candidates, Send and Data indications, and release on close.
+- `crates/engine/src/webrtc_receiver.rs` + `webrtc_sender.rs` — `WebRtcSource` (decode thread, gap concealment) and `WebRtcOutput` (encode thread).
+- `crates/engine/src/stun.rs` — STUN messages: building and parsing them, XOR addresses, and long-term MESSAGE-INTEGRITY.
+- `crates/engine/src/codec.rs` — `Encoder` and `Decoder` over AudioToolbox's `AudioConverter` for each `Codec` (AAC-LC, Opus). Every stream decodes to 48 kHz.
+- `crates/engine/src/adts.rs` + `ts.rs` — ADTS framing of AAC access units, and a single-stream MPEG-TS muxer and demuxer.
+- `crates/engine/src/flow.rs` — `FlowMeter`, which every source and output uses to report idle, connecting, connected, flowing or stalled.
 
 ## Core Audio gotchas (learned the hard way)
 
@@ -104,7 +105,7 @@ Key files:
 
 ## IPC
 
-Unix domain socket at `spaghetti_common::ipc_protocol::SOCKET_PATH`. Request/response enum in `crates/common/src/ipc_protocol.rs`; bump `IPC_VERSION` when a payload changes shape. Daemon dispatches in `crates/daemon/src/server.rs`. The CLI client is `crates/cli/src/client.rs`.
+Unix domain socket at `spaghetti_common::ipc_protocol::SOCKET_PATH`. Request/response enum in `crates/common/src/ipc_protocol.rs`; bump `IPC_VERSION` when a payload changes shape. Daemon dispatches to the engine in `crates/daemon/src/server.rs`. The CLI client is `crates/cli/src/client.rs`.
 
 ## Virtual devices — the multi-device model
 

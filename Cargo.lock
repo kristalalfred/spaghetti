@@ -1743,10 +1743,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "spaghettid"
+name = "spaghetti-engine"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "bytes",
  "cc",
  "core-foundation",
@@ -1758,7 +1757,6 @@ dependencies = [
  "libc",
  "md-5",
  "rubato",
- "serde",
  "serde_json",
  "sha1",
  "spaghetti-common",
@@ -1767,8 +1765,22 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "spaghettid"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "spaghetti-common",
+ "spaghetti-engine",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

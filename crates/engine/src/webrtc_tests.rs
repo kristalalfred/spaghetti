@@ -1,23 +1,18 @@
 use std::net::{SocketAddr, SocketAddrV4};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use coreaudio_sys::{AudioGetCurrentHostTime, AudioGetHostClockFrequency};
 use spaghetti_common::ipc_protocol::{
-    Destination, FlowState, FlowStatus, PeerRef, PeerRole, Request, Response, SourceSpec,
-    TurnServer, WebRtcPeer,
+    Destination, FlowState, FlowStatus, PeerRef, PeerRole, SourceSpec, TurnServer, WebRtcPeer,
 };
 use tokio::net::UdpSocket;
-use tokio_util::sync::CancellationToken;
 
-use super::{ActivityState, DaemonState, Shared, dispatch, lock_state};
-use crate::activity::FpsTracker;
 use crate::codec::tests::measure;
-use crate::device_manager::DeviceManager;
 use crate::playout::{HealthReport, Playout};
 use crate::ring::{CHANNELS, Ring};
+use crate::router::Router;
 use crate::sinks::{Sinks, SourceTiming};
 use crate::stun;
 
@@ -27,17 +22,10 @@ const TONE_HZ: f64 = 1000.0;
 const LEFT: f32 = 0.5;
 const RIGHT: f32 = 0.25;
 
-/// Claude: a daemon's request handling over a router of its own, with a device
-/// config in a temporary directory that is removed with it.
-struct Daemon {
-    shared: Shared,
-    dir: PathBuf,
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
+/// Claude: a router of its own, driven through the calls a controller's
+/// requests make.
+struct Engine {
+    router: Mutex<Router>,
 }
 
 fn peer(role: PeerRole, link: &str) -> WebRtcPeer {
@@ -50,81 +38,52 @@ fn peer(role: PeerRole, link: &str) -> WebRtcPeer {
     }
 }
 
-impl Daemon {
+impl Engine {
     fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "spaghetti-webrtc-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let shared = Shared {
-            state: Mutex::new(DaemonState::new()),
-            devices: DeviceManager::at(&dir.join("devices.json"), Box::new(|_| false)),
-            activity: ActivityState {
-                reader: Mutex::new(None),
-                fps: FpsTracker::new(),
-            },
-            cancel: CancellationToken::new(),
-        };
-        Self { shared, dir }
+        Self {
+            router: Mutex::new(Router::new()),
+        }
     }
 
-    async fn request(&self, request: Request) -> Response {
-        dispatch(request, &self.shared).await
+    fn router(&self) -> MutexGuard<'_, Router> {
+        self.router.lock().unwrap()
     }
 
     async fn create_source(&self, peer: WebRtcPeer) -> u32 {
-        let request = Request::CreateSource {
-            source: SourceSpec::WebRtc(peer),
-            tag: None,
-        };
-        match self.request(request).await {
-            Response::SourceCreated { source_id } => source_id,
-            other => panic!("create source: {other:?}"),
-        }
+        self.router()
+            .create_source(SourceSpec::WebRtc(peer), None)
+            .unwrap_or_else(|message| panic!("create source: {message}"))
     }
 
     async fn create_route(&self, source_id: u32, peer: WebRtcPeer) -> u32 {
-        let request = Request::CreateRoute {
-            source_id,
-            destination: Destination::WebRtc(peer),
-            volume: 1.0,
-        };
-        match self.request(request).await {
-            Response::RouteCreated { route_id } => route_id,
-            other => panic!("create route: {other:?}"),
-        }
+        self.router()
+            .create_route(source_id, Destination::WebRtc(peer), 1.0)
+            .unwrap_or_else(|message| panic!("create route: {message}"))
     }
 
     fn fixture(&self, sample_rate: f64) -> (u32, Arc<Sinks>) {
-        lock_state(&self.shared.state)
-            .router
-            .create_fixture_source(sample_rate)
+        self.router().create_fixture_source(sample_rate)
     }
 
     fn sink(&self, source_id: u32) -> (Arc<Ring>, SourceTiming) {
-        lock_state(&self.shared.state)
-            .router
-            .attach_fixture_sink(source_id)
+        self.router().attach_fixture_sink(source_id)
     }
 
     async fn listed(&self, peer: PeerRef) -> (FlowStatus, Option<String>) {
-        match (
-            peer,
-            self.request(Request::ListSources).await,
-            self.request(Request::ListRoutes).await,
-        ) {
-            (PeerRef::Source(id), Response::Sources(sources), _) => sources
+        let router = self.router();
+        match peer {
+            PeerRef::Source(id) => router
+                .list_sources()
                 .into_iter()
                 .find(|source| source.source_id == id)
                 .map(|source| (source.status, source.local_description))
                 .expect("the source is listed"),
-            (PeerRef::Route(id), _, Response::Routes(routes)) => routes
+            PeerRef::Route(id) => router
+                .list_routes()
                 .into_iter()
                 .find(|route| route.route_id == id)
                 .map(|route| (route.status, route.local_description))
                 .expect("the route is listed"),
-            other => panic!("listing: {other:?}"),
         }
     }
 
@@ -151,18 +110,14 @@ impl Daemon {
         }
     }
 
-    async fn set_remote(&self, peer: PeerRef, generation: u32, sdp: &str) -> Response {
-        let request = Request::SetRemoteDescription {
-            peer,
-            generation,
-            sdp: sdp.into(),
-        };
-        self.request(request).await
+    async fn set_remote(&self, peer: PeerRef, generation: u32, sdp: &str) -> Result<(), String> {
+        self.router()
+            .set_remote_description(peer, generation, sdp.into())
     }
 
     async fn apply(&self, peer: PeerRef, sdp: &str) {
-        let response = self.set_remote(peer, 1, sdp).await;
-        assert!(matches!(response, Response::Ok), "{peer:?}: {response:?}");
+        let applied = self.set_remote(peer, 1, sdp).await;
+        assert!(applied.is_ok(), "{peer:?}: {applied:?}");
     }
 
     /// Claude: how long the peer took to reach `state`, failing after `within`.
@@ -381,20 +336,20 @@ fn is_rtp(datagram: &[u8]) -> bool {
 }
 
 impl Shim {
-    /// Claude: carries an offer and its answer between the daemon's two peers
+    /// Claude: carries an offer and its answer between the engine's two peers
     /// through a new shim, which then relays all their traffic.
     async fn exchange(
-        daemon: &Daemon,
+        engine: &Engine,
         offerer: PeerRef,
         answerer: PeerRef,
         impairment: Impairment,
     ) -> Self {
-        let offer = daemon.description(offerer).await;
+        let offer = engine.description(offerer).await;
         let shim = Self::from_offerer(host_candidate(&offer), impairment).await;
-        daemon.apply(answerer, &shim.carry(&offer, true)).await;
-        let answer = daemon.description(answerer).await;
+        engine.apply(answerer, &shim.carry(&offer, true)).await;
+        let answer = engine.description(answerer).await;
         shim.answerer.set(host_candidate(&answer)).unwrap();
-        daemon.apply(offerer, &shim.carry(&answer, false)).await;
+        engine.apply(offerer, &shim.carry(&answer, false)).await;
         shim
     }
 
@@ -550,29 +505,29 @@ async fn fake_stun(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_offered_route_and_an_answering_source_carry_a_stereo_tone() {
-    let daemon = Daemon::new();
-    let (fixture, sinks) = daemon.fixture(48000.0);
+    let engine = Engine::new();
+    let (fixture, sinks) = engine.fixture(48000.0);
     let _producer = Producer::start(sinks, 48000.0);
-    let source = PeerRef::Source(daemon.create_source(peer(PeerRole::Answer, "tone")).await);
+    let source = PeerRef::Source(engine.create_source(peer(PeerRole::Answer, "tone")).await);
     let route = PeerRef::Route(
-        daemon
+        engine
             .create_route(fixture, peer(PeerRole::Offer, "tone"))
             .await,
     );
     let PeerRef::Source(source_id) = source else {
         unreachable!()
     };
-    let (ring, _) = daemon.sink(source_id);
+    let (ring, _) = engine.sink(source_id);
 
-    let offer = daemon.description(route).await;
+    let offer = engine.description(route).await;
     assert_eq!(
-        daemon.listed(source).await.1,
+        engine.listed(source).await.1,
         None,
         "an answerer describes itself only after the offer"
     );
     assert!(offer.contains("a=sendonly"), "{offer}");
-    daemon.apply(source, &offer).await;
-    let answer = daemon.description(source).await;
+    engine.apply(source, &offer).await;
+    let answer = engine.description(source).await;
     assert!(answer.contains("a=recvonly"), "{answer}");
     for sdp in [&offer, &answer] {
         let fmtp = sdp
@@ -584,18 +539,18 @@ async fn an_offered_route_and_an_answering_source_carry_a_stereo_tone() {
             "{fmtp}"
         );
     }
-    daemon.apply(route, &answer).await;
+    engine.apply(route, &answer).await;
 
-    daemon
+    engine
         .wait_for(source, FlowState::Flowing, Duration::from_secs(5))
         .await;
-    daemon
+    engine
         .wait_for(route, FlowState::Flowing, Duration::from_secs(5))
         .await;
     let pcm = collect(&ring, 2.0).await;
     assert_tone(&pcm, "received");
 
-    let (sent, received) = (daemon.status(route).await, daemon.status(source).await);
+    let (sent, received) = (engine.status(route).await, engine.status(source).await);
     assert!(
         sent.bytes > 0 && received.bytes > 0,
         "{sent:?} {received:?}"
@@ -608,22 +563,22 @@ async fn an_offered_route_and_an_answering_source_carry_a_stereo_tone() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_44_1_khz_source_advances_rtp_time_by_960_per_packet() {
-    let daemon = Daemon::new();
-    let (fixture, sinks) = daemon.fixture(44100.0);
+    let engine = Engine::new();
+    let (fixture, sinks) = engine.fixture(44100.0);
     let _producer = Producer::start(sinks, 44100.0);
-    let source = PeerRef::Source(daemon.create_source(peer(PeerRole::Answer, "cd")).await);
+    let source = PeerRef::Source(engine.create_source(peer(PeerRole::Answer, "cd")).await);
     let route = PeerRef::Route(
-        daemon
+        engine
             .create_route(fixture, peer(PeerRole::Offer, "cd"))
             .await,
     );
     let PeerRef::Source(source_id) = source else {
         unreachable!()
     };
-    let (ring, _) = daemon.sink(source_id);
+    let (ring, _) = engine.sink(source_id);
 
-    let shim = Shim::exchange(&daemon, route, source, Impairment::None).await;
-    daemon
+    let shim = Shim::exchange(&engine, route, source, Impairment::None).await;
+    engine
         .wait_for(source, FlowState::Flowing, Duration::from_secs(5))
         .await;
 
@@ -644,28 +599,28 @@ async fn a_44_1_khz_source_advances_rtp_time_by_960_per_packet() {
             "packet {index}"
         );
     }
-    assert_eq!(daemon.status(source).await.packets_lost, 0);
+    assert_eq!(engine.status(source).await.packets_lost, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_receiver_stalls_when_packets_stop_and_flows_when_they_resume() {
-    let daemon = Daemon::new();
-    let (fixture, sinks) = daemon.fixture(48000.0);
+    let engine = Engine::new();
+    let (fixture, sinks) = engine.fixture(48000.0);
     let producer = Producer::start(sinks, 48000.0);
-    let source = PeerRef::Source(daemon.create_source(peer(PeerRole::Answer, "stall")).await);
+    let source = PeerRef::Source(engine.create_source(peer(PeerRole::Answer, "stall")).await);
     let route = PeerRef::Route(
-        daemon
+        engine
             .create_route(fixture, peer(PeerRole::Offer, "stall"))
             .await,
     );
-    daemon.exchange(route, source, direct).await;
-    daemon
+    engine.exchange(route, source, direct).await;
+    engine
         .wait_for(source, FlowState::Flowing, Duration::from_secs(5))
         .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     producer.pause(true);
-    let stalled_after = daemon
+    let stalled_after = engine
         .wait_for(source, FlowState::Stalled, Duration::from_secs(3))
         .await;
     assert!(
@@ -673,7 +628,7 @@ async fn a_receiver_stalls_when_packets_stop_and_flows_when_they_resume() {
         "stalled {stalled_after:?} after the packets stopped"
     );
     producer.pause(false);
-    let resumed_after = daemon
+    let resumed_after = engine
         .wait_for(source, FlowState::Flowing, Duration::from_secs(1))
         .await;
     assert!(
@@ -684,35 +639,35 @@ async fn a_receiver_stalls_when_packets_stop_and_flows_when_they_resume() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stun_answer_in_time_becomes_a_candidate_and_a_late_one_changes_nothing() {
-    let daemon = Daemon::new();
-    let (fixture, sinks) = daemon.fixture(48000.0);
+    let engine = Engine::new();
+    let (fixture, sinks) = engine.fixture(48000.0);
     let _producer = Producer::start(sinks, 48000.0);
     let mapped: SocketAddrV4 = "203.0.113.7:40000".parse().unwrap();
     let (stun_server, late, _stun) = fake_stun(mapped).await;
-    let source = PeerRef::Source(daemon.create_source(peer(PeerRole::Answer, "stun")).await);
+    let source = PeerRef::Source(engine.create_source(peer(PeerRole::Answer, "stun")).await);
     let PeerRef::Source(source_id) = source else {
         unreachable!()
     };
-    let (ring, _) = daemon.sink(source_id);
+    let (ring, _) = engine.sink(source_id);
     let created = Instant::now();
     let offering = WebRtcPeer {
         stun: vec![stun_server.to_string()],
         ..peer(PeerRole::Offer, "stun")
     };
-    let route = PeerRef::Route(daemon.create_route(fixture, offering).await);
+    let route = PeerRef::Route(engine.create_route(fixture, offering).await);
 
-    let offer = daemon.description(route).await;
+    let offer = engine.description(route).await;
     assert!(
         created.elapsed() < Duration::from_millis(900),
         "the answered STUN round took {:?}",
         created.elapsed()
     );
     assert!(offer.contains("203.0.113.7 40000 typ srflx"), "{offer}");
-    daemon.exchange(route, source, direct).await;
-    daemon
+    engine.exchange(route, source, direct).await;
+    engine
         .wait_for(source, FlowState::Flowing, Duration::from_secs(5))
         .await;
-    daemon
+    engine
         .wait_for(route, FlowState::Flowing, Duration::from_secs(5))
         .await;
 
@@ -720,36 +675,36 @@ async fn a_stun_answer_in_time_becomes_a_candidate_and_a_late_one_changes_nothin
     tokio::time::sleep(Duration::from_millis(500)).await;
     let pcm = collect(&ring, 2.0).await;
     assert_tone(&pcm, "after a late STUN answer");
-    assert_eq!(daemon.state(route).await, FlowState::Flowing);
-    assert_eq!(daemon.state(source).await, FlowState::Flowing);
+    assert_eq!(engine.state(route).await, FlowState::Flowing);
+    assert_eq!(engine.state(source).await, FlowState::Flowing);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn garbage_on_the_media_sockets_does_not_end_the_link() {
-    let daemon = Daemon::new();
-    let (fixture, sinks) = daemon.fixture(48000.0);
+    let engine = Engine::new();
+    let (fixture, sinks) = engine.fixture(48000.0);
     let _producer = Producer::start(sinks, 48000.0);
     let source = PeerRef::Source(
-        daemon
+        engine
             .create_source(peer(PeerRole::Answer, "garbage"))
             .await,
     );
     let route = PeerRef::Route(
-        daemon
+        engine
             .create_route(fixture, peer(PeerRole::Offer, "garbage"))
             .await,
     );
     let PeerRef::Source(source_id) = source else {
         unreachable!()
     };
-    let (ring, _) = daemon.sink(source_id);
-    daemon.exchange(route, source, direct).await;
-    daemon
+    let (ring, _) = engine.sink(source_id);
+    engine.exchange(route, source, direct).await;
+    engine
         .wait_for(source, FlowState::Flowing, Duration::from_secs(5))
         .await;
 
-    let offer = daemon.description(route).await;
-    let answer = daemon.description(source).await;
+    let offer = engine.description(route).await;
+    let answer = engine.description(source).await;
     let sender = UdpSocket::bind((host_candidate(&offer).ip(), 0))
         .await
         .unwrap();
@@ -779,30 +734,30 @@ async fn garbage_on_the_media_sockets_does_not_end_the_link() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     let pcm = collect(&ring, 2.0).await;
     assert_tone(&pcm, "after garbage");
-    assert_eq!(daemon.state(route).await, FlowState::Flowing);
-    assert_eq!(daemon.state(source).await, FlowState::Flowing);
+    assert_eq!(engine.state(route).await, FlowState::Flowing);
+    assert_eq!(engine.state(source).await, FlowState::Flowing);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unanswered_offer_describes_itself_after_the_stun_deadline_and_stays_connecting() {
-    let daemon = Daemon::new();
-    let (fixture, _sinks) = daemon.fixture(48000.0);
+    let engine = Engine::new();
+    let (fixture, _sinks) = engine.fixture(48000.0);
     let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let created = Instant::now();
     let offering = WebRtcPeer {
         stun: vec![silent.local_addr().unwrap().to_string()],
         ..peer(PeerRole::Offer, "unanswered")
     };
-    let route = PeerRef::Route(daemon.create_route(fixture, offering).await);
+    let route = PeerRef::Route(engine.create_route(fixture, offering).await);
 
-    let not_ready = daemon.set_remote(route, 1, "v=0\r\n").await;
+    let not_ready = engine.set_remote(route, 1, "v=0\r\n").await;
     assert!(
-        matches!(&not_ready, Response::Error { message } if message.contains("not ready")),
+        matches!(&not_ready, Err(message) if message.contains("not ready")),
         "{not_ready:?}"
     );
     let latest = Duration::from_secs(4);
     let offer = loop {
-        if let Some(sdp) = daemon.listed(route).await.1 {
+        if let Some(sdp) = engine.listed(route).await.1 {
             break sdp;
         }
         assert!(
@@ -823,7 +778,7 @@ async fn an_unanswered_offer_describes_itself_after_the_stun_deadline_and_stays_
     );
     while created.elapsed() < Duration::from_secs(12) {
         assert_eq!(
-            daemon.state(route).await,
+            engine.state(route).await,
             FlowState::Connecting,
             "after {:?}",
             created.elapsed()
@@ -834,29 +789,29 @@ async fn an_unanswered_offer_describes_itself_after_the_stun_deadline_and_stays_
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_unreachable_deadline_waits_for_the_answer_however_late_it_comes() {
-    let daemon = Daemon::new();
-    let (fixture, sinks) = daemon.fixture(48000.0);
+    let engine = Engine::new();
+    let (fixture, sinks) = engine.fixture(48000.0);
     let _producer = Producer::start(sinks, 48000.0);
     let source = PeerRef::Source(
-        daemon
+        engine
             .create_source(peer(PeerRole::Answer, "patient"))
             .await,
     );
     let route = PeerRef::Route(
-        daemon
+        engine
             .create_route(fixture, peer(PeerRole::Offer, "patient"))
             .await,
     );
     let created = Instant::now();
 
-    let offer = daemon.description(route).await;
+    let offer = engine.description(route).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
-    daemon.apply(source, &offer).await;
-    let answer = daemon.description(source).await;
+    engine.apply(source, &offer).await;
+    let answer = engine.description(source).await;
     while created.elapsed() < Duration::from_millis(11500) {
         for peer in [route, source] {
             assert_eq!(
-                daemon.state(peer).await,
+                engine.state(peer).await,
                 FlowState::Connecting,
                 "{peer:?} after {:?}",
                 created.elapsed()
@@ -864,45 +819,45 @@ async fn the_unreachable_deadline_waits_for_the_answer_however_late_it_comes() {
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    daemon.apply(route, &answer).await;
-    daemon
+    engine.apply(route, &answer).await;
+    engine
         .wait_for(source, FlowState::Flowing, Duration::from_secs(5))
         .await;
-    daemon
+    engine
         .wait_for(route, FlowState::Flowing, Duration::from_secs(5))
         .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_applied_answer_whose_peer_is_silent_makes_the_offerer_unreachable_10_s_later() {
-    let daemon = Daemon::new();
-    let (fixture, _sinks) = daemon.fixture(48000.0);
-    let source = PeerRef::Source(daemon.create_source(peer(PeerRole::Answer, "silent")).await);
+    let engine = Engine::new();
+    let (fixture, _sinks) = engine.fixture(48000.0);
+    let source = PeerRef::Source(engine.create_source(peer(PeerRole::Answer, "silent")).await);
     let route = PeerRef::Route(
-        daemon
+        engine
             .create_route(fixture, peer(PeerRole::Offer, "silent"))
             .await,
     );
     let created = Instant::now();
-    let offer = daemon.description(route).await;
+    let offer = engine.description(route).await;
     let shim = Shim::from_offerer(host_candidate(&offer), Impairment::Blackhole).await;
-    daemon.apply(source, &shim.carry(&offer, true)).await;
-    let answer = shim.carry(&daemon.description(source).await, false);
+    engine.apply(source, &shim.carry(&offer, true)).await;
+    let answer = shim.carry(&engine.description(source).await, false);
     tokio::time::sleep(Duration::from_secs(3).saturating_sub(created.elapsed())).await;
 
     let applied = Instant::now();
-    daemon.apply(route, &answer).await;
+    engine.apply(route, &answer).await;
     while applied.elapsed() < Duration::from_millis(9500) {
         assert_eq!(
-            daemon.state(route).await,
+            engine.state(route).await,
             FlowState::Connecting,
             "{:?} after the answer",
             applied.elapsed()
         );
-        assert_eq!(daemon.state(source).await, FlowState::Connecting);
+        assert_eq!(engine.state(source).await, FlowState::Connecting);
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    daemon
+    engine
         .wait_for(route, FlowState::Unreachable, Duration::from_secs(2))
         .await;
     let unreachable_after = applied.elapsed();
@@ -910,43 +865,43 @@ async fn an_applied_answer_whose_peer_is_silent_makes_the_offerer_unreachable_10
         unreachable_after < Duration::from_millis(11000),
         "unreachable {unreachable_after:?} after the answer"
     );
-    assert_eq!(daemon.state(source).await, FlowState::Connecting);
+    assert_eq!(engine.state(source).await, FlowState::Connecting);
 
-    let (_, description) = daemon.listed(route).await;
+    let (_, description) = engine.listed(route).await;
     assert_eq!(description, Some(offer));
-    let refused = daemon.set_remote(route, 1, &answer).await;
+    let refused = engine.set_remote(route, 1, &answer).await;
     assert!(
-        matches!(&refused, Response::Error { message } if message.contains("unreachable")),
+        matches!(&refused, Err(message) if message.contains("unreachable")),
         "{refused:?}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn closing_one_side_makes_the_other_lost() {
-    let daemon = Daemon::new();
-    let (fixture, sinks) = daemon.fixture(48000.0);
+    let engine = Engine::new();
+    let (fixture, sinks) = engine.fixture(48000.0);
     let _producer = Producer::start(sinks, 48000.0);
-    let source_id = daemon
+    let source_id = engine
         .create_source(peer(PeerRole::Answer, "closing"))
         .await;
     let (source, route) = (
         PeerRef::Source(source_id),
         PeerRef::Route(
-            daemon
+            engine
                 .create_route(fixture, peer(PeerRole::Offer, "closing"))
                 .await,
         ),
     );
-    daemon.exchange(route, source, direct).await;
-    daemon
+    engine.exchange(route, source, direct).await;
+    engine
         .wait_for(route, FlowState::Flowing, Duration::from_secs(5))
         .await;
-    let answer = daemon.description(source).await;
-    let offer = daemon.description(route).await;
+    let answer = engine.description(source).await;
+    let offer = engine.description(route).await;
 
-    let destroyed = daemon.request(Request::DestroySource { source_id }).await;
-    assert!(matches!(destroyed, Response::Ok), "{destroyed:?}");
-    let lost_after = daemon
+    let destroyed = engine.router().destroy_source(source_id);
+    assert!(destroyed.is_ok(), "{destroyed:?}");
+    let lost_after = engine
         .wait_for(route, FlowState::Lost, Duration::from_secs(1))
         .await;
     assert!(
@@ -954,11 +909,11 @@ async fn closing_one_side_makes_the_other_lost() {
         "lost {lost_after:?} after the close"
     );
 
-    let (_, description) = daemon.listed(route).await;
+    let (_, description) = engine.listed(route).await;
     assert_eq!(description, Some(offer));
-    let refused = daemon.set_remote(route, 1, &answer).await;
+    let refused = engine.set_remote(route, 1, &answer).await;
     assert!(
-        matches!(&refused, Response::Error { message } if message.contains("lost")),
+        matches!(&refused, Err(message) if message.contains("lost")),
         "{refused:?}"
     );
 
@@ -966,76 +921,73 @@ async fn closing_one_side_makes_the_other_lost() {
     let PeerRef::Route(route_id) = route else {
         unreachable!()
     };
-    let ring = lock_state(&daemon.shared.state).router.route_ring(route_id);
+    let ring = engine.router().route_ring(route_id);
     assert_eq!(
         ring.overflows(),
         0,
         "the lost route stopped draining its ring"
     );
-    assert_eq!(daemon.state(route).await, FlowState::Lost);
+    assert_eq!(engine.state(route).await, FlowState::Lost);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_remote_description_applies_once_per_generation() {
-    let daemon = Daemon::new();
-    let (fixture, _sinks) = daemon.fixture(48000.0);
-    let source = PeerRef::Source(daemon.create_source(peer(PeerRole::Answer, "once")).await);
+    let engine = Engine::new();
+    let (fixture, _sinks) = engine.fixture(48000.0);
+    let source = PeerRef::Source(engine.create_source(peer(PeerRole::Answer, "once")).await);
     let route = PeerRef::Route(
-        daemon
+        engine
             .create_route(fixture, peer(PeerRole::Offer, "once"))
             .await,
     );
     let other_route = PeerRef::Route(
-        daemon
+        engine
             .create_route(fixture, peer(PeerRole::Offer, "other"))
             .await,
     );
     let receiving_offerer =
-        PeerRef::Source(daemon.create_source(peer(PeerRole::Offer, "inbound")).await);
-    let offer = daemon.description(route).await;
-    let other_offer = daemon.description(other_route).await;
+        PeerRef::Source(engine.create_source(peer(PeerRole::Offer, "inbound")).await);
+    let offer = engine.description(route).await;
+    let other_offer = engine.description(other_route).await;
 
-    let error = |response: Response| match response {
-        Response::Error { message } => message,
-        other => panic!("expected an error, got {other:?}"),
-    };
-    let wrong = error(daemon.set_remote(source, 2, &offer).await);
+    let error = |result: Result<(), String>| result.expect_err("expected an error");
+    let wrong = error(engine.set_remote(source, 2, &offer).await);
     assert!(wrong.contains('2') && wrong.contains('1'), "{wrong}");
     let unparsable = error(
-        daemon
+        engine
             .set_remote(source, 1, "not a session description")
             .await,
     );
     assert!(unparsable.contains("parse"), "{unparsable}");
-    let inbound_offer = daemon.description(receiving_offerer).await;
-    let wrong_way = error(daemon.set_remote(source, 1, &inbound_offer).await);
+    let inbound_offer = engine.description(receiving_offerer).await;
+    let wrong_way = error(engine.set_remote(source, 1, &inbound_offer).await);
     assert!(wrong_way.contains("does not send"), "{wrong_way}");
     assert_eq!(
-        daemon.listed(source).await.1,
+        engine.listed(source).await.1,
         None,
         "a refused offer is not applied"
     );
 
-    daemon.apply(source, &offer).await;
-    let answer = daemon.description(source).await;
-    daemon.apply(source, &offer).await;
-    assert_eq!(daemon.listed(source).await.1, Some(answer.clone()));
-    let different = error(daemon.set_remote(source, 1, &other_offer).await);
+    engine.apply(source, &offer).await;
+    let answer = engine.description(source).await;
+    engine.apply(source, &offer).await;
+    assert_eq!(engine.listed(source).await.1, Some(answer.clone()));
+    let different = error(engine.set_remote(source, 1, &other_offer).await);
     assert!(different.contains("different"), "{different}");
 
-    daemon.apply(route, &answer).await;
-    daemon.apply(route, &answer).await;
+    engine.apply(route, &answer).await;
+    engine.apply(route, &answer).await;
     let edited = answer.replacen("a=recvonly", "a=recvonly\r\na=x-edited:1", 1);
-    let different = error(daemon.set_remote(route, 1, &edited).await);
+    let different = error(engine.set_remote(route, 1, &edited).await);
     assert!(different.contains("different"), "{different}");
-    daemon
+    engine
         .wait_for(route, FlowState::Connected, Duration::from_secs(5))
         .await;
 
-    let missing = error(daemon.set_remote(PeerRef::Route(999), 1, &answer).await);
+    let missing = error(engine.set_remote(PeerRef::Route(999), 1, &answer).await);
     assert!(missing.contains("not found"), "{missing}");
     let not_webrtc = error(
-        daemon
+        engine
             .set_remote(PeerRef::Source(fixture), 1, &answer)
             .await,
     );
@@ -1044,7 +996,7 @@ async fn a_remote_description_applies_once_per_generation() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_peer_takes_stun_and_turn_servers_only_as_host_and_port() {
-    let daemon = Daemon::new();
+    let engine = Engine::new();
     let turn = |address: &str| TurnServer {
         address: address.into(),
         username: "user".into(),
@@ -1069,15 +1021,12 @@ async fn a_peer_takes_stun_and_turn_servers_only_as_host_and_port() {
             turn,
             ..peer(PeerRole::Answer, "servers")
         };
-        let response = daemon
-            .request(Request::CreateSource {
-                source: SourceSpec::WebRtc(spec),
-                tag: None,
-            })
-            .await;
+        let created = engine
+            .router()
+            .create_source(SourceSpec::WebRtc(spec), None);
         assert!(
-            matches!(&response, Response::Error { message } if message.contains(named) && message.contains("host:port")),
-            "{response:?}"
+            matches!(&created, Err(message) if message.contains(named) && message.contains("host:port")),
+            "{created:?}"
         );
     }
     let accepted = WebRtcPeer {
@@ -1085,33 +1034,33 @@ async fn a_peer_takes_stun_and_turn_servers_only_as_host_and_port() {
         turn: vec![turn("turn.example.net:3478")],
         ..peer(PeerRole::Answer, "servers")
     };
-    daemon.create_source(accepted).await;
+    engine.create_source(accepted).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn concealment_keeps_a_lossy_reordered_stream_continuous() {
-    let daemon = Daemon::new();
-    let (fixture, sinks) = daemon.fixture(48000.0);
+    let engine = Engine::new();
+    let (fixture, sinks) = engine.fixture(48000.0);
     let _producer = Producer::start(sinks, 48000.0);
-    let source = PeerRef::Source(daemon.create_source(peer(PeerRole::Answer, "lossy")).await);
+    let source = PeerRef::Source(engine.create_source(peer(PeerRole::Answer, "lossy")).await);
     let route = PeerRef::Route(
-        daemon
+        engine
             .create_route(fixture, peer(PeerRole::Offer, "lossy"))
             .await,
     );
     let PeerRef::Source(source_id) = source else {
         unreachable!()
     };
-    let (ring, timing) = daemon.sink(source_id);
+    let (ring, timing) = engine.sink(source_id);
 
-    let shim = Shim::exchange(&daemon, route, source, Impairment::LossAndReorder).await;
-    daemon
+    let shim = Shim::exchange(&engine, route, source, Impairment::LossAndReorder).await;
+    engine
         .wait_for(source, FlowState::Flowing, Duration::from_secs(5))
         .await;
 
     let (rendered, health, worst_correction_ppm) = play(&ring, timing, 20.0).await;
     let dropped = shim.dropped.load(Ordering::Relaxed);
-    let concealed = daemon.status(source).await.packets_lost;
+    let concealed = engine.status(source).await.packets_lost;
     assert!(dropped >= 18, "the shim dropped {dropped} packets");
     assert_eq!(
         [health.underruns, health.reprimes],

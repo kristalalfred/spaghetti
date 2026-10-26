@@ -1,37 +1,11 @@
 use std::fs;
 
+use spaghetti_engine::{ActivityReader, DeviceManager};
 use tokio::signal;
 use tokio::signal::unix::SignalKind;
 use tracing_subscriber::EnvFilter;
 
-mod abl;
-mod activity;
-mod adts;
-mod audio;
-mod codec;
-mod delivery;
-mod device_manager;
-mod device_output;
-#[cfg(test)]
-mod fixture;
-mod flow;
-mod mixer;
-mod playout;
-mod ring;
-mod router;
-mod rt_slots;
 mod server;
-mod sinks;
-mod srt;
-mod srt_receiver;
-mod srt_sender;
-mod stun;
-mod tap;
-mod ts;
-mod turn;
-mod webrtc;
-mod webrtc_receiver;
-mod webrtc_sender;
 
 fn init_logging() {
     tracing_subscriber::fmt()
@@ -50,11 +24,11 @@ async fn main() -> anyhow::Result<()> {
     // Bootstrap the device config file before anything else. On a fresh
     // install this writes the default entry so the HAL plugin can publish
     // `SpaghettiDevice_UID` when it loads.
-    let device_manager = device_manager::DeviceManager::new();
+    let device_manager = DeviceManager::new();
 
     // Activity shm is a soft dependency — daemon keeps running if the driver's
     // shm region is unavailable (reads will just return defaults).
-    let activity_reader = match activity::ActivityReader::open() {
+    let activity_reader = match ActivityReader::open() {
         Ok(r) => {
             tracing::info!("activity shm opened: {}", spaghetti_common::ACTIVITY_SHM_NAME);
             Some(r)
@@ -70,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Probe for the virtual device in the background so we log whether the
     // driver is installed without blocking the socket bind.
-    tokio::task::spawn_blocking(|| match audio::find_device_by_uid("SpaghettiDevice_UID") {
+    tokio::task::spawn_blocking(|| match spaghetti_engine::find_device_by_uid("SpaghettiDevice_UID") {
         Some(id) => tracing::info!("Found Spaghetti device: object_id={id}"),
         None => tracing::warn!(
             "Spaghetti virtual device not found — is the driver installed and coreaudiod loaded it?"

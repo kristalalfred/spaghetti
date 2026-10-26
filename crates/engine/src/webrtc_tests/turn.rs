@@ -372,31 +372,31 @@ fn candidates(sdp: &str) -> Vec<(SocketAddr, String)> {
 }
 
 async fn link(
-    daemon: &Daemon,
+    engine: &Engine,
     offerer: WebRtcPeer,
     answerer: WebRtcPeer,
 ) -> (PeerRef, PeerRef, Arc<Ring>, Producer) {
-    let (fixture, sinks) = daemon.fixture(48000.0);
+    let (fixture, sinks) = engine.fixture(48000.0);
     let producer = Producer::start(sinks, 48000.0);
-    let source_id = daemon.create_source(answerer).await;
-    let route = PeerRef::Route(daemon.create_route(fixture, offerer).await);
-    let (ring, _) = daemon.sink(source_id);
+    let source_id = engine.create_source(answerer).await;
+    let route = PeerRef::Route(engine.create_route(fixture, offerer).await);
+    let (ring, _) = engine.sink(source_id);
     (route, PeerRef::Source(source_id), ring, producer)
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn two_relay_only_peers_carry_a_tone_through_one_shared_relayed_address() {
     let turn = FakeTurn::start(Settings::default()).await;
-    let daemon = Daemon::new();
+    let engine = Engine::new();
     let (route, source, ring, _producer) = link(
-        &daemon,
+        &engine,
         relay_only(PeerRole::Offer, "both-relay-offer", &turn),
         relay_only(PeerRole::Answer, "both-relay-answer", &turn),
     )
     .await;
-    daemon.exchange(route, source, direct).await;
-    let offer = daemon.description(route).await;
-    let answer = daemon.description(source).await;
+    engine.exchange(route, source, direct).await;
+    let offer = engine.description(route).await;
+    let answer = engine.description(source).await;
     for sdp in [&offer, &answer] {
         assert_eq!(
             candidates(sdp),
@@ -406,14 +406,14 @@ async fn two_relay_only_peers_carry_a_tone_through_one_shared_relayed_address() 
     }
 
     for peer in [route, source] {
-        daemon
+        engine
             .wait_for(peer, FlowState::Flowing, Duration::from_secs(5))
             .await;
     }
     let pcm = collect(&ring, 2.0).await;
     assert_tone(&pcm, "relayed both ways");
     for peer in [route, source] {
-        let status = daemon.status(peer).await;
+        let status = engine.status(peer).await;
         assert!(status.relayed, "{peer:?}: {status:?}");
         assert_eq!(status.peer, Some(turn.relay.to_string()), "{peer:?}");
     }
@@ -434,7 +434,7 @@ async fn two_relay_only_peers_carry_a_tone_through_one_shared_relayed_address() 
 /// relayed by the address its own allocation was granted.
 async fn one_end_relaying(settings: Settings, relaying: PeerRole, name: &str) {
     let turn = FakeTurn::start(settings).await;
-    let daemon = Daemon::new();
+    let engine = Engine::new();
     let spec = |role: PeerRole| {
         let link = format!("{name}-{role:?}");
         if role == relaying {
@@ -444,35 +444,35 @@ async fn one_end_relaying(settings: Settings, relaying: PeerRole, name: &str) {
         }
     };
     let (route, source, ring, _producer) =
-        link(&daemon, spec(PeerRole::Offer), spec(PeerRole::Answer)).await;
-    daemon.exchange(route, source, direct).await;
+        link(&engine, spec(PeerRole::Offer), spec(PeerRole::Answer)).await;
+    engine.exchange(route, source, direct).await;
     let (relaying_end, open_end) = match relaying {
         PeerRole::Offer => (route, source),
         PeerRole::Answer => (source, route),
     };
-    let restricted = daemon.description(relaying_end).await;
+    let restricted = engine.description(relaying_end).await;
     assert_eq!(
         candidates(&restricted),
         [(turn.relay, "relay".to_string())],
         "{restricted}"
     );
-    let open = daemon.description(open_end).await;
+    let open = engine.description(open_end).await;
     let open_host = host_candidate(&open);
     assert!(open.contains("typ relay"), "{open}");
 
     for peer in [route, source] {
-        daemon
+        engine
             .wait_for(peer, FlowState::Flowing, Duration::from_secs(5))
             .await;
     }
     let pcm = collect(&ring, 2.0).await;
     assert_tone(&pcm, name);
     for peer in [route, source] {
-        let status = daemon.status(peer).await;
+        let status = engine.status(peer).await;
         assert!(status.relayed, "{name}, {peer:?}: {status:?}");
     }
     assert_eq!(
-        daemon.status(open_end).await.peer,
+        engine.status(open_end).await.peer,
         Some(turn.relay.to_string()),
         "{name}"
     );
@@ -498,25 +498,25 @@ async fn either_end_relaying_alone_makes_both_ends_report_relayed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_direct_path_wins_over_the_relay_and_reports_direct() {
     let turn = FakeTurn::start(Settings::default()).await;
-    let daemon = Daemon::new();
+    let engine = Engine::new();
     let (route, source, ring, _producer) = link(
-        &daemon,
+        &engine,
         with_turn(PeerRole::Offer, "direct-offer", &turn, PASSWORD),
         with_turn(PeerRole::Answer, "direct-answer", &turn, PASSWORD),
     )
     .await;
-    daemon.exchange(route, source, direct).await;
-    let offer = daemon.description(route).await;
-    let answer = daemon.description(source).await;
+    engine.exchange(route, source, direct).await;
+    let offer = engine.description(route).await;
+    let answer = engine.description(source).await;
     for peer in [route, source] {
-        daemon
+        engine
             .wait_for(peer, FlowState::Flowing, Duration::from_secs(5))
             .await;
     }
     let pcm = collect(&ring, 2.0).await;
     assert_tone(&pcm, "direct with TURN offered");
     for (peer, remote) in [(route, &answer), (source, &offer)] {
-        let status = daemon.status(peer).await;
+        let status = engine.status(peer).await;
         assert!(!status.relayed, "{peer:?}: {status:?}");
         assert_eq!(status.peer, Some(host_candidate(remote).to_string()));
     }
@@ -543,15 +543,15 @@ async fn a_direct_path_wins_over_the_relay_and_reports_direct() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_turn_credential_offers_no_relayed_candidate_and_connects_directly() {
     let turn = FakeTurn::start(Settings::default()).await;
-    let daemon = Daemon::new();
+    let engine = Engine::new();
     let created = Instant::now();
     let (route, source, ring, _producer) = link(
-        &daemon,
+        &engine,
         with_turn(PeerRole::Offer, "refused-offer", &turn, "not the secret"),
         peer(PeerRole::Answer, "refused-answer"),
     )
     .await;
-    let offer = daemon.description(route).await;
+    let offer = engine.description(route).await;
     assert!(
         created.elapsed() < Duration::from_millis(1500),
         "the refused allocation held the offer back {:?}",
@@ -570,16 +570,16 @@ async fn a_refused_turn_credential_offers_no_relayed_candidate_and_connects_dire
         );
     }
 
-    daemon.exchange(route, source, direct).await;
+    engine.exchange(route, source, direct).await;
     for peer in [route, source] {
-        daemon
+        engine
             .wait_for(peer, FlowState::Flowing, Duration::from_secs(5))
             .await;
     }
     let pcm = collect(&ring, 2.0).await;
     assert_tone(&pcm, "direct after a refused credential");
     for peer in [route, source] {
-        assert!(!daemon.status(peer).await.relayed, "{peer:?}");
+        assert!(!engine.status(peer).await.relayed, "{peer:?}");
     }
 }
 
@@ -592,23 +592,23 @@ async fn allocations_are_refreshed_before_their_lifetime_ends_and_released_on_cl
         ..Settings::default()
     })
     .await;
-    let daemon = Daemon::new();
+    let engine = Engine::new();
     let (route, source, ring, _producer) = link(
-        &daemon,
+        &engine,
         relay_only(PeerRole::Offer, "refresh-offer", &turn),
         relay_only(PeerRole::Answer, "refresh-answer", &turn),
     )
     .await;
-    daemon.exchange(route, source, direct).await;
+    engine.exchange(route, source, direct).await;
     for peer in [route, source] {
-        daemon
+        engine
             .wait_for(peer, FlowState::Flowing, Duration::from_secs(5))
             .await;
     }
     let pcm = collect(&ring, 7.0).await;
     assert_tone(&pcm, "relayed past two lifetimes");
     for peer in [route, source] {
-        assert!(daemon.status(peer).await.relayed, "{peer:?}");
+        assert!(engine.status(peer).await.relayed, "{peer:?}");
     }
     {
         let now = Instant::now();
@@ -647,13 +647,8 @@ async fn allocations_are_refreshed_before_their_lifetime_ends_and_released_on_cl
     let PeerRef::Source(source_id) = source else {
         unreachable!()
     };
-    for request in [
-        Request::DestroyRoute { route_id },
-        Request::DestroySource { source_id },
-    ] {
-        let response = daemon.request(request).await;
-        assert!(matches!(response, Response::Ok), "{response:?}");
-    }
+    engine.router().destroy_route(route_id).unwrap();
+    engine.router().destroy_source(source_id).unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     let seen = turn.seen();
     for (client, _) in &seen.allocated {
@@ -688,28 +683,28 @@ async fn two_relay_only_peers_carry_a_tone_through_a_real_turn_server() {
             ..peer(role, link)
         }
     };
-    let daemon = Daemon::new();
+    let engine = Engine::new();
     let (route, source, ring, _producer) = link(
-        &daemon,
+        &engine,
         spec(PeerRole::Offer, "real-turn-offer"),
         spec(PeerRole::Answer, "real-turn-answer"),
     )
     .await;
-    daemon.exchange(route, source, direct).await;
+    engine.exchange(route, source, direct).await;
     for peer in [route, source] {
-        let sdp = daemon.description(peer).await;
+        let sdp = engine.description(peer).await;
         let kinds: Vec<String> = candidates(&sdp).into_iter().map(|(_, kind)| kind).collect();
         assert_eq!(kinds, ["relay"], "{peer:?} was allocated nothing: {sdp}");
     }
     for peer in [route, source] {
-        daemon
+        engine
             .wait_for(peer, FlowState::Flowing, Duration::from_secs(10))
             .await;
     }
     let pcm = collect(&ring, 3.0).await;
     assert_tone(&pcm, "through the TURN server");
     for peer in [route, source] {
-        let status = daemon.status(peer).await;
+        let status = engine.status(peer).await;
         assert!(status.relayed, "{peer:?}: {status:?}");
     }
 }

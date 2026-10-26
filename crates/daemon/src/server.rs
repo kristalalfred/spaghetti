@@ -1,24 +1,16 @@
 use std::sync::{Arc, Mutex};
 
 use spaghetti_common::ipc_protocol::*;
+use spaghetti_engine::{ActivityReader, DeviceManager, FpsTracker, Router};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
-
-use crate::activity::{ActivityReader, FpsTracker};
-use crate::audio;
-use crate::device_manager::DeviceManager;
-use crate::router::Router;
-use crate::tap;
 
 /// Freshness window for the driver's last WriteMix timestamp — older than this
 /// and the activity snapshot is considered stale (driver idle or gone).
 const ACTIVITY_FRESHNESS_NS: u64 = 200_000_000;
 
 const HEALTH_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-
-#[cfg(test)]
-mod webrtc_tests;
 
 /// Shared daemon state accessible by all client handlers.
 pub struct DaemonState {
@@ -145,7 +137,7 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
             })
         }
         Request::ListApps => {
-            let apps = tap::list_audio_apps();
+            let apps = spaghetti_engine::list_audio_apps();
             Response::Apps(apps)
         }
         Request::CreateSource { source, tag } => {
@@ -235,7 +227,7 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
         }
         Request::ListDevices => Response::Devices(shared.devices.list_devices()),
         Request::GetActivity => Response::Activity(read_activity(&shared.activity)),
-        Request::ListSystemDevices => Response::SystemDevices(audio::list_all_devices()),
+        Request::ListSystemDevices => Response::SystemDevices(spaghetti_engine::list_all_devices()),
         Request::Shutdown => {
             tracing::info!("shutdown requested by client");
             shared.cancel.cancel();

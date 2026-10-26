@@ -10,30 +10,11 @@ path = "src/main.rs"
 
 [dependencies]
 spaghetti-common = { path = "../common" }
+spaghetti-engine = { path = "../engine" }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-coreaudio-sys = { version = "0.2", features = ["core_audio", "audio_toolbox"] }
-core-foundation-sys = "0.8"
-core-foundation = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
-libc = "0.2"
-uuid = { version = "1", features = ["v4", "fast-rng"] }
-rubato = { version = "5.0.1", default-features = false }
-srt-tokio = "0.4.4"
-bytes = "1"
-futures = "0.3"
-str0m = { version = "=0.24.1", default-features = false, features = ["aws-lc-rs"] }
-getrandom = "0.4"
-md-5 = "0.10"
-hmac = "0.12"
-sha1 = "0.10"
-
-[dev-dependencies]
-tokio = { version = "1", features = ["full", "test-util"] }
-
-[build-dependencies]
-cc = "1"
