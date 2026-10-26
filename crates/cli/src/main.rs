@@ -1,18 +1,19 @@
 mod client;
 mod daemon_mgmt;
+mod output;
 
 use clap::{Parser, Subcommand};
-use spaghetti_common::ipc_protocol::{
-    ActivityInfo, AppInfo, Destination, DeviceInfo, FlowState, FlowStatus, PeerRole, Request,
-    Response, RouteInfo, SourceInfo, SourceSpec, SrtMode, SrtSocket, SystemDeviceInfo, TapMode,
+use client::UNEXPECTED;
+use output::{
+    format_activity_line, print_apps, print_devices, print_error, print_logo, print_routes,
+    print_sources, print_status, print_system_devices,
 };
+use spaghetti_common::ipc_protocol::{
+    Destination, Request, Response, SourceSpec, SrtMode, SrtSocket, TapMode,
+};
+use std::error::Error;
 use std::io::{IsTerminal, Write};
-
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-fn print_logo() {
-    print!("\n{}", include_str!("logo.ans").replace("{version}", VERSION));
-}
+use std::os::unix::net::UnixStream;
 
 #[derive(Parser)]
 #[command(name = "spaghetti", about = "Route audio any way you like")]
@@ -180,283 +181,64 @@ enum DeviceAction {
     },
 }
 
-fn print_apps(apps: &[AppInfo]) {
-    if apps.is_empty() {
-        println!("No audio apps detected.");
-        return;
-    }
-    let name_w = col_width(apps.iter().map(|a| a.name.as_str()), 24);
-    println!("{:<name_w$} {:<16} BUNDLE", "NAME", "PIDS");
-    println!("{}", "-".repeat(name_w + 40));
-    for app in apps {
-        let pids = app.pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-        println!("{:<name_w$} {:<16} {}", app.name, pids, app.bundle_id.as_deref().unwrap_or("-"));
-    }
-}
-
-fn flow_label(state: FlowState) -> &'static str {
-    match state {
-        FlowState::Idle => "idle",
-        FlowState::Connecting => "connecting",
-        FlowState::Connected => "connected",
-        FlowState::Flowing => "flowing",
-        FlowState::Stalled => "stalled",
-        FlowState::Unreachable => "unreachable",
-        FlowState::Lost => "lost",
-    }
-}
-
-fn state_label(webrtc: bool, status: &FlowStatus) -> String {
-    let state = flow_label(status.state);
-    match (webrtc, &status.peer) {
-        (true, Some(_)) if status.relayed => format!("{state} (relayed)"),
-        (true, Some(_)) => format!("{state} (direct)"),
-        _ => state.to_string(),
-    }
-}
-
-fn srt_label(socket: &SrtSocket) -> String {
-    match &socket.mode {
-        SrtMode::Listen { port } => format!("srt://:{port}"),
-        SrtMode::Call { host, port } => format!("srt://{host}:{port}"),
-    }
-}
-
-fn role_label(role: PeerRole) -> &'static str {
-    match role {
-        PeerRole::Offer => "offer",
-        PeerRole::Answer => "answer",
-    }
-}
-
-fn print_sources(sources: &[SourceInfo]) {
-    if sources.is_empty() {
-        println!("No sources.");
-        return;
-    }
-    let mut sources: Vec<_> = sources.iter().collect();
-    sources.sort_by_key(|s| s.source_id);
-    let kinds: Vec<String> = sources
-        .iter()
-        .map(|source| match &source.spec {
-            SourceSpec::Tap { mode, .. } => format!("tap ({})", mode.label()),
-            SourceSpec::Srt(_) => "srt".to_string(),
-            SourceSpec::WebRtc(peer) => format!("webrtc ({})", role_label(peer.role)),
-        })
-        .collect();
-    let kind_w = col_width(kinds.iter().map(String::as_str), 12);
-    let label_w = col_width(sources.iter().map(|s| s.label.as_str()), 24);
-    println!("{:<6} {:<kind_w$} {:<label_w$} STATE", "ID", "KIND", "LABEL");
-    println!("{}", "-".repeat(kind_w + label_w + 20));
-    for (source, kind) in sources.into_iter().zip(&kinds) {
-        println!(
-            "{:<6} {:<kind_w$} {:<label_w$} {}",
-            source.source_id,
-            kind,
-            source.label,
-            state_label(matches!(source.spec, SourceSpec::WebRtc(_)), &source.status)
-        );
-    }
-}
-
-fn print_routes(routes: &[RouteInfo]) {
-    if routes.is_empty() {
-        println!("No active routes.");
-        return;
-    }
-    let mut routes: Vec<_> = routes.iter().collect();
-    routes.sort_by_key(|r| r.route_id);
-    let destinations: Vec<String> = routes
-        .iter()
-        .map(|route| match &route.destination {
-            Destination::Device { uid } => uid.clone(),
-            Destination::Srt(socket) => srt_label(socket),
-            Destination::WebRtc(peer) => format!("webrtc {} ({})", peer.link, role_label(peer.role)),
-        })
-        .collect();
-    let dest_w = col_width(destinations.iter().map(String::as_str), 30);
-    println!("{:<6} {:<7} {:<dest_w$} {:<7} STATE", "ID", "SOURCE", "DESTINATION", "VOLUME");
-    println!("{}", "-".repeat(dest_w + 34));
-    for (route, destination) in routes.into_iter().zip(&destinations) {
-        println!(
-            "{:<6} {:<7} {:<dest_w$} {:<7.2} {}",
-            route.route_id,
-            route.source_id,
-            destination,
-            route.volume,
-            state_label(
-                matches!(route.destination, Destination::WebRtc(_)),
-                &route.status
-            )
-        );
-    }
-}
-
-fn print_system_devices(devices: &[SystemDeviceInfo]) {
-    if devices.is_empty() {
-        println!("No audio devices found.");
-        return;
-    }
-    let uid_w = col_width(devices.iter().map(|d| d.uid.as_str()), 40);
-    let name_w = col_width(devices.iter().map(|d| d.name.as_str()), 24);
-    println!("{:<uid_w$} {:<name_w$} {:<8} TYPE", "UID", "NAME", "CHANNELS");
-    println!("{}", "-".repeat(uid_w + name_w + 16));
-    for d in devices {
-        let kind = if d.is_output { "output" } else { "input" };
-        println!("{:<uid_w$} {:<name_w$} {:<8} {}", d.uid, d.name, d.channels, kind);
-    }
-}
-
-fn print_devices(devices: &[DeviceInfo]) {
-    if devices.is_empty() {
-        println!("No virtual devices.");
-        return;
-    }
-    let uid_w = col_width(devices.iter().map(|d| d.uid.as_str()), 40);
-    let name_w = col_width(devices.iter().map(|d| d.name.as_str()), 24);
-    println!("{:<uid_w$} {:<name_w$} {:<8} FLAGS", "UID", "NAME", "CHANNELS");
-    println!("{}", "-".repeat(uid_w + name_w + 31));
-    for d in devices {
-        let flags = if d.is_default { "(default, protected)" } else { "" };
-        println!("{:<uid_w$} {:<name_w$} {:<8} {}", d.uid, d.name, d.channels, flags);
-    }
-}
-
-fn col_width<'a>(values: impl Iterator<Item = &'a str>, min: usize) -> usize {
-    values.map(|v| v.chars().count()).max().unwrap_or(0).max(min)
-}
-
-fn print_error(msg: &str) {
-    // Use red if the terminal likely supports ANSI colors
-    if std::env::var("TERM").is_ok() && std::env::var("NO_COLOR").is_err() {
-        eprintln!("\x1b[31merror:\x1b[0m {msg}");
+fn check_volume(volume: f32) -> Result<(), &'static str> {
+    if (0.0..=2.0).contains(&volume) {
+        Ok(())
     } else {
-        eprintln!("error: {msg}");
+        Err("volume must be between 0.0 and 2.0")
     }
 }
 
-/// Render a single status line for the monitor.
-///
-/// `tty` controls ANSI colour of the active dot; everything else is plain text.
-fn format_activity_line(info: &ActivityInfo, tty: bool) -> String {
-    let (dot, io_str) = if info.active {
-        (if tty { "\x1b[32m●\x1b[0m" } else { "●" }, "on ")
-    } else if tty {
-        ("\x1b[90m○\x1b[0m", "off")
-    } else {
-        ("○", "off")
-    };
-
-    let peak = if info.active || info.peak_db > -96.0 {
-        format!("{:>5.1} dB", info.peak_db)
-    } else {
-        "--.- dB".to_string()
-    };
-
-    format!(
-        "[spaghetti] active: {dot}  io: {io}   frames/s: {fps:<6}  peak: {peak}   total: {total}",
-        io = io_str,
-        fps = info.frames_per_second,
-        total = info.total_frames,
-    )
-}
-
-fn run_monitor() -> Result<(), Box<dyn std::error::Error>> {
+fn run_monitor(stream: UnixStream) -> Result<(), Box<dyn Error>> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(monitor_loop())
+    let result = rt.block_on(monitor_loop(stream));
+    println!();
+    result
 }
 
-async fn monitor_loop() -> Result<(), Box<dyn std::error::Error>> {
+async fn monitor_loop(mut stream: UnixStream) -> Result<(), Box<dyn Error>> {
     // Blocking Unix socket, polled from a periodic task. Using the std socket
     // keeps the CLI deps minimal; each request/response is small so blocking
     // the single-threaded runtime for the round-trip is acceptable here.
     let tty = std::io::stdout().is_terminal();
-    let mut stream = client::connect().map_err(|e| -> Box<dyn std::error::Error> {
-        if e.kind() == std::io::ErrorKind::ConnectionRefused
-            || e.kind() == std::io::ErrorKind::NotFound
-        {
-            "Daemon not running. Start it with: spaghettid".into()
-        } else {
-            format!("Failed to connect to daemon: {e}").into()
-        }
-    })?;
-
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut stdout = std::io::stdout();
 
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                println!();
-                return Ok(());
-            }
+            _ = tokio::signal::ctrl_c() => return Ok(()),
             _ = ticker.tick() => {
-                let response = client::send_request(&mut stream, &Request::GetActivity)?;
-                match response {
-                    Response::Activity(info) => {
-                        let line = format_activity_line(&info, tty);
-                        // \r + erase-to-end-of-line, then redraw without newline.
-                        write!(stdout, "\r\x1b[K{line}")?;
-                        stdout.flush()?;
-                    }
-                    Response::Error { message } => {
-                        println!();
-                        print_error(&message);
-                        std::process::exit(1);
-                    }
-                    _ => {
-                        println!();
-                        print_error("unexpected response from daemon");
-                        std::process::exit(1);
-                    }
-                }
+                let Response::Activity(info) = client::request(&mut stream, &Request::GetActivity)? else {
+                    return Err(UNEXPECTED.into());
+                };
+                let line = format_activity_line(&info, tty);
+                // \r + erase-to-end-of-line, then redraw without newline.
+                write!(stdout, "\r\x1b[K{line}")?;
+                stdout.flush()?;
             }
         }
     }
 }
 
-fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
-    let mut stream = client::connect().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::ConnectionRefused
-            || e.kind() == std::io::ErrorKind::NotFound
-        {
-            "Daemon not running. Start it with: spaghetti daemon start".to_string()
-        } else {
-            format!("Failed to connect to daemon: {e}")
-        }
-    })?;
+fn run_command(cmd: Command) -> Result<(), Box<dyn Error>> {
+    let mut stream = client::connect()?;
 
     match cmd {
         Command::Status => {
-            let response = client::send_request(&mut stream, &Request::Status)?;
-            match response {
-                Response::Status(s) => {
-                    let state = if s.running { "running" } else { "stopped" };
-                    println!("Daemon:  {state}");
-                    println!("Sources: {}", s.source_count);
-                    println!("Routes:  {}", s.route_count);
-                }
-                Response::Error { message } => {
-                    print_error(&message);
-                    std::process::exit(1);
-                }
-                _ => print_error("unexpected response from daemon"),
-            }
+            let Response::Status(status) = client::request(&mut stream, &Request::Status)? else {
+                return Err(UNEXPECTED.into());
+            };
+            print_status(&status);
         }
 
         Command::Apps => {
-            let response = client::send_request(&mut stream, &Request::ListApps)?;
-            match response {
-                Response::Apps(apps) => print_apps(&apps),
-                Response::Error { message } => {
-                    print_error(&message);
-                    std::process::exit(1);
-                }
-                _ => print_error("unexpected response from daemon"),
-            }
+            let Response::Apps(apps) = client::request(&mut stream, &Request::ListApps)? else {
+                return Err(UNEXPECTED.into());
+            };
+            print_apps(&apps);
         }
 
         Command::Tap { target, mute } => {
@@ -466,69 +248,39 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
             let pids = if let Ok(pid) = target.parse::<u32>() {
                 vec![pid]
             } else {
-                let response = client::send_request(&mut stream, &Request::ListApps)?;
-                let apps = match response {
-                    Response::Apps(apps) => apps,
-                    Response::Error { message } => {
-                        print_error(&message);
-                        std::process::exit(1);
-                    }
-                    _ => {
-                        print_error("unexpected response from daemon");
-                        std::process::exit(1);
-                    }
+                let Response::Apps(apps) = client::request(&mut stream, &Request::ListApps)? else {
+                    return Err(UNEXPECTED.into());
                 };
-
                 let needle = target.to_lowercase();
-                let matched = apps
-                    .iter()
+                apps.iter()
                     .find(|a| a.name.to_lowercase() == needle)
-                    .or_else(|| apps.iter().find(|a| a.name.to_lowercase().contains(&needle)));
-
-                match matched {
-                    Some(app) => app.pids.clone(),
-                    None => {
-                        print_error(&format!("no app matching '{target}' found"));
-                        std::process::exit(1);
-                    }
-                }
+                    .or_else(|| apps.iter().find(|a| a.name.to_lowercase().contains(&needle)))
+                    .map(|app| app.pids.clone())
+                    .ok_or_else(|| format!("no app matching '{target}' found"))?
             };
 
-            let source = SourceSpec::Tap { pids, mode };
-            create_source(&mut stream, source)?;
+            create_source(&mut stream, SourceSpec::Tap { pids, mode })?;
         }
 
         Command::Receive { url, srt } => {
-            let source = SourceSpec::Srt(srt.socket(&url).unwrap_or_else(|e| {
-                print_error(&e);
-                std::process::exit(1);
-            }));
-            create_source(&mut stream, source)?;
+            create_source(&mut stream, SourceSpec::Srt(srt.socket(&url)?))?;
         }
 
         Command::Unsource { source_id } => {
-            let response =
-                client::send_request(&mut stream, &Request::DestroySource { source_id })?;
-            match response {
-                Response::Ok => println!("Source {source_id} removed."),
-                Response::Error { message } => {
-                    print_error(&message);
-                    std::process::exit(1);
-                }
-                _ => print_error("unexpected response from daemon"),
-            }
+            let Response::Ok =
+                client::request(&mut stream, &Request::DestroySource { source_id })?
+            else {
+                return Err(UNEXPECTED.into());
+            };
+            println!("Source {source_id} removed.");
         }
 
         Command::Sources => {
-            let response = client::send_request(&mut stream, &Request::ListSources)?;
-            match response {
-                Response::Sources(sources) => print_sources(&sources),
-                Response::Error { message } => {
-                    print_error(&message);
-                    std::process::exit(1);
-                }
-                _ => print_error("unexpected response from daemon"),
-            }
+            let Response::Sources(sources) = client::request(&mut stream, &Request::ListSources)?
+            else {
+                return Err(UNEXPECTED.into());
+            };
+            print_sources(&sources);
         }
 
         Command::Route {
@@ -537,168 +289,108 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
             volume,
             srt,
         } => {
-            if !(0.0..=2.0).contains(&volume) {
-                print_error("volume must be between 0.0 and 2.0");
-                std::process::exit(1);
-            }
+            check_volume(volume)?;
             if srt.is_set() && !destination.starts_with("srt://") {
-                print_error("--latency and --passphrase apply only to srt:// destinations");
-                std::process::exit(1);
+                return Err("--latency and --passphrase apply only to srt:// destinations".into());
             }
             let destination = if destination.starts_with("srt://") {
-                Destination::Srt(srt.socket(&destination).unwrap_or_else(|e| {
-                    print_error(&e);
-                    std::process::exit(1);
-                }))
+                Destination::Srt(srt.socket(&destination)?)
             } else {
                 Destination::Device { uid: destination }
             };
-            let response = client::send_request(
+            let Response::RouteCreated { route_id } = client::request(
                 &mut stream,
                 &Request::CreateRoute {
                     source_id,
                     destination,
                     volume,
                 },
-            )?;
-            match response {
-                Response::RouteCreated { route_id } => {
-                    println!("Route created: id={route_id}");
-                }
-                Response::Error { message } => {
-                    print_error(&message);
-                    std::process::exit(1);
-                }
-                _ => print_error("unexpected response from daemon"),
-            }
+            )?
+            else {
+                return Err(UNEXPECTED.into());
+            };
+            println!("Route created: id={route_id}");
         }
 
         Command::Unroute { route_id } => {
-            let response =
-                client::send_request(&mut stream, &Request::DestroyRoute { route_id })?;
-            match response {
-                Response::Ok => println!("Route {route_id} removed."),
-                Response::Error { message } => {
-                    print_error(&message);
-                    std::process::exit(1);
-                }
-                _ => print_error("unexpected response from daemon"),
-            }
+            let Response::Ok = client::request(&mut stream, &Request::DestroyRoute { route_id })?
+            else {
+                return Err(UNEXPECTED.into());
+            };
+            println!("Route {route_id} removed.");
         }
 
         Command::Routes => {
-            let response = client::send_request(&mut stream, &Request::ListRoutes)?;
-            match response {
-                Response::Routes(routes) => print_routes(&routes),
-                Response::Error { message } => {
-                    print_error(&message);
-                    std::process::exit(1);
-                }
-                _ => print_error("unexpected response from daemon"),
-            }
+            let Response::Routes(routes) = client::request(&mut stream, &Request::ListRoutes)?
+            else {
+                return Err(UNEXPECTED.into());
+            };
+            print_routes(&routes);
         }
 
         Command::Volume { route_id, level } => {
-            if !(0.0..=2.0).contains(&level) {
-                print_error("volume must be between 0.0 and 2.0");
-                std::process::exit(1);
-            }
-            let response = client::send_request(
+            check_volume(level)?;
+            let Response::Ok = client::request(
                 &mut stream,
                 &Request::SetVolume {
                     route_id,
                     volume: level,
                 },
-            )?;
-            match response {
-                Response::Ok => println!("Volume for route {route_id} set to {level:.2}."),
-                Response::Error { message } => {
-                    print_error(&message);
-                    std::process::exit(1);
-                }
-                _ => print_error("unexpected response from daemon"),
-            }
+            )?
+            else {
+                return Err(UNEXPECTED.into());
+            };
+            println!("Volume for route {route_id} set to {level:.2}.");
         }
 
         Command::Devices { action } => match action {
             None => {
-                let response =
-                    client::send_request(&mut stream, &Request::ListDevices)?;
-                match response {
-                    Response::Devices(devices) => print_devices(&devices),
-                    Response::Error { message } => {
-                        print_error(&message);
-                        std::process::exit(1);
-                    }
-                    _ => print_error("unexpected response from daemon"),
-                }
+                let Response::Devices(devices) =
+                    client::request(&mut stream, &Request::ListDevices)?
+                else {
+                    return Err(UNEXPECTED.into());
+                };
+                print_devices(&devices);
             }
             Some(DeviceAction::Create { name, channels }) => {
-                let response = client::send_request(
+                let Response::DeviceCreated { device_uid } = client::request(
                     &mut stream,
                     &Request::CreateDevice {
                         name,
                         channels: Some(channels),
                     },
-                )?;
-                match response {
-                    Response::DeviceCreated { device_uid } => {
-                        println!("Device created: {device_uid}");
-                    }
-                    Response::Error { message } => {
-                        print_error(&message);
-                        std::process::exit(1);
-                    }
-                    _ => print_error("unexpected response from daemon"),
-                }
+                )?
+                else {
+                    return Err(UNEXPECTED.into());
+                };
+                println!("Device created: {device_uid}");
             }
             Some(DeviceAction::Destroy { uid }) => {
-                let response = client::send_request(
-                    &mut stream,
-                    &Request::DestroyDevice { device_uid: uid },
-                )?;
-                match response {
-                    Response::Ok => println!("Device destroyed."),
-                    Response::Error { message } => {
-                        print_error(&message);
-                        std::process::exit(1);
-                    }
-                    _ => print_error("unexpected response from daemon"),
-                }
+                let Response::Ok =
+                    client::request(&mut stream, &Request::DestroyDevice { device_uid: uid })?
+                else {
+                    return Err(UNEXPECTED.into());
+                };
+                println!("Device destroyed.");
             }
         },
 
         Command::SystemDevices => {
-            let response =
-                client::send_request(&mut stream, &Request::ListSystemDevices)?;
-            match response {
-                Response::SystemDevices(devices) => print_system_devices(&devices),
-                Response::Error { message } => {
-                    print_error(&message);
-                    std::process::exit(1);
-                }
-                _ => print_error("unexpected response from daemon"),
-            }
+            let Response::SystemDevices(devices) =
+                client::request(&mut stream, &Request::ListSystemDevices)?
+            else {
+                return Err(UNEXPECTED.into());
+            };
+            print_system_devices(&devices);
         }
 
-        Command::Monitor => {
-            // Monitor owns its own connection lifecycle and loops until Ctrl-C,
-            // so hand off to a dedicated function rather than fitting it into
-            // the single-request shape of the other commands.
-            drop(stream);
-            return run_monitor();
-        }
+        Command::Monitor => return run_monitor(stream),
 
         Command::Shutdown => {
-            let response = client::send_request(&mut stream, &Request::Shutdown)?;
-            match response {
-                Response::Ok => println!("Daemon shut down."),
-                Response::Error { message } => {
-                    print_error(&message);
-                    std::process::exit(1);
-                }
-                _ => print_error("unexpected response from daemon"),
-            }
+            let Response::Ok = client::request(&mut stream, &Request::Shutdown)? else {
+                return Err(UNEXPECTED.into());
+            };
+            println!("Daemon shut down.");
         }
 
         Command::Daemon { .. } => unreachable!("daemon commands handled in main"),
@@ -707,52 +399,45 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn create_source(
-    stream: &mut std::os::unix::net::UnixStream,
-    source: SourceSpec,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match client::send_request(stream, &Request::CreateSource { source, tag: None })? {
-        Response::SourceCreated { source_id } => println!("Source created: id={source_id}"),
-        Response::Error { message } => {
-            print_error(&message);
-            std::process::exit(1);
-        }
-        _ => print_error("unexpected response from daemon"),
-    }
+fn create_source(stream: &mut UnixStream, source: SourceSpec) -> Result<(), Box<dyn Error>> {
+    let Response::SourceCreated { source_id } =
+        client::request(stream, &Request::CreateSource { source, tag: None })?
+    else {
+        return Err(UNEXPECTED.into());
+    };
+    println!("Source created: id={source_id}");
     Ok(())
+}
+
+fn run_daemon(action: DaemonAction) -> Result<(), String> {
+    match action {
+        DaemonAction::Install => daemon_mgmt::install(),
+        DaemonAction::Uninstall => daemon_mgmt::uninstall(),
+        DaemonAction::Start => daemon_mgmt::start(),
+        DaemonAction::Stop => daemon_mgmt::stop(),
+        DaemonAction::Restart => daemon_mgmt::restart(),
+        DaemonAction::Status => daemon_mgmt::status(),
+        DaemonAction::Logs { follow, lines } => daemon_mgmt::logs(follow, lines),
+    }
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    match cli.command {
+    let result = match cli.command {
         None => {
             print_logo();
             println!("\nRun 'spaghetti --help' for usage.\n");
+            Ok(())
         }
         // Daemon-management commands don't talk to the daemon socket; they
         // shell out to launchctl / tail. Handle them before `run_command` so
         // they work even when the daemon is not running.
-        Some(Command::Daemon { action }) => {
-            let result = match action {
-                DaemonAction::Install => daemon_mgmt::install(),
-                DaemonAction::Uninstall => daemon_mgmt::uninstall(),
-                DaemonAction::Start => daemon_mgmt::start(),
-                DaemonAction::Stop => daemon_mgmt::stop(),
-                DaemonAction::Restart => daemon_mgmt::restart(),
-                DaemonAction::Status => daemon_mgmt::status(),
-                DaemonAction::Logs { follow, lines } => daemon_mgmt::logs(follow, lines),
-            };
-            if let Err(e) = result {
-                print_error(&e);
-                std::process::exit(1);
-            }
-        }
-        Some(cmd) => {
-            if let Err(e) = run_command(cmd) {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
-        }
+        Some(Command::Daemon { action }) => run_daemon(action).map_err(Into::into),
+        Some(cmd) => run_command(cmd),
+    };
+    if let Err(e) = result {
+        print_error(&e.to_string());
+        std::process::exit(1);
     }
 }
