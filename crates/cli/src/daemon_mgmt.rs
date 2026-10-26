@@ -5,6 +5,8 @@
 //! embedded at compile time and rendered with the daemon's path and the user's
 //! log path on install.
 
+use crate::output::Output;
+use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -69,7 +71,7 @@ fn service_target() -> Result<String, String> {
     Ok(format!("gui/{}/{AGENT_LABEL}", uid()?))
 }
 
-pub fn install() -> Result<(), String> {
+pub fn install(out: Output) -> Result<(), String> {
     let log_dir = log_dir()?;
     fs::create_dir_all(&log_dir).map_err(|e| format!("create {}: {e}", log_dir.display()))?;
 
@@ -117,13 +119,13 @@ pub fn install() -> Result<(), String> {
         .stderr(Stdio::null())
         .status();
 
-    println!("Daemon agent installed and started.");
-    println!("  Plist: {}", plist.display());
-    println!("  Logs:  {}", log.display());
+    out.note("Daemon agent installed and started.");
+    out.note(format_args!("  Plist: {}", plist.display()));
+    out.note(format_args!("  Logs:  {}", log.display()));
     Ok(())
 }
 
-pub fn uninstall() -> Result<(), String> {
+pub fn uninstall(out: Output) -> Result<(), String> {
     let _ = Command::new("launchctl")
         .args(["bootout", &service_target()?])
         .stdout(Stdio::null())
@@ -134,11 +136,11 @@ pub fn uninstall() -> Result<(), String> {
     if plist.exists() {
         fs::remove_file(&plist).map_err(|e| format!("remove {}: {e}", plist.display()))?;
     }
-    println!("Daemon agent uninstalled.");
+    out.note("Daemon agent uninstalled.");
     Ok(())
 }
 
-pub fn start() -> Result<(), String> {
+pub fn start(out: Output) -> Result<(), String> {
     let plist = plist_path()?;
     if !plist.exists() {
         return Err("Agent not installed. Run `spaghetti daemon install` first.".into());
@@ -162,25 +164,25 @@ pub fn start() -> Result<(), String> {
     if !status.success() {
         return Err("launchctl kickstart failed".into());
     }
-    println!("Daemon started.");
+    out.note("Daemon started.");
     Ok(())
 }
 
-pub fn stop() -> Result<(), String> {
+pub fn stop(out: Output) -> Result<(), String> {
     // bootout disables KeepAlive restart until the next `start` or login.
     let status = Command::new("launchctl")
         .args(["bootout", &service_target()?])
         .status()
         .map_err(|e| format!("launchctl bootout: {e}"))?;
     if !status.success() {
-        println!("Daemon was not running.");
+        out.note("Daemon was not running.");
     } else {
-        println!("Daemon stopped.");
+        out.note("Daemon stopped.");
     }
     Ok(())
 }
 
-pub fn restart() -> Result<(), String> {
+pub fn restart(out: Output) -> Result<(), String> {
     let status = Command::new("launchctl")
         .args(["kickstart", "-k", &service_target()?])
         .status()
@@ -191,57 +193,91 @@ pub fn restart() -> Result<(), String> {
                 .into(),
         );
     }
-    println!("Daemon restarted.");
+    out.note("Daemon restarted.");
     Ok(())
 }
 
-pub fn status() -> Result<(), String> {
+#[derive(Serialize)]
+struct AgentStatus {
+    installed: bool,
+    loaded: bool,
+    state: Option<String>,
+    pid: Option<u32>,
+    last_exit_code: Option<i32>,
+    plist: PathBuf,
+    log: PathBuf,
+}
+
+pub fn status(out: Output) -> Result<(), String> {
+    let status = agent_status()?;
+    out.emit(&status, || print_agent_status(&status))
+        .map_err(|e| e.to_string())
+}
+
+fn agent_status() -> Result<AgentStatus, String> {
     let plist = plist_path()?;
-    if !plist.exists() {
-        println!("Agent:  not installed");
-        println!("        Run `spaghetti daemon install` to install the LaunchAgent.");
-        return Ok(());
+    let mut status = AgentStatus {
+        installed: plist.exists(),
+        loaded: false,
+        state: None,
+        pid: None,
+        last_exit_code: None,
+        plist,
+        log: log_path()?,
+    };
+    if !status.installed {
+        return Ok(status);
     }
 
-    let out = Command::new("launchctl")
+    let print = Command::new("launchctl")
         .args(["print", &service_target()?])
         .output()
         .map_err(|e| format!("launchctl print: {e}"))?;
-
-    if !out.status.success() {
-        println!("Agent:  installed but not loaded");
-        println!("Plist:  {}", plist.display());
-        println!("        Run `spaghetti daemon start` to load it.");
-        return Ok(());
+    if !print.status.success() {
+        return Ok(status);
     }
+    status.loaded = true;
 
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut pid = None;
-    let mut state = None;
-    let mut last_exit = None;
+    let text = String::from_utf8_lossy(&print.stdout);
     for line in text.lines() {
         let Some(property) = line.strip_prefix('\t').filter(|p| !p.starts_with('\t')) else {
             continue;
         };
         let trimmed = property.trim();
         if let Some(rest) = trimmed.strip_prefix("pid = ") {
-            pid = Some(rest.trim().to_string());
+            status.pid = rest.trim().parse().ok();
         } else if let Some(rest) = trimmed.strip_prefix("state = ") {
-            state = Some(rest.trim().to_string());
+            status.state = Some(rest.trim().to_string());
         } else if let Some(rest) = trimmed.strip_prefix("last exit code = ") {
-            last_exit = Some(rest.trim().to_string());
+            status.last_exit_code = rest.split(':').next().and_then(|code| code.trim().parse().ok());
         }
     }
+    Ok(status)
+}
 
+fn print_agent_status(status: &AgentStatus) {
+    if !status.installed {
+        println!("Agent:  not installed");
+        println!("        Run `spaghetti daemon install` to install the LaunchAgent.");
+        return;
+    }
+    if !status.loaded {
+        println!("Agent:  installed but not loaded");
+        println!("Plist:  {}", status.plist.display());
+        println!("        Run `spaghetti daemon start` to load it.");
+        return;
+    }
     println!("Agent:  installed");
-    println!("State:  {}", state.as_deref().unwrap_or("unknown"));
-    println!("PID:    {}", pid.as_deref().unwrap_or("-"));
-    if let Some(code) = last_exit {
+    println!("State:  {}", status.state.as_deref().unwrap_or("unknown"));
+    match status.pid {
+        Some(pid) => println!("PID:    {pid}"),
+        None => println!("PID:    -"),
+    }
+    if let Some(code) = status.last_exit_code {
         println!("Exit:   {code}");
     }
-    println!("Plist:  {}", plist.display());
-    println!("Logs:   {}", log_path()?.display());
-    Ok(())
+    println!("Plist:  {}", status.plist.display());
+    println!("Logs:   {}", status.log.display());
 }
 
 pub fn logs(follow: bool, lines: usize) -> Result<(), String> {

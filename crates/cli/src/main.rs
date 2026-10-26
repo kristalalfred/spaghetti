@@ -5,19 +5,23 @@ mod output;
 use clap::{Parser, Subcommand};
 use client::UNEXPECTED;
 use output::{
-    format_activity_line, print_apps, print_devices, print_error, print_logo, print_routes,
-    print_sources, print_status, print_system_devices,
+    Output, RouteJson, SourceJson, format_activity_line, print_apps, print_devices, print_error,
+    print_logo, print_routes, print_sources, print_status, print_system_devices,
 };
+use serde_json::json;
 use spaghetti_common::ipc_protocol::{
     Destination, Request, Response, SourceSpec, SrtMode, SrtSocket, TapMode,
 };
 use std::error::Error;
-use std::io::{IsTerminal, Write};
+use std::io::{ErrorKind, IsTerminal, Write};
 use std::os::unix::net::UnixStream;
 
 #[derive(Parser)]
 #[command(name = "spaghetti", about = "Route audio any way you like")]
 struct Cli {
+    /// Print JSON instead of text, one line per reading for monitor
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -189,16 +193,18 @@ fn check_volume(volume: f32) -> Result<(), &'static str> {
     }
 }
 
-fn run_monitor(stream: UnixStream) -> Result<(), Box<dyn Error>> {
+fn run_monitor(stream: UnixStream, out: Output) -> Result<(), Box<dyn Error>> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let result = rt.block_on(monitor_loop(stream));
-    println!();
+    let result = rt.block_on(monitor_loop(stream, out));
+    if out == Output::Text {
+        let _ = writeln!(std::io::stdout());
+    }
     result
 }
 
-async fn monitor_loop(mut stream: UnixStream) -> Result<(), Box<dyn Error>> {
+async fn monitor_loop(mut stream: UnixStream, out: Output) -> Result<(), Box<dyn Error>> {
     // Blocking Unix socket, polled from a periodic task. Using the std socket
     // keeps the CLI deps minimal; each request/response is small so blocking
     // the single-threaded runtime for the round-trip is acceptable here.
@@ -214,16 +220,21 @@ async fn monitor_loop(mut stream: UnixStream) -> Result<(), Box<dyn Error>> {
                 let Response::Activity(info) = client::request(&mut stream, &Request::GetActivity)? else {
                     return Err(UNEXPECTED.into());
                 };
-                let line = format_activity_line(&info, tty);
-                // \r + erase-to-end-of-line, then redraw without newline.
-                write!(stdout, "\r\x1b[K{line}")?;
-                stdout.flush()?;
+                let written = match out {
+                    // \r + erase-to-end-of-line, then redraw without newline.
+                    Output::Text => write!(stdout, "\r\x1b[K{}", format_activity_line(&info, tty)),
+                    Output::Json => writeln!(stdout, "{}", serde_json::to_string(&info)?),
+                };
+                match written.and_then(|()| stdout.flush()) {
+                    Err(e) if e.kind() == ErrorKind::BrokenPipe => return Ok(()),
+                    result => result?,
+                }
             }
         }
     }
 }
 
-fn run_command(cmd: Command) -> Result<(), Box<dyn Error>> {
+fn run_command(cmd: Command, out: Output) -> Result<(), Box<dyn Error>> {
     let mut stream = client::connect()?;
 
     match cmd {
@@ -231,14 +242,14 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn Error>> {
             let Response::Status(status) = client::request(&mut stream, &Request::Status)? else {
                 return Err(UNEXPECTED.into());
             };
-            print_status(&status);
+            out.emit(&status, || print_status(&status))?;
         }
 
         Command::Apps => {
             let Response::Apps(apps) = client::request(&mut stream, &Request::ListApps)? else {
                 return Err(UNEXPECTED.into());
             };
-            print_apps(&apps);
+            out.emit(&apps, || print_apps(&apps))?;
         }
 
         Command::Tap { target, mute } => {
@@ -259,11 +270,11 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn Error>> {
                     .ok_or_else(|| format!("no app matching '{target}' found"))?
             };
 
-            create_source(&mut stream, SourceSpec::Tap { pids, mode })?;
+            create_source(&mut stream, out, SourceSpec::Tap { pids, mode })?;
         }
 
         Command::Receive { url, srt } => {
-            create_source(&mut stream, SourceSpec::Srt(srt.socket(&url)?))?;
+            create_source(&mut stream, out, SourceSpec::Srt(srt.socket(&url)?))?;
         }
 
         Command::Unsource { source_id } => {
@@ -272,15 +283,18 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn Error>> {
             else {
                 return Err(UNEXPECTED.into());
             };
-            println!("Source {source_id} removed.");
+            out.note(format_args!("Source {source_id} removed."));
         }
 
         Command::Sources => {
-            let Response::Sources(sources) = client::request(&mut stream, &Request::ListSources)?
+            let Response::Sources(mut sources) =
+                client::request(&mut stream, &Request::ListSources)?
             else {
                 return Err(UNEXPECTED.into());
             };
-            print_sources(&sources);
+            sources.sort_by_key(|s| s.source_id);
+            let json: Vec<_> = sources.iter().map(SourceJson::from).collect();
+            out.emit(&json, || print_sources(&sources))?;
         }
 
         Command::Route {
@@ -309,7 +323,9 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn Error>> {
             else {
                 return Err(UNEXPECTED.into());
             };
-            println!("Route created: id={route_id}");
+            out.emit(&json!({ "route_id": route_id }), || {
+                println!("Route created: id={route_id}")
+            })?;
         }
 
         Command::Unroute { route_id } => {
@@ -317,15 +333,17 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn Error>> {
             else {
                 return Err(UNEXPECTED.into());
             };
-            println!("Route {route_id} removed.");
+            out.note(format_args!("Route {route_id} removed."));
         }
 
         Command::Routes => {
-            let Response::Routes(routes) = client::request(&mut stream, &Request::ListRoutes)?
+            let Response::Routes(mut routes) = client::request(&mut stream, &Request::ListRoutes)?
             else {
                 return Err(UNEXPECTED.into());
             };
-            print_routes(&routes);
+            routes.sort_by_key(|r| r.route_id);
+            let json: Vec<_> = routes.iter().map(RouteJson::from).collect();
+            out.emit(&json, || print_routes(&routes))?;
         }
 
         Command::Volume { route_id, level } => {
@@ -340,7 +358,7 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn Error>> {
             else {
                 return Err(UNEXPECTED.into());
             };
-            println!("Volume for route {route_id} set to {level:.2}.");
+            out.note(format_args!("Volume for route {route_id} set to {level:.2}."));
         }
 
         Command::Devices { action } => match action {
@@ -350,7 +368,7 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn Error>> {
                 else {
                     return Err(UNEXPECTED.into());
                 };
-                print_devices(&devices);
+                out.emit(&devices, || print_devices(&devices))?;
             }
             Some(DeviceAction::Create { name, channels }) => {
                 let Response::DeviceCreated { device_uid } = client::request(
@@ -363,7 +381,9 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn Error>> {
                 else {
                     return Err(UNEXPECTED.into());
                 };
-                println!("Device created: {device_uid}");
+                out.emit(&json!({ "uid": device_uid }), || {
+                    println!("Device created: {device_uid}")
+                })?;
             }
             Some(DeviceAction::Destroy { uid }) => {
                 let Response::Ok =
@@ -371,7 +391,7 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn Error>> {
                 else {
                     return Err(UNEXPECTED.into());
                 };
-                println!("Device destroyed.");
+                out.note("Device destroyed.");
             }
         },
 
@@ -381,16 +401,16 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn Error>> {
             else {
                 return Err(UNEXPECTED.into());
             };
-            print_system_devices(&devices);
+            out.emit(&devices, || print_system_devices(&devices))?;
         }
 
-        Command::Monitor => return run_monitor(stream),
+        Command::Monitor => return run_monitor(stream, out),
 
         Command::Shutdown => {
             let Response::Ok = client::request(&mut stream, &Request::Shutdown)? else {
                 return Err(UNEXPECTED.into());
             };
-            println!("Daemon shut down.");
+            out.note("Daemon shut down.");
         }
 
         Command::Daemon { .. } => unreachable!("daemon commands handled in main"),
@@ -399,30 +419,40 @@ fn run_command(cmd: Command) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn create_source(stream: &mut UnixStream, source: SourceSpec) -> Result<(), Box<dyn Error>> {
+fn create_source(
+    stream: &mut UnixStream,
+    out: Output,
+    source: SourceSpec,
+) -> Result<(), Box<dyn Error>> {
     let Response::SourceCreated { source_id } =
         client::request(stream, &Request::CreateSource { source, tag: None })?
     else {
         return Err(UNEXPECTED.into());
     };
-    println!("Source created: id={source_id}");
+    out.emit(&json!({ "source_id": source_id }), || {
+        println!("Source created: id={source_id}")
+    })?;
     Ok(())
 }
 
-fn run_daemon(action: DaemonAction) -> Result<(), String> {
+fn run_daemon(action: DaemonAction, out: Output) -> Result<(), String> {
     match action {
-        DaemonAction::Install => daemon_mgmt::install(),
-        DaemonAction::Uninstall => daemon_mgmt::uninstall(),
-        DaemonAction::Start => daemon_mgmt::start(),
-        DaemonAction::Stop => daemon_mgmt::stop(),
-        DaemonAction::Restart => daemon_mgmt::restart(),
-        DaemonAction::Status => daemon_mgmt::status(),
+        DaemonAction::Install => daemon_mgmt::install(out),
+        DaemonAction::Uninstall => daemon_mgmt::uninstall(out),
+        DaemonAction::Start => daemon_mgmt::start(out),
+        DaemonAction::Stop => daemon_mgmt::stop(out),
+        DaemonAction::Restart => daemon_mgmt::restart(out),
+        DaemonAction::Status => daemon_mgmt::status(out),
+        DaemonAction::Logs { .. } if out == Output::Json => {
+            Err("daemon logs has no JSON output".into())
+        }
         DaemonAction::Logs { follow, lines } => daemon_mgmt::logs(follow, lines),
     }
 }
 
 fn main() {
     let cli = Cli::parse();
+    let out = if cli.json { Output::Json } else { Output::Text };
 
     let result = match cli.command {
         None => {
@@ -433,8 +463,8 @@ fn main() {
         // Daemon-management commands don't talk to the daemon socket; they
         // shell out to launchctl / tail. Handle them before `run_command` so
         // they work even when the daemon is not running.
-        Some(Command::Daemon { action }) => run_daemon(action).map_err(Into::into),
-        Some(cmd) => run_command(cmd),
+        Some(Command::Daemon { action }) => run_daemon(action, out).map_err(Into::into),
+        Some(cmd) => run_command(cmd, out),
     };
     if let Err(e) = result {
         print_error(&e.to_string());
