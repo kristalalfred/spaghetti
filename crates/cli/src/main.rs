@@ -134,7 +134,7 @@ enum Command {
     },
     /// Stream live driver activity (frames/s, peak dB)
     Monitor,
-    /// List all CoreAudio output devices visible to the system
+    /// List all Core Audio devices visible to the system
     SystemDevices,
     /// Shut down the daemon
     Shutdown,
