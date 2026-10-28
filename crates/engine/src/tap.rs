@@ -370,17 +370,17 @@ fn get_process_name(pid: u32) -> Option<String> {
     }
 }
 
-/// Claude: the processes Core Audio knows, grouped under the app bundle each
-/// runs from. A helper inside `Slack.app/Contents/Frameworks/...` belongs to
-/// Slack; a process outside any `.app` is listed alone.
+/// Claude: the processes Core Audio knows, grouped under the app each plays
+/// for. A helper inside `Slack.app/Contents/Frameworks/...` belongs to Slack, a
+/// system XPC service such as WebKit's GPU process belongs to the app
+/// responsible for it, and any other process outside an `.app` is listed alone.
 pub fn list_audio_apps() -> Vec<AppInfo> {
     let mut apps: BTreeMap<String, AppInfo> = BTreeMap::new();
     for pid in audio_process_pids() {
-        let executable = process_path(pid);
-        match executable.as_deref().and_then(app_bundle) {
+        match owning_app_bundle(pid) {
             Some(bundle) => apps
-                .entry(bundle.to_string())
-                .or_insert_with(|| bundle_app(bundle))
+                .entry(bundle.clone())
+                .or_insert_with(|| bundle_app(&bundle))
                 .pids
                 .push(pid),
             None => {
@@ -405,17 +405,41 @@ pub fn list_audio_apps() -> Vec<AppInfo> {
 }
 
 fn app_label(pid: u32) -> String {
-    process_path(pid)
-        .as_deref()
-        .and_then(app_bundle)
-        .map(|bundle| bundle_app(bundle).name)
+    owning_app_bundle(pid)
+        .map(|bundle| bundle_app(&bundle).name)
         .or_else(|| get_process_name(pid))
         .unwrap_or_else(|| format!("PID {pid}"))
+}
+
+unsafe extern "C" {
+    unsafe fn responsibility_get_pid_responsible_for_pid(pid: libc::pid_t) -> libc::pid_t;
+}
+
+fn owning_app_bundle(pid: u32) -> Option<String> {
+    let executable = process_path(pid)?;
+    if let Some(bundle) = app_bundle(&executable) {
+        return Some(bundle.to_string());
+    }
+    if !is_xpc_service(&executable) {
+        return None;
+    }
+    let responsible = unsafe { responsibility_get_pid_responsible_for_pid(pid as libc::pid_t) };
+    if responsible <= 0 || responsible as u32 == pid {
+        return None;
+    }
+    process_path(responsible as u32)
+        .as_deref()
+        .and_then(app_bundle)
+        .map(str::to_string)
 }
 
 /// Claude: the outermost `.app` bundle in an executable's path.
 fn app_bundle(executable: &str) -> Option<&str> {
     executable.find(".app/").map(|end| &executable[..end + 4])
+}
+
+fn is_xpc_service(executable: &str) -> bool {
+    executable.contains(".xpc/")
 }
 
 fn bundle_app(bundle: &str) -> AppInfo {
@@ -536,6 +560,15 @@ mod tests {
         );
         assert_eq!(app_bundle("/usr/sbin/coreaudiod"), None);
         assert_eq!(app_bundle("/Applications/Weird.application/bin/x"), None);
+    }
+
+    #[test]
+    fn system_xpc_services_are_told_apart_from_other_processes() {
+        assert!(is_xpc_service(
+            "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU"
+        ));
+        assert!(!is_xpc_service("/usr/bin/afplay"));
+        assert!(!is_xpc_service("/usr/libexec/audiomxd"));
     }
 
     #[test]
