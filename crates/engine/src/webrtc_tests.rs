@@ -439,8 +439,8 @@ impl Shim {
         }
     }
 
-    /// Claude: rewrites a description so its sender's host candidate is this
-    /// shim, and drops the other candidates.
+    /// Claude: rewrites a description so its sender's first host candidate is
+    /// this shim, and drops the other candidates.
     fn carry(&self, sdp: &str, from_offerer: bool) -> String {
         let address = if from_offerer {
             self.as_offerer
@@ -453,7 +453,9 @@ impl Shim {
                     return Some(line.to_string());
                 }
                 let mut fields: Vec<String> = line.split(' ').map(String::from).collect();
-                if fields.get(7).map(String::as_str) != Some("host") {
+                let first_host = fields.get(7).map(String::as_str) == Some("host")
+                    && fields.get(4) == Some(&host_candidate(sdp).ip().to_string());
+                if !first_host {
                     return None;
                 }
                 fields[4] = address.ip().to_string();
@@ -465,15 +467,30 @@ impl Shim {
     }
 }
 
-fn host_candidate(sdp: &str) -> SocketAddr {
+/// Claude: in the order offered, which is the order of preference, the
+/// default route's first.
+fn host_candidates(sdp: &str) -> Vec<SocketAddr> {
     sdp.split("\r\n")
         .filter(|line| line.starts_with("a=candidate:"))
-        .find_map(|line| {
+        .filter_map(|line| {
             let fields: Vec<&str> = line.split(' ').collect();
             (fields.get(7) == Some(&"host"))
                 .then(|| SocketAddr::new(fields[4].parse().unwrap(), fields[5].parse().unwrap()))
         })
+        .collect()
+}
+
+fn host_candidate(sdp: &str) -> SocketAddr {
+    host_candidates(sdp)
+        .into_iter()
+        .next()
         .expect("a host candidate")
+}
+
+fn is_host_candidate(sdp: &str, peer: &Option<String>) -> bool {
+    host_candidates(sdp)
+        .iter()
+        .any(|candidate| Some(candidate.to_string()) == *peer)
 }
 
 /// Claude: a STUN server that answers each request at once with `mapped`, and
@@ -556,9 +573,29 @@ async fn an_offered_route_and_an_answering_source_carry_a_stereo_tone() {
         "{sent:?} {received:?}"
     );
     assert_eq!(received.packets_lost, 0);
-    assert_eq!(received.peer, Some(host_candidate(&offer).to_string()));
-    assert_eq!(sent.peer, Some(host_candidate(&answer).to_string()));
+    assert!(is_host_candidate(&offer, &received.peer), "{received:?}");
+    assert!(is_host_candidate(&answer, &sent.peer), "{sent:?}");
     assert!(!sent.relayed && !received.relayed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_offers_a_host_candidate_on_every_interface_the_default_route_first() {
+    let engine = Engine::new();
+    let route = PeerRef::Route(
+        engine
+            .create_route(engine.fixture(48000.0).0, peer(PeerRole::Offer, "hosts"))
+            .await,
+    );
+    let offer = engine.description(route).await;
+    let offered: Vec<_> = host_candidates(&offer).iter().map(SocketAddr::ip).collect();
+    let mut interfaces = crate::webrtc::interface_ipv4s();
+    if let Ok(primary) = crate::webrtc::default_route_ipv4() {
+        assert_eq!(offered.first(), Some(&primary.into()), "{offer}");
+        interfaces.retain(|address| *address != primary);
+    }
+    for address in interfaces {
+        assert!(offered.contains(&address.into()), "{address}: {offer}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

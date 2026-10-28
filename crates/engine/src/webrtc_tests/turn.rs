@@ -457,7 +457,7 @@ async fn one_end_relaying(settings: Settings, relaying: PeerRole, name: &str) {
         "{restricted}"
     );
     let open = engine.description(open_end).await;
-    let open_host = host_candidate(&open);
+    let open_hosts = host_candidates(&open);
     assert!(open.contains("typ relay"), "{open}");
 
     for peer in [route, source] {
@@ -477,8 +477,11 @@ async fn one_end_relaying(settings: Settings, relaying: PeerRole, name: &str) {
         "{name}"
     );
     let seen = turn.seen();
-    let straight = seen.direct.get(&open_host).copied().unwrap_or(0);
-    let indicated = seen.indicated.get(&open_host).copied().unwrap_or(0);
+    let count = |sent: &std::collections::HashMap<SocketAddr, u64>| -> u64 {
+        open_hosts.iter().filter_map(|host| sent.get(host)).sum()
+    };
+    let straight = count(&seen.direct);
+    let indicated = count(&seen.indicated);
     assert!(
         straight > indicated,
         "{name}: the unrestricted end sent {straight} datagrams straight to the relayed address and {indicated} through its allocation"
@@ -518,7 +521,10 @@ async fn a_direct_path_wins_over_the_relay_and_reports_direct() {
     for (peer, remote) in [(route, &answer), (source, &offer)] {
         let status = engine.status(peer).await;
         assert!(!status.relayed, "{peer:?}: {status:?}");
-        assert_eq!(status.peer, Some(host_candidate(remote).to_string()));
+        assert!(
+            is_host_candidate(remote, &status.peer),
+            "{peer:?}: {status:?}"
+        );
     }
 
     let seen = turn.seen();

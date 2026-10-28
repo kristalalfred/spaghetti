@@ -30,6 +30,7 @@ const RELEASE_WAIT: Duration = Duration::from_millis(500);
 pub const REORDER_TIMEOUT: Duration = Duration::from_millis(40);
 const OPUS_PT: u8 = 111;
 const DATAGRAM_MAX: usize = 2048;
+const ARRIVALS_MAX: usize = 256;
 const CLOSE_PASSES: usize = 4;
 
 static CRYPTO: Once = Once::new();
@@ -159,16 +160,24 @@ impl PeerLink {
                 return Err(format!("TURN server '{}' is not host:port", server.address));
             }
         }
-        let socket = std::net::UdpSocket::bind((default_route_ipv4()?, 0))
-            .and_then(|socket| socket.set_nonblocking(true).map(|()| socket))
-            .map_err(|e| format!("bind a WebRTC socket: {e}"))?;
-        let local = socket
-            .local_addr()
-            .map_err(|e| format!("WebRTC socket address: {e}"))?;
-        let host = Candidate::host(local, "udp")
-            .map_err(|e| format!("{local} cannot be a WebRTC candidate: {e}"))?;
-        let socket =
-            UdpSocket::from_std(socket).map_err(|e| format!("register a WebRTC socket: {e}"))?;
+        let mut addresses = interface_ipv4s();
+        let primary = default_route_ipv4()
+            .ok()
+            .or_else(|| addresses.first().copied())
+            .ok_or("no IPv4 address for WebRTC")?;
+        addresses.retain(|address| *address != primary);
+        let (socket, local) = bind(primary)?;
+        let others: Vec<_> = addresses
+            .into_iter()
+            .filter_map(|address| {
+                bind(address)
+                    .inspect_err(
+                        |e| tracing::debug!(link = spec.link, error = %e, "skipped an interface"),
+                    )
+                    .ok()
+            })
+            .map(|(socket, local)| (Arc::new(socket), local))
+            .collect();
 
         let shared = Arc::new(Shared {
             meter: FlowMeter::new(),
@@ -186,7 +195,7 @@ impl PeerLink {
             link: spec.link.clone(),
             socket,
             local,
-            host,
+            others,
             relay_only: relay_only(&spec.link),
             stun: spec.stun.clone(),
             turn: spec.turn.clone(),
@@ -358,6 +367,54 @@ fn audio_mid(
         ));
     }
     Ok(mid)
+}
+
+fn bind(address: Ipv4Addr) -> Result<(UdpSocket, SocketAddr), String> {
+    let socket = std::net::UdpSocket::bind((address, 0))
+        .and_then(|socket| socket.set_nonblocking(true).map(|()| socket))
+        .map_err(|e| format!("bind a WebRTC socket on {address}: {e}"))?;
+    let local = socket
+        .local_addr()
+        .map_err(|e| format!("WebRTC socket address: {e}"))?;
+    let socket =
+        UdpSocket::from_std(socket).map_err(|e| format!("register a WebRTC socket: {e}"))?;
+    Ok((socket, local))
+}
+
+/// Claude: the IPv4 address of every interface that is up, except loopback
+/// and link-local ones. A link offers a host candidate on each, so a peer
+/// reaches it on a network other than the default route's, such as the LAN
+/// while a VPN holds the default route.
+pub fn interface_ipv4s() -> Vec<Ipv4Addr> {
+    let mut addresses = Vec::new();
+    let mut interfaces = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut interfaces) } != 0 {
+        return addresses;
+    }
+    let mut cursor = interfaces;
+    while let Some(interface) = unsafe { cursor.as_ref() } {
+        cursor = interface.ifa_next;
+        let flags = interface.ifa_flags as libc::c_int;
+        if flags & libc::IFF_UP == 0
+            || flags & libc::IFF_RUNNING == 0
+            || flags & libc::IFF_LOOPBACK != 0
+        {
+            continue;
+        }
+        let Some(address) = (unsafe { interface.ifa_addr.as_ref() }) else {
+            continue;
+        };
+        if libc::c_int::from(address.sa_family) != libc::AF_INET {
+            continue;
+        }
+        let address = unsafe { &*interface.ifa_addr.cast::<libc::sockaddr_in>() };
+        let ip = Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr));
+        if !ip.is_link_local() && !ip.is_unspecified() && !addresses.contains(&ip) {
+            addresses.push(ip);
+        }
+    }
+    unsafe { libc::freeifaddrs(interfaces) };
+    addresses
 }
 
 /// Claude: the address this host reaches the internet from. Connecting a UDP
@@ -532,7 +589,9 @@ struct Gathering {
     link: String,
     socket: UdpSocket,
     local: SocketAddr,
-    host: Candidate,
+    /// Claude: a socket on every other interface, each offered as a host
+    /// candidate. STUN and TURN use only `socket`.
+    others: Vec<(Arc<UdpSocket>, SocketAddr)>,
     relay_only: bool,
     stun: Vec<String>,
     turn: Vec<TurnServer>,
@@ -594,7 +653,10 @@ impl Gathering {
         let mut rtc = rtc_config().build(Instant::now());
         let mut candidates = Vec::new();
         if !self.relay_only {
-            candidates.push(Ok(self.host.clone()));
+            candidates.push(Candidate::host(self.local, "udp"));
+            for (_, local) in &self.others {
+                candidates.push(Candidate::host(*local, "udp"));
+            }
             for &address in &gathered.mapped {
                 let address = SocketAddr::V4(address);
                 if address != self.local {
@@ -619,11 +681,24 @@ impl Gathering {
     }
 
     fn into_session(self, rtc: Rtc, gathered: Gathered, mid: Mid) -> Session {
+        let readers = self.closing.child_token();
+        let (arrive, arrivals) = mpsc::channel(ARRIVALS_MAX);
+        for (socket, local) in &self.others {
+            tokio::spawn(read(
+                Arc::clone(socket),
+                *local,
+                arrive.clone(),
+                readers.clone(),
+            ));
+        }
         Session {
             link: self.link,
             rtc,
             socket: self.socket,
             local: self.local,
+            others: self.others,
+            arrivals,
+            _readers: readers.drop_guard(),
             issued: gathered.issued,
             relays: gathered.relays,
             mid,
@@ -669,6 +744,10 @@ struct Session {
     rtc: Rtc,
     socket: UdpSocket,
     local: SocketAddr,
+    others: Vec<(Arc<UdpSocket>, SocketAddr)>,
+    /// Claude: datagrams the other sockets received.
+    arrivals: mpsc::Receiver<Arrival>,
+    _readers: DropGuard,
     /// Claude: our own STUN transactions; their replies never reach str0m.
     issued: HashSet<stun::Transaction>,
     relays: Relays,
@@ -717,6 +796,9 @@ impl Session {
                     Ok((len, from)) => self.receive(&buffer[..len], from),
                     Err(e) => tracing::debug!(link = self.link, error = %e, "WebRTC receive failed"),
                 },
+                Some(arrival) = self.arrivals.recv() => {
+                    self.deliver(&arrival.datagram, arrival.from, arrival.to);
+                }
                 () = tokio::time::sleep_until(tokio::time::Instant::from_std(wake)) => self.tick(),
             }
         }
@@ -738,13 +820,14 @@ impl Session {
     /// Claude: every datagram str0m sends leaves here, by the local address it
     /// names as its source.
     fn transmit(&self, transmit: Transmit) {
-        if transmit.source == self.local {
-            send(
-                &self.socket,
-                transmit.destination,
-                &transmit.contents,
-                &self.link,
-            );
+        let host = self
+            .others
+            .iter()
+            .find(|(_, local)| *local == transmit.source)
+            .map(|(socket, _)| &**socket)
+            .or((transmit.source == self.local).then_some(&self.socket));
+        if let Some(socket) = host {
+            send(socket, transmit.destination, &transmit.contents, &self.link);
         } else if let Some((server, indication)) =
             self.relays
                 .indication(transmit.source, transmit.destination, &transmit.contents)
@@ -824,7 +907,7 @@ impl Session {
             },
         );
         if self.connected && self.rtc.accepts(&input) {
-            let through_relay = to != self.local || self.relays.relays(from);
+            let through_relay = !self.is_host(to) || self.relays.relays(from);
             let relayed = self.paths.record(now, through_relay);
             let mut state = self.shared.state();
             if state.peer != Some(from) || state.relayed != relayed {
@@ -836,6 +919,10 @@ impl Session {
         if let Err(e) = self.rtc.handle_input(input) {
             tracing::debug!(link = self.link, %from, error = %e, "str0m refused a datagram");
         }
+    }
+
+    fn is_host(&self, address: SocketAddr) -> bool {
+        address == self.local || self.others.iter().any(|(_, local)| *local == address)
     }
 
     fn tick(&mut self) {
@@ -962,6 +1049,42 @@ impl Session {
             {
                 self.relays.receive(&buffer[..len], from, Instant::now());
             }
+        }
+    }
+}
+
+struct Arrival {
+    datagram: Vec<u8>,
+    from: SocketAddr,
+    to: SocketAddr,
+}
+
+/// Claude: hands a session what one of its other sockets receives. A full
+/// queue drops the datagram, as the network would.
+async fn read(
+    socket: Arc<UdpSocket>,
+    local: SocketAddr,
+    arrivals: mpsc::Sender<Arrival>,
+    stop: CancellationToken,
+) {
+    let mut buffer = [0u8; DATAGRAM_MAX];
+    loop {
+        let received = tokio::select! {
+            () = stop.cancelled() => return,
+            received = socket.recv_from(&mut buffer) => received,
+        };
+        match received {
+            Ok((len, from)) => {
+                let arrival = Arrival {
+                    datagram: buffer[..len].to_vec(),
+                    from,
+                    to: local,
+                };
+                if let Err(mpsc::error::TrySendError::Closed(_)) = arrivals.try_send(arrival) {
+                    return;
+                }
+            }
+            Err(e) => tracing::debug!(%local, error = %e, "WebRTC receive failed"),
         }
     }
 }
