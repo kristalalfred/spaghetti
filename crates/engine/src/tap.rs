@@ -42,6 +42,12 @@ unsafe extern "C" {
 
 pub const AGGREGATE_UID_PREFIX: &str = "spaghetti_tap_agg_";
 
+/// Claude: device UIDs are shared by every process, private aggregates
+/// included, so the UID names the process as well as the source.
+fn aggregate_uid(source_id: u32) -> String {
+    format!("{AGGREGATE_UID_PREFIX}{}_{source_id}", std::process::id())
+}
+
 /// Claude: a process tap and the private aggregate device that exposes it.
 struct ProcessTap {
     tap: AudioObjectID,
@@ -160,8 +166,7 @@ pub struct TapSource {
 impl TapSource {
     pub fn create(source_id: u32, pids: &[u32], mode: TapMode) -> Result<Self, String> {
         let &first = pids.first().ok_or("a tap needs at least one process")?;
-        let process_tap =
-            ProcessTap::create(pids, mode, &format!("{AGGREGATE_UID_PREFIX}{source_id}"))?;
+        let process_tap = ProcessTap::create(pids, mode, &aggregate_uid(source_id))?;
         let format = unsafe { query_device_stream_format(process_tap.aggregate) }?;
         tracing::info!(
             sample_rate = format.mSampleRate,
