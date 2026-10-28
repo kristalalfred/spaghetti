@@ -63,7 +63,7 @@ OSStatus spaghetti_create_tap(
     int mute_behavior,
     AudioObjectID *out_tap_id
 ) {
-    if (!pids || pid_count == 0 || !out_tap_id) {
+    if ((!pids && pid_count > 0) || !out_tap_id) {
         return kAudio_ParamError;
     }
 
@@ -230,4 +230,112 @@ OSStatus spaghetti_create_aggregate_for_tap(
 
 OSStatus spaghetti_destroy_aggregate(AudioObjectID aggregate_id) {
     return AudioHardwareDestroyAggregateDevice(aggregate_id);
+}
+
+OSStatus spaghetti_retarget_tap(
+    AudioObjectID tap_id,
+    const pid_t *pids,
+    uint32_t pid_count,
+    int mute_behavior
+) {
+    NSMutableArray<NSNumber *> *processObjects = [NSMutableArray arrayWithCapacity:pid_count];
+    for (uint32_t i = 0; i < pid_count; i++) {
+        AudioObjectID objID = process_object_for_pid(pids[i]);
+        if (objID != kAudioObjectUnknown) {
+            [processObjects addObject:@(objID)];
+        }
+    }
+
+    AudioObjectPropertyAddress addr = {
+        .mSelector = kAudioTapPropertyDescription,
+        .mScope    = kAudioObjectPropertyScopeGlobal,
+        .mElement  = kAudioObjectPropertyElementMain,
+    };
+    CFTypeRef current = NULL;
+    UInt32 dataSize = sizeof(CFTypeRef);
+    OSStatus status = AudioObjectGetPropertyData(tap_id, &addr, 0, NULL, &dataSize, &current);
+    if (status != noErr || current == NULL) {
+        return status != noErr ? status : kAudio_ParamError;
+    }
+
+    CATapDescription *desc = (__bridge_transfer CATapDescription *)current;
+    desc.processes = processObjects;
+    desc.muteBehavior = (mute_behavior != 0) ? CATapMutedWhenTapped : CATapUnmuted;
+    CFTypeRef updated = (__bridge CFTypeRef)desc;
+    return AudioObjectSetPropertyData(tap_id, &addr, 0, NULL, sizeof(CFTypeRef), &updated);
+}
+
+OSStatus spaghetti_create_bus_aggregate(
+    const char *device_uid,
+    const AudioObjectID *taps,
+    uint32_t tap_count,
+    const char *aggregate_uid,
+    AudioObjectID *out_aggregate_id
+) {
+    if (!device_uid || !aggregate_uid || !out_aggregate_id || (!taps && tap_count > 0)) {
+        return kAudio_ParamError;
+    }
+
+    NSMutableArray *tapList = [NSMutableArray arrayWithCapacity:tap_count];
+    for (uint32_t i = 0; i < tap_count; i++) {
+        NSString *tapUID = get_tap_uid(taps[i]);
+        if (!tapUID) {
+            return kAudio_ParamError;
+        }
+        [tapList addObject:@{
+            @(kAudioSubTapUIDKey): tapUID,
+            @(kAudioSubTapDriftCompensationKey): @YES,
+        }];
+    }
+
+    NSString *device = @(device_uid);
+    NSDictionary *aggDesc = @{
+        @(kAudioAggregateDeviceUIDKey):           @(aggregate_uid),
+        @(kAudioAggregateDeviceNameKey):          @"Spaghetti Bus",
+        @(kAudioAggregateDeviceIsPrivateKey):     @YES,
+        @(kAudioAggregateDeviceTapAutoStartKey):  @YES,
+        @(kAudioAggregateDeviceMainSubDeviceKey): device,
+        @(kAudioAggregateDeviceSubDeviceListKey): @[@{ @(kAudioSubDeviceUIDKey): device }],
+        @(kAudioAggregateDeviceTapListKey):       tapList,
+    };
+
+    AudioObjectID aggregateID = kAudioObjectUnknown;
+    OSStatus status = AudioHardwareCreateAggregateDevice((__bridge CFDictionaryRef)aggDesc, &aggregateID);
+    if (status != noErr) {
+        return status;
+    }
+    *out_aggregate_id = aggregateID;
+    return noErr;
+}
+
+OSStatus spaghetti_read_last_inputs_only(
+    AudioObjectID device,
+    AudioDeviceIOProcID ioproc,
+    uint32_t count
+) {
+    AudioObjectPropertyAddress addr = {
+        .mSelector = kAudioDevicePropertyIOProcStreamUsage,
+        .mScope    = kAudioObjectPropertyScopeInput,
+        .mElement  = kAudioObjectPropertyElementMain,
+    };
+    UInt32 dataSize = 0;
+    OSStatus status = AudioObjectGetPropertyDataSize(device, &addr, 0, NULL, &dataSize);
+    if (status != noErr) {
+        return status;
+    }
+    AudioHardwareIOProcStreamUsage *usage = calloc(1, dataSize);
+    if (!usage) {
+        return kAudio_MemFullError;
+    }
+    usage->mIOProc = (void *)ioproc;
+    status = AudioObjectGetPropertyData(device, &addr, 0, NULL, &dataSize, usage);
+    if (status == noErr) {
+        UInt32 streams = usage->mNumberStreams;
+        for (UInt32 i = 0; i < streams; i++) {
+            usage->mStreamIsOn[i] = i + count >= streams;
+        }
+        status = AudioObjectSetPropertyData(device, &addr, 0, NULL, dataSize, usage);
+    }
+    free(usage);
+    return status;
 }

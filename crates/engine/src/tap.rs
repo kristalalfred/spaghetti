@@ -153,19 +153,15 @@ impl Drop for Capture {
     }
 }
 
-/// Claude: an app's audio, captured from a process tap. The IOProc runs only
-/// while at least one route is attached.
-pub struct TapSource {
-    capture: Option<Capture>,
-    state: Arc<CaptureState>,
+/// Claude: the process tap and aggregate a capture reads, opened while any route
+/// takes the tap's frames through a ring.
+struct Opened {
     process_tap: ProcessTap,
     sample_rate: f64,
-    pub label: String,
 }
 
-impl TapSource {
-    pub fn create(source_id: u32, pids: &[u32], mode: TapMode) -> Result<Self, String> {
-        let &first = pids.first().ok_or("a tap needs at least one process")?;
+impl Opened {
+    fn open(source_id: u32, pids: &[u32], mode: TapMode) -> Result<Self, String> {
         let process_tap = ProcessTap::create(pids, mode, &aggregate_uid(source_id))?;
         let format = unsafe { query_device_stream_format(process_tap.aggregate) }?;
         tracing::info!(
@@ -189,8 +185,34 @@ impl TapSource {
                 format.mSampleRate, format.mFormatID, format.mFormatFlags, format.mBitsPerChannel
             ));
         }
-
         tracing::info!(source_id, ?pids, "created process tap");
+        Ok(Self {
+            process_tap,
+            sample_rate: format.mSampleRate,
+        })
+    }
+}
+
+/// Claude: an app's audio, captured from a process tap. The tap and its
+/// aggregate exist, and the IOProc runs, only while at least one route reads
+/// the frames through a ring; a device bus taps the app on its own.
+pub struct TapSource {
+    capture: Option<Capture>,
+    state: Arc<CaptureState>,
+    opened: Option<Opened>,
+    source_id: u32,
+    pids: Vec<u32>,
+    mode: TapMode,
+    pub label: String,
+}
+
+impl TapSource {
+    pub fn create(source_id: u32, pids: &[u32], mode: TapMode) -> Result<Self, String> {
+        let &first = pids.first().ok_or("a tap needs at least one process")?;
+        let known = audio_process_pids();
+        if let Some(pid) = pids.iter().find(|pid| !known.contains(pid)) {
+            return Err(format!("process {pid} is not known to Core Audio"));
+        }
         Ok(Self {
             capture: None,
             state: Arc::new(CaptureState {
@@ -199,10 +221,19 @@ impl TapSource {
                 delivery: Arc::new(DeliverySpan::new(0.0)),
                 logged_once: AtomicBool::new(false),
             }),
-            process_tap,
-            sample_rate: format.mSampleRate,
+            opened: None,
+            source_id,
+            pids: pids.to_vec(),
+            mode,
             label: app_label(first),
         })
+    }
+
+    fn open(&mut self) -> Result<&Opened, String> {
+        if self.opened.is_none() {
+            self.opened = Some(Opened::open(self.source_id, &self.pids, self.mode)?);
+        }
+        Ok(self.opened.as_ref().expect("opened above"))
     }
 
     pub fn status(&self) -> FlowStatus {
@@ -221,32 +252,37 @@ impl TapSource {
     /// Claude: replaces the processes the running tap mixes, without stopping
     /// its capture, so an app's helpers can come and go.
     pub fn set_processes(&mut self, pids: &[u32]) -> Result<(), String> {
-        let pids: Vec<i32> = pids.iter().map(|&pid| pid as i32).collect();
-        let status = unsafe {
-            spaghetti_set_tap_processes(self.process_tap.tap, pids.as_ptr(), pids.len() as u32)
-        };
-        if status != 0 {
-            return Err(format!("set the tap's processes failed: OSStatus {status}"));
+        if let Some(opened) = &self.opened {
+            let raw: Vec<i32> = pids.iter().map(|&pid| pid as i32).collect();
+            let status = unsafe {
+                spaghetti_set_tap_processes(opened.process_tap.tap, raw.as_ptr(), raw.len() as u32)
+            };
+            if status != 0 {
+                return Err(format!("set the tap's processes failed: OSStatus {status}"));
+            }
         }
+        self.pids = pids.to_vec();
         tracing::info!(label = self.label, ?pids, "updated tap processes");
         Ok(())
     }
 
-    pub fn timing(&self) -> SourceTiming {
-        SourceTiming {
-            sample_rate: self.sample_rate,
+    pub fn timing(&mut self) -> Result<SourceTiming, String> {
+        let sample_rate = self.open()?.sample_rate;
+        Ok(SourceTiming {
+            sample_rate,
             delivery: Arc::clone(&self.state.delivery),
-        }
+        })
     }
 
     pub fn add_sink(&mut self, ring: Arc<Ring>) -> Result<usize, String> {
+        let aggregate = self.open()?.process_tap.aggregate;
         let slot = self
             .state
             .sinks
             .insert(Box::new(ring))
             .map_err(|_| format!("a source can feed at most {MAX_SINKS} routes"))?;
         if self.capture.is_none() {
-            match Capture::start(self.process_tap.aggregate, Arc::clone(&self.state)) {
+            match Capture::start(aggregate, Arc::clone(&self.state)) {
                 Ok(capture) => self.capture = Some(capture),
                 Err(e) => {
                     self.state.sinks.remove(slot);
@@ -259,8 +295,11 @@ impl TapSource {
 
     pub fn remove_sink(&mut self, slot: usize) {
         drop(self.state.sinks.remove(slot));
-        if self.state.sinks.is_empty() && self.capture.take().is_some() {
-            tracing::info!(label = self.label, "stopped tap capture");
+        if self.state.sinks.is_empty() {
+            if self.capture.take().is_some() {
+                tracing::info!(label = self.label, "stopped tap capture");
+            }
+            self.opened = None;
         }
     }
 }

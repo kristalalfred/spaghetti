@@ -30,27 +30,40 @@ Daemon logs: `~/Library/Logs/spaghetti/spaghettid.log`. Follow with `spaghetti d
 
 ## Architecture: source → route pipeline
 
-The routing path is the trickiest part. Flow for a tap routed to a device:
+The routing path is the trickiest part. A tap routed to a device goes through that device's bus:
 
 ```
-target app
-  → Core Audio process tap (AudioHardwareCreateProcessTap)
-  → private aggregate device (wraps the tap + a main sub-device for clocking)
-  → one IOProc per tap (AudioDeviceCreateIOProcID) delivers AudioBufferList directly
-  → per route sink (lock-free `RtSlots` the IOProc iterates) → SPSC ring of tap-rate frames
-  → per route output AUHAL render callback: rubato async resampler (tap rate → dest rate)
-    pulls exactly the input it needs; the AUHAL runs at the device-native format.
-    A jitter buffer holds output silent until the ring reaches its target fill, and a PI
-    controller on the fill trims the ratio by up to 0.5% so the tap's clock (the default
-    output's hardware) and the destination's clock (mach time for virtual devices) stay matched
+target apps
+  → one process tap per route, a slot of the device's `DeviceBus`
+  → one private aggregate device per destination device: the device as main sub-device
+    (clock and output) plus every slot tap, drift-compensated by the HAL
+  → one IOProc per bus reads each slot's tap and adds it, ramped to the route's volume,
+    into the device's output buffer in the same cycle: no ring, resampler or jitter buffer
   → destination device
 ```
 
-SRT and WebRTC ends replace either side:
+Changing an aggregate's tap list while it runs drops 20–35 ms of audio for every tap in it, but pointing a tap at other processes does not, so a bus keeps a fixed set of slot taps, points free ones at no process, and doubles them in one rebuild when full. Every tap costs `coreaudiod` CPU each cycle, empty or not. A started aggregate waits for a tapped app to play before it runs but keeps running after the apps stop, so the bus watcher restarts it once no slot's process has played for 3 s.
+
+Every other route goes through a ring. Flow for a tap routed to SRT or WebRTC:
+
+```
+target app
+  → Core Audio process tap (AudioHardwareCreateProcessTap), opened while a ring route needs it
+  → private aggregate device (wraps the tap + the default output as main sub-device for clocking)
+  → one IOProc per tap (AudioDeviceCreateIOProcID) delivers AudioBufferList directly
+  → per route sink (lock-free `RtSlots` the IOProc iterates) → SPSC ring of tap-rate frames
+  → the route's output, as below
+```
+
+A network source routed to a device plays through an AUHAL:
 
 ```
 SRT source: srt-tokio receive → TsDemuxer → ADTS → AudioToolbox AAC decode at 48 kHz
-  → the same per route rings, Playout and AUHAL as a tap
+  → per route ring → per route output AUHAL render callback: rubato async resampler
+    (source rate → dest rate) pulls exactly the input it needs; the AUHAL runs at the
+    device-native format. A jitter buffer holds output silent until the ring reaches its
+    target fill, and a PI controller on the fill trims the ratio by up to 0.5% so the
+    source's clock and the destination's clock (mach time for virtual devices) stay matched
 
 SRT destination: the route's ring → encoder thread (every 5 ms, 1024-frame chunks)
   → AudioToolbox AAC-LC 256 kb/s → ADTS → TsMuxer → 1316-byte messages → srt-tokio send
@@ -67,14 +80,15 @@ WebRTC destination: the route's ring → encoder thread (every 5 ms, 960-frame c
 A source reports its `SourceTiming`: its rate, and its `DeliverySpan`, how far behind their capture its frames may land. A tap publishes its IOProc buffer; SRT and WebRTC sources measure the span from each push's media time and arrival, growing it at once past a stall it fell short of and shedding it slowly once delivery calms. `Playout` holds the live span on top of what the resampler needs, and re-primes once when the span grows under a playing route rather than resample audibly up to it.
 
 Key files:
-- `crates/engine/src/router.rs` — `Router`, the routing graph: sources, routes, and attaching a route's ring to its source and its output.
-- `crates/engine/src/tap.rs` — `TapSource`: a process tap, its private aggregate device and the capture IOProc (`capture_ioproc`) that pushes into every attached route's ring. FFI wrappers around the ObjC bridge, and `list_audio_apps`.
+- `crates/engine/src/router.rs` — `Router`, the routing graph: sources, routes, the device buses, and attaching a route either to a bus or through a ring to its source and its output.
+- `crates/engine/src/bus.rs` — `DeviceBus`: the slot taps and aggregate device that mix taps into one device, `bus_ioproc`, and the watcher that lets an idle bus wait for an app to play.
+- `crates/engine/src/tap.rs` — `TapSource`: a process tap, its private aggregate device and the capture IOProc (`capture_ioproc`) that pushes into every attached route's ring, opened only while a ring route needs them. FFI wrappers around the ObjC bridge, and `list_audio_apps`.
 - `crates/engine/src/device_output.rs` — `DeviceOutput`: a route's output AUHAL and `route_render_callback`.
 - `crates/engine/src/playout.rs` — `Playout`, a route's output side: the resampler, jitter buffer and clock-drift controller between the ring and the render callback.
 - `crates/engine/src/ring.rs` — the SPSC ring of interleaved stereo frames.
 - `crates/engine/src/delivery.rs` — `DeliverySpan`, the span a source shares with its routes, and `DeliveryMeter`, which measures it for network sources.
 - `crates/engine/src/sinks.rs` + `rt_slots.rs` — `Sinks`, the rings a source feeds, held in `RtSlots`, the lock-free handoff that lets routes join and leave a running capture.
-- `crates/engine/bridge/tap_bridge.m` + `.h` — ObjC bridge for `AudioHardwareCreateProcessTap` and aggregate device creation. Compiled by `build.rs`.
+- `crates/engine/bridge/tap_bridge.m` + `.h` — ObjC bridge for `AudioHardwareCreateProcessTap`, retargeting taps, and aggregate device creation. Compiled by `build.rs`.
 - `crates/engine/src/srt.rs` — `SrtLink`, one SRT connection that reconnects when it drops, with its `FlowStatus`.
 - `crates/engine/src/srt_receiver.rs` + `srt_sender.rs` — `SrtSource` (decode thread) and `SrtOutput` (encode thread).
 - `crates/engine/src/webrtc.rs` — `PeerLink`, one str0m peer connection on its own UDP socket (default-route IPv4) run by a tokio task: STUN and TURN allocation on that socket before the SDP (one 2 s bound), the offer or answer exchanged whole through `SetRemoteDescription` and `local_description`, transmits from a relayed address sent through TURN, its status (including whether recent datagrams came through a relay), and close on drop.

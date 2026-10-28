@@ -5,6 +5,7 @@ mod abl;
 mod activity;
 mod adts;
 mod audio;
+mod bus;
 mod codec;
 mod delivery;
 mod device_manager;

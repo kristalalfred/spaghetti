@@ -1,15 +1,18 @@
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use spaghetti_common::ipc_protocol::{
-    Destination, FlowStatus, PeerRef, RouteInfo, SourceInfo, SourceSpec,
+    Destination, FlowState, FlowStatus, PeerRef, RouteInfo, SourceInfo, SourceSpec,
 };
 
 use crate::audio;
+use crate::bus::DeviceBus;
 use crate::device_output::DeviceOutput;
 #[cfg(test)]
 use crate::fixture::FixtureSource;
+use crate::flow::{FlowMeter, Link};
 use crate::ring::Ring;
 use crate::sinks::SourceTiming;
 use crate::srt_receiver::SrtSource;
@@ -36,13 +39,13 @@ impl Source {
         }
     }
 
-    fn timing(&self) -> SourceTiming {
+    fn timing(&mut self) -> Result<SourceTiming, String> {
         match self {
             Self::Tap(tap) => tap.timing(),
-            Self::Srt(srt) => srt.timing(),
-            Self::WebRtc(webrtc) => webrtc.timing(),
+            Self::Srt(srt) => Ok(srt.timing()),
+            Self::WebRtc(webrtc) => Ok(webrtc.timing()),
             #[cfg(test)]
-            Self::Fixture(fixture) => fixture.timing(),
+            Self::Fixture(fixture) => Ok(fixture.timing()),
         }
     }
 
@@ -161,17 +164,48 @@ struct Route {
     source_id: u32,
     destination: Destination,
     volume: Arc<AtomicU32>,
-    sink_slot: usize,
-    ring: Arc<Ring>,
-    output: Output,
+    path: Path,
+}
+
+enum Path {
+    /// Claude: the source feeds the output through a ring in one of its sinks.
+    Ring {
+        sink_slot: usize,
+        ring: Arc<Ring>,
+        output: Output,
+    },
+    /// Claude: the destination device's bus taps the app and mixes it in.
+    Bus { slot: usize, meter: Arc<FlowMeter> },
+}
+
+impl Path {
+    fn status(&self) -> FlowStatus {
+        match self {
+            Self::Ring { output, .. } => output.status(),
+            Self::Bus { meter, .. } => meter.status(Link::Connected {
+                peer: None,
+                packets_lost: 0,
+                packets_retransmitted: 0,
+            }),
+        }
+    }
+
+    fn peer(&self) -> Option<&PeerLink> {
+        match self {
+            Self::Ring { output, .. } => output.peer(),
+            Self::Bus { .. } => None,
+        }
+    }
 }
 
 /// Claude: the routing graph. Sources feed routes through their sinks, and a
-/// source's routes are destroyed before the source.
+/// source's routes are destroyed before the source. A tap routed to a device
+/// skips the sinks and is mixed by that device's bus instead.
 pub struct Router {
     /// Claude: declared before `sources` so routes are torn down before their sources on drop.
     routes: HashMap<u32, Route>,
     sources: HashMap<u32, SourceEntry>,
+    buses: HashMap<String, DeviceBus>,
     next_source_id: u32,
     next_route_id: u32,
 }
@@ -181,6 +215,7 @@ impl Router {
         Self {
             routes: HashMap::new(),
             sources: HashMap::new(),
+            buses: HashMap::new(),
             next_source_id: 1,
             next_route_id: 1,
         }
@@ -225,6 +260,17 @@ impl Router {
         };
         tap.set_processes(&pids)?;
         *tapped = pids;
+        let SourceSpec::Tap { pids, mode } = &entry.spec else {
+            unreachable!("matched as a tap above");
+        };
+        for route in self.routes.values().filter(|route| route.source_id == source_id) {
+            if let (Path::Bus { slot, .. }, Destination::Device { uid }) =
+                (&route.path, &route.destination)
+                && let Some(bus) = self.buses.get(uid)
+            {
+                bus.retarget(*slot, pids, *mode)?;
+            }
+        }
         Ok(())
     }
 
@@ -236,7 +282,7 @@ impl Router {
                 spec: entry.spec.clone(),
                 tag: entry.tag.clone(),
                 label: entry.source.label().to_string(),
-                status: entry.source.status(),
+                status: self.source_status(id, &entry.source),
                 local_description: entry.source.peer().and_then(PeerLink::local_description),
             })
             .collect()
@@ -260,7 +306,7 @@ impl Router {
                 .routes
                 .get(&id)
                 .ok_or_else(|| format!("route {id} not found"))?
-                .output
+                .path
                 .peer()
                 .ok_or_else(|| format!("route {id} is not a WebRTC peer"))?,
         };
@@ -277,25 +323,50 @@ impl Router {
         destination: Destination,
         initial_volume: f32,
     ) -> Result<u32, String> {
-        let source = &mut self
+        let entry = self
             .sources
             .get_mut(&source_id)
-            .ok_or_else(|| format!("source {source_id} not found"))?
-            .source;
+            .ok_or_else(|| format!("source {source_id} not found"))?;
 
         let volume = Arc::new(AtomicU32::new(initial_volume.clamp(0.0, 2.0).to_bits()));
-        let ring = Arc::new(Ring::new());
-        let output = Output::open(
-            &destination,
-            source.timing(),
-            Arc::clone(&ring),
-            Arc::clone(&volume),
-        )?;
-        let sink_slot = source.add_sink(Arc::clone(&ring))?;
-        if let Err(e) = output.start() {
-            source.remove_sink(sink_slot);
-            return Err(e);
-        }
+        let path = match (&entry.spec, &destination) {
+            (SourceSpec::Tap { pids, mode }, Destination::Device { uid }) => {
+                let bus = match self.buses.entry(uid.clone()) {
+                    Entry::Occupied(bus) => bus.into_mut(),
+                    Entry::Vacant(vacant) => vacant.insert(DeviceBus::open(uid)?),
+                };
+                let meter = Arc::new(FlowMeter::new());
+                match bus.attach(pids, *mode, Arc::clone(&volume), Arc::clone(&meter)) {
+                    Ok(slot) => Path::Bus { slot, meter },
+                    Err(e) => {
+                        if bus.is_empty() {
+                            self.buses.remove(uid);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            _ => {
+                let source = &mut entry.source;
+                let ring = Arc::new(Ring::new());
+                let output = Output::open(
+                    &destination,
+                    source.timing()?,
+                    Arc::clone(&ring),
+                    Arc::clone(&volume),
+                )?;
+                let sink_slot = source.add_sink(Arc::clone(&ring))?;
+                if let Err(e) = output.start() {
+                    source.remove_sink(sink_slot);
+                    return Err(e);
+                }
+                Path::Ring {
+                    sink_slot,
+                    ring,
+                    output,
+                }
+            }
+        };
 
         let id = self.next_route_id;
         self.next_route_id += 1;
@@ -306,9 +377,7 @@ impl Router {
                 source_id,
                 destination,
                 volume,
-                sink_slot,
-                ring,
-                output,
+                path,
             },
         );
         Ok(id)
@@ -317,17 +386,31 @@ impl Router {
     pub fn destroy_route(&mut self, route_id: u32) -> Result<(), String> {
         let Route {
             source_id,
-            sink_slot,
-            output,
+            destination,
+            path,
             ..
         } = self
             .routes
             .remove(&route_id)
             .ok_or_else(|| format!("route {route_id} not found"))?;
 
-        drop(output);
-        if let Some(entry) = self.sources.get_mut(&source_id) {
-            entry.source.remove_sink(sink_slot);
+        match (path, destination) {
+            (Path::Ring { sink_slot, output, .. }, _) => {
+                drop(output);
+                if let Some(entry) = self.sources.get_mut(&source_id) {
+                    entry.source.remove_sink(sink_slot);
+                }
+            }
+            (Path::Bus { slot, .. }, Destination::Device { uid }) => {
+                if let Some(bus) = self.buses.get_mut(&uid) {
+                    bus.detach(slot);
+                    if bus.is_empty() {
+                        self.buses.remove(&uid);
+                        tracing::info!(device_uid = uid, "closed device bus");
+                    }
+                }
+            }
+            (Path::Bus { .. }, _) => unreachable!("only device routes use a bus"),
         }
 
         tracing::info!(route_id, "destroyed route");
@@ -354,8 +437,8 @@ impl Router {
                 source_id: r.source_id,
                 destination: r.destination.clone(),
                 volume: f32::from_bits(r.volume.load(Ordering::Relaxed)),
-                status: r.output.status(),
-                local_description: r.output.peer().and_then(PeerLink::local_description),
+                status: r.path.status(),
+                local_description: r.path.peer().and_then(PeerLink::local_description),
             })
             .collect()
     }
@@ -366,8 +449,25 @@ impl Router {
 
     pub fn log_health(&mut self) {
         for (&route_id, route) in &mut self.routes {
-            route.output.log_health(route_id, &route.ring);
+            if let Path::Ring { ring, output, .. } = &mut route.path {
+                output.log_health(route_id, ring);
+            }
         }
+    }
+
+    /// Claude: a tap's own capture says nothing about the routes its device
+    /// buses mix, so a tap that only feeds buses reports the busiest of those.
+    fn source_status(&self, source_id: u32, source: &Source) -> FlowStatus {
+        let status = source.status();
+        if !matches!(source, Source::Tap(_)) || status.state != FlowState::Idle {
+            return status;
+        }
+        self.routes
+            .values()
+            .filter(|route| route.source_id == source_id && matches!(route.path, Path::Bus { .. }))
+            .map(|route| route.path.status())
+            .max_by_key(|status| status.bytes)
+            .unwrap_or(status)
     }
 
     /// Return every route ID currently targeting the given device UID.
@@ -416,10 +516,13 @@ impl Router {
         let source = &mut self.sources.get_mut(&source_id).expect("the source exists").source;
         let ring = Arc::new(Ring::new());
         source.add_sink(Arc::clone(&ring)).expect("a free sink");
-        (ring, source.timing())
+        (ring, source.timing().expect("a fixture has timing"))
     }
 
     pub fn route_ring(&self, route_id: u32) -> Arc<Ring> {
-        Arc::clone(&self.routes.get(&route_id).expect("the route exists").ring)
+        match &self.routes.get(&route_id).expect("the route exists").path {
+            Path::Ring { ring, .. } => Arc::clone(ring),
+            Path::Bus { .. } => panic!("route {route_id} is mixed by a bus"),
+        }
     }
 }

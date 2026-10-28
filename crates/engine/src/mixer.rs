@@ -52,22 +52,29 @@ impl Fader {
         }
     }
 
-    /// Claude: the gain for each of `frames` frames, or none when the buffer
-    /// stays at unity and needs no scaling.
-    fn gains(&mut self, frames: usize, target: f32) -> Option<impl Iterator<Item = f32> + use<>> {
+    /// Claude: the gain for each of the next `frames` frames.
+    pub fn ramp(&mut self, frames: usize, target: f32) -> impl Iterator<Item = f32> + use<> {
         let from = self.gain;
-        if frames == 0 || (from == 1.0 && target == 1.0) {
-            return None;
+        if frames > 0 {
+            self.gain = target;
         }
-        self.gain = target;
-        let step = (target - from) / frames as f32;
-        Some((1..=frames).map(move |frame| {
+        let step = (target - from) / frames.max(1) as f32;
+        (1..=frames).map(move |frame| {
             if frame == frames {
                 target
             } else {
                 from + step * frame as f32
             }
-        }))
+        })
+    }
+
+    /// Claude: the gain for each of `frames` frames, or none when the buffer
+    /// stays at unity and needs no scaling.
+    fn gains(&mut self, frames: usize, target: f32) -> Option<impl Iterator<Item = f32> + use<>> {
+        if frames == 0 || (self.gain == 1.0 && target == 1.0) {
+            return None;
+        }
+        Some(self.ramp(frames, target))
     }
 }
 
@@ -131,6 +138,15 @@ mod tests {
         let mut next = vec![1.0f32; 4];
         fader.planar(&mut [&mut next], 0.0);
         assert_eq!(next, [0.0; 4]);
+    }
+
+    #[test]
+    fn a_ramp_yields_every_frame_even_at_unity() {
+        let mut fader = Fader::new(1.0);
+        assert_eq!(fader.ramp(2, 1.0).collect::<Vec<_>>(), [1.0, 1.0]);
+        assert_eq!(fader.ramp(2, 0.0).collect::<Vec<_>>(), [0.5, 0.0]);
+        assert_eq!(fader.ramp(0, 1.0).count(), 0);
+        assert_eq!(fader.ramp(1, 0.0).collect::<Vec<_>>(), [0.0]);
     }
 
     #[test]
