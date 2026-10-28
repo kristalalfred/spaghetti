@@ -193,11 +193,7 @@ impl FpsTracker {
                     return prev.fps;
                 }
                 let delta = frames.saturating_sub(prev.frames);
-                let fps = if elapsed_ns == 0 {
-                    prev.fps
-                } else {
-                    delta.saturating_mul(1_000_000_000) / elapsed_ns
-                };
+                let fps = delta.saturating_mul(1_000_000_000) / elapsed_ns;
                 prev.frames = frames;
                 prev.when = now;
                 prev.fps = fps;
