@@ -6,7 +6,7 @@ use spaghetti_common::ipc_protocol::FlowStatus;
 
 use crate::abl;
 use crate::flow::{FlowMeter, Link};
-use crate::mixer;
+use crate::mixer::Fader;
 use crate::playout::{Playout, PlayoutHealth};
 use crate::ring::{CHANNELS, Ring};
 use crate::sinks::SourceTiming;
@@ -125,6 +125,7 @@ struct OutputCallbackState {
     ring: Arc<Ring>,
     playout: Playout,
     volume: Arc<AtomicU32>,
+    fader: Fader,
     meter: Arc<FlowMeter>,
     logged_once: bool,
 }
@@ -232,6 +233,7 @@ impl OutputUnit {
         self.render_state = Box::into_raw(Box::new(OutputCallbackState {
             ring,
             playout,
+            fader: Fader::new(f32::from_bits(volume.load(Ordering::Relaxed))),
             volume,
             meter,
             logged_once: false,
@@ -332,10 +334,8 @@ unsafe extern "C" fn route_render_callback(
         );
     }
 
-    let vol = f32::from_bits(state.volume.load(Ordering::Relaxed));
-    for plane in out.iter_mut() {
-        mixer::apply_volume(plane, vol);
-    }
+    let volume = f32::from_bits(state.volume.load(Ordering::Relaxed));
+    state.fader.planar(&mut out, volume);
 
     if !state.logged_once {
         state.logged_once = true;

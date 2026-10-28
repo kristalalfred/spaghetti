@@ -15,13 +15,59 @@ pub fn mix(inputs: &[&[f32]], volumes: &[f32], output: &mut [f32]) {
     }
 }
 
-/// Apply volume scaling to a buffer in-place, clamping to [-1.0, 1.0].
-pub fn apply_volume(buffer: &mut [f32], volume: f32) {
-    if (volume - 1.0).abs() < f32::EPSILON {
-        return;
+/// Claude: a route's volume, applied to consecutive buffers. A change ramps
+/// linearly across the next buffer, because stepping the gain between two
+/// buffers clicks. Scaled samples are clamped to [-1.0, 1.0].
+pub struct Fader {
+    gain: f32,
+}
+
+impl Fader {
+    pub fn new(gain: f32) -> Self {
+        Self { gain }
     }
-    for sample in buffer.iter_mut() {
-        *sample = (*sample * volume).clamp(-1.0, 1.0);
+
+    /// Scale channels held in separate planes of equal length.
+    pub fn planar(&mut self, planes: &mut [&mut [f32]], target: f32) {
+        let frames = planes.iter().map(|plane| plane.len()).min().unwrap_or(0);
+        let Some(gains) = self.gains(frames, target) else {
+            return;
+        };
+        for (frame, gain) in gains.enumerate() {
+            for plane in planes.iter_mut() {
+                plane[frame] = (plane[frame] * gain).clamp(-1.0, 1.0);
+            }
+        }
+    }
+
+    /// Scale frames of `channels` interleaved samples.
+    pub fn interleaved(&mut self, buffer: &mut [f32], channels: usize, target: f32) {
+        let Some(gains) = self.gains(buffer.len() / channels, target) else {
+            return;
+        };
+        for (frame, gain) in buffer.chunks_exact_mut(channels).zip(gains) {
+            for sample in frame {
+                *sample = (*sample * gain).clamp(-1.0, 1.0);
+            }
+        }
+    }
+
+    /// Claude: the gain for each of `frames` frames, or none when the buffer
+    /// stays at unity and needs no scaling.
+    fn gains(&mut self, frames: usize, target: f32) -> Option<impl Iterator<Item = f32> + use<>> {
+        let from = self.gain;
+        if frames == 0 || (from == 1.0 && target == 1.0) {
+            return None;
+        }
+        self.gain = target;
+        let step = (target - from) / frames as f32;
+        Some((1..=frames).map(move |frame| {
+            if frame == frames {
+                target
+            } else {
+                from + step * frame as f32
+            }
+        }))
     }
 }
 
@@ -53,26 +99,45 @@ mod tests {
     }
 
     #[test]
-    fn apply_volume_unity_is_noop() {
-        let mut buf = [0.5f32, -0.3];
-        let original = buf;
-        apply_volume(&mut buf, 1.0);
-        assert_eq!(buf, original);
+    fn a_fader_at_unity_leaves_samples_alone() {
+        let mut planes = [vec![1.5f32, -0.3], vec![0.2, 0.4]];
+        let original = planes.clone();
+        let [left, right] = &mut planes;
+        Fader::new(1.0).planar(&mut [left, right], 1.0);
+        assert_eq!(planes, original);
     }
 
     #[test]
-    fn apply_volume_scales() {
-        let mut buf = [1.0f32, -0.5];
-        apply_volume(&mut buf, 0.5);
-        assert!((buf[0] - 0.5).abs() < 1e-6);
-        assert!((buf[1] - -0.25).abs() < 1e-6);
+    fn a_steady_fader_scales_and_clamps() {
+        let mut buf = [0.5f32, -0.5, 0.9, -0.9];
+        Fader::new(0.5).interleaved(&mut buf, 2, 0.5);
+        assert_eq!(buf, [0.25, -0.25, 0.45, -0.45]);
+        Fader::new(2.0).interleaved(&mut buf, 2, 2.0);
+        assert_eq!(buf, [0.5, -0.5, 0.9, -0.9]);
+        let mut loud = [0.9f32, -0.9];
+        Fader::new(2.0).interleaved(&mut loud, 2, 2.0);
+        assert_eq!(loud, [1.0, -1.0]);
     }
 
     #[test]
-    fn apply_volume_clamps_when_over_unity() {
-        let mut buf = [0.9f32, -0.9];
-        apply_volume(&mut buf, 2.0);
-        assert_eq!(buf[0], 1.0);
-        assert_eq!(buf[1], -1.0);
+    fn a_volume_change_ramps_across_one_buffer_then_holds() {
+        let mut fader = Fader::new(1.0);
+        let mut left = vec![1.0f32; 4];
+        let mut right = vec![1.0f32; 4];
+        fader.planar(&mut [&mut left, &mut right], 0.0);
+        assert_eq!(left, [0.75, 0.5, 0.25, 0.0]);
+        assert_eq!(right, left);
+
+        let mut next = vec![1.0f32; 4];
+        fader.planar(&mut [&mut next], 0.0);
+        assert_eq!(next, [0.0; 4]);
+    }
+
+    #[test]
+    fn interleaved_channels_of_a_frame_share_its_gain() {
+        let mut fader = Fader::new(0.0);
+        let mut buf = [1.0f32, -1.0, 1.0, -1.0];
+        fader.interleaved(&mut buf, 2, 1.0);
+        assert_eq!(buf, [0.5, -0.5, 1.0, -1.0]);
     }
 }

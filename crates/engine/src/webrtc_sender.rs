@@ -7,7 +7,7 @@ use spaghetti_common::ipc_protocol::{FlowStatus, WebRtcPeer};
 use tokio::sync::mpsc::Sender;
 
 use crate::codec::{Codec, Encoder};
-use crate::mixer;
+use crate::mixer::Fader;
 use crate::ring::{CHANNELS, Ring};
 use crate::sinks::SourceTiming;
 use crate::webrtc::{Media, OutgoingPacket, PeerLink};
@@ -96,6 +96,7 @@ fn encode(
     let frames_per_packet = encoder.frames_per_packet();
     let ticks_per_second = unsafe { AudioGetHostClockFrequency() };
     let mut pcm = vec![0.0; frames_per_packet * CHANNELS];
+    let mut fader = Fader::new(f32::from_bits(volume.load(Ordering::Relaxed)));
     let mut rtp_time = 0u64;
     while !stop.load(Ordering::Relaxed) {
         if packets.is_closed() {
@@ -104,7 +105,8 @@ fn encode(
         while ring.available() >= frames_per_packet && !packets.is_closed() {
             let captured = ring.captured_at(source_rate, ticks_per_second);
             ring.pop_into(&mut pcm);
-            mixer::apply_volume(&mut pcm, f32::from_bits(volume.load(Ordering::Relaxed)));
+            let gain = f32::from_bits(volume.load(Ordering::Relaxed));
+            fader.interleaved(&mut pcm, CHANNELS, gain);
             let encoded = encoder.encode(&pcm, |packet| {
                 let _ = packets.try_send(OutgoingPacket {
                     rtp_time,

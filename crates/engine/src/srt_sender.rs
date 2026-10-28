@@ -8,7 +8,7 @@ use spaghetti_common::ipc_protocol::{FlowStatus, SrtSocket};
 
 use crate::adts;
 use crate::codec::{Codec, Encoder};
-use crate::mixer;
+use crate::mixer::Fader;
 use crate::ring::{CHANNELS, Ring};
 use crate::sinks::SourceTiming;
 use crate::srt::{SrtEndpoint, SrtLink};
@@ -103,6 +103,7 @@ fn encode(
     let ticks_per_second = unsafe { AudioGetHostClockFrequency() };
     let ticks_per_unit = frames_per_packet as u64 * 90_000;
     let mut pcm = vec![0.0; frames_per_packet * CHANNELS];
+    let mut fader = Fader::new(f32::from_bits(volume.load(Ordering::Relaxed)));
     let mut muxer = TsMuxer::new();
     let (mut adts, mut stream) = (Vec::new(), Vec::new());
     let mut units = 0u64;
@@ -111,7 +112,8 @@ fn encode(
         while ring.available() >= frames_per_packet && !closed {
             let origin = ring.captured_at(source_rate, ticks_per_second);
             ring.pop_into(&mut pcm);
-            mixer::apply_volume(&mut pcm, f32::from_bits(volume.load(Ordering::Relaxed)));
+            let gain = f32::from_bits(volume.load(Ordering::Relaxed));
+            fader.interleaved(&mut pcm, CHANNELS, gain);
             let encoded = encoder.encode(&pcm, |unit| {
                 adts.clear();
                 if let Err(e) = adts::adts_frame(format, unit, &mut adts) {
