@@ -26,6 +26,9 @@ const CONTROL_DAMPING: f64 = 1.0;
 /// Claude: a scheduled playout further off its schedule than this re-primes
 /// rather than resample its way back.
 const RESCHEDULE_SECONDS: f64 = 0.02;
+/// Claude: how long playback ramps up from silence once primed, so it starts
+/// without a click wherever in the waveform it begins.
+const FADE_IN_SECONDS: f64 = 0.005;
 
 /// Claude: a route that plays each frame `delay` seconds after the source
 /// captured it, on a device that takes `latency` seconds from a render's
@@ -67,6 +70,9 @@ pub struct Playout {
     fill_avg: f64,
     controller: FillController,
     schedule: Option<Scheduled>,
+    fade_in_frames: usize,
+    /// Claude: frames played since priming, up to `fade_in_frames`.
+    faded: usize,
     health: Arc<PlayoutHealth>,
 }
 
@@ -207,6 +213,8 @@ impl Playout {
             primed: false,
             fill_avg: 0.0,
             controller: FillController::new(source_rate),
+            fade_in_frames: (FADE_IN_SECONDS * source_rate).ceil() as usize,
+            faded: 0,
             schedule: schedule.map(|schedule| Scheduled {
                 delay: schedule.delay * ticks_per_second,
                 latency: schedule.latency * ticks_per_second,
@@ -283,6 +291,7 @@ impl Playout {
             }
             ring.discard((fill - target as f64) as usize);
             self.primed = true;
+            self.faded = 0;
             self.fill_avg = target as f64;
         } else if ring.available() < need {
             self.reprime(Glitch::Underrun, span, target, out);
@@ -311,6 +320,7 @@ impl Playout {
         );
 
         let got = ring.pop_into(&mut self.input[..need * CHANNELS]);
+        self.fade_in(0, got);
         self.indexing.partial_len = (got < need).then_some(got);
         if !self.resample(need, out) {
             silence(out);
@@ -369,6 +379,7 @@ impl Playout {
                 return;
             }
             self.primed = true;
+            self.faded = 0;
             self.schedule.as_mut().expect("scheduled").lateness_avg = 0.0;
         } else if ring.available() < need {
             self.reprime(Glitch::Underrun, 0.0, 0, out);
@@ -394,6 +405,7 @@ impl Playout {
 
         self.input[..lead * CHANNELS].fill(0.0);
         let got = ring.pop_into(&mut self.input[lead * CHANNELS..need * CHANNELS]);
+        self.fade_in(lead, got);
         self.indexing.partial_len = (lead + got < need).then_some(lead + got);
         if !self.resample(need, out) {
             silence(out);
@@ -401,6 +413,18 @@ impl Playout {
         let _ = self
             .resampler
             .set_resample_ratio_relative(1.0 / (1.0 + self.controller.correction), true);
+    }
+
+    /// Claude: scales `frames` input frames from `from` on along the fade-in.
+    fn fade_in(&mut self, from: usize, frames: usize) {
+        let fading = frames.min(self.fade_in_frames.saturating_sub(self.faded));
+        for frame in from..from + fading {
+            self.faded += 1;
+            let gain = self.faded as f32 / self.fade_in_frames as f32;
+            for sample in &mut self.input[frame * CHANNELS..][..CHANNELS] {
+                *sample *= gain;
+            }
+        }
     }
 
     fn reprime(
@@ -1406,5 +1430,35 @@ mod tests {
         assert_eq!(sim.playout.health.report().underruns, 1);
         let error = sim.schedule_error(SCHEDULE, 2.0);
         assert!(error.abs() < 20e-6, "{} µs off", error * 1e6);
+    }
+    /// Claude: the output's peak over `frames` frames from `at`.
+    fn peak(samples: &[f32], at: usize, frames: usize) -> f32 {
+        samples[at..at + frames]
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()))
+    }
+
+    #[test]
+    fn fades_in_when_it_starts_playing() {
+        let delivered = Sim::new(48000.0, 48000.0, 512, 0.0);
+        let scheduled = Sim::scheduled(
+            48000.0,
+            48000.0,
+            0.0,
+            SCHEDULE,
+            on_time(48000.0, 960, 100.0),
+            0.0071,
+        );
+        for (label, mut sim) in [("delivered", delivered), ("scheduled", scheduled)] {
+            sim.run(2.0);
+            let start = sim.rendered.iter().position(|s| *s != 0.0).unwrap();
+            let opening = peak(&sim.rendered, start, 24);
+            let steady = peak(&sim.rendered, start + 960, 960);
+            assert!(
+                opening < 0.1 * steady,
+                "{label}: opens at {opening} of {steady}"
+            );
+            assert!((steady - 0.5).abs() < 0.01, "{label}: steady at {steady}");
+        }
     }
 }

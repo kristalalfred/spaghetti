@@ -1,3 +1,8 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use coreaudio_sys::{AudioGetCurrentHostTime, AudioGetHostClockFrequency};
+
 /// Mix multiple audio sources with individual volumes into an output buffer.
 /// All buffers are interleaved f32.
 #[allow(dead_code)]
@@ -12,6 +17,58 @@ pub fn mix(inputs: &[&[f32]], volumes: &[f32], output: &mut [f32]) {
 
     for sample in output.iter_mut() {
         *sample = sample.clamp(-1.0, 1.0);
+    }
+}
+
+/// Claude: how long a new tap waits for its first cycles, and a route for its
+/// fade-out, before going on regardless.
+pub const START_LIMIT: Duration = Duration::from_millis(250);
+pub const FADE_LIMIT: Duration = Duration::from_millis(250);
+/// Claude: an output that has not cycled for this long is not playing.
+pub const IDLE: Duration = Duration::from_millis(100);
+
+/// Claude: counts the cycles of an IOProc or render callback and when the
+/// latest ran, so the control side can wait for a change to take effect there.
+pub struct Cycles {
+    count: AtomicU64,
+    at: AtomicU64,
+}
+
+impl Cycles {
+    pub fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            at: AtomicU64::new(0),
+        }
+    }
+
+    /// Claude: real-time safe, called once a cycle's output is written. `now`
+    /// is the cycle's host time.
+    pub fn tick(&self, now: u64) {
+        self.at.store(now, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Release);
+    }
+
+    /// Claude: whether a cycle ran within `within`.
+    pub fn running(&self, within: Duration) -> bool {
+        let ticks = within.as_secs_f64() * unsafe { AudioGetHostClockFrequency() };
+        let now = unsafe { AudioGetCurrentHostTime() };
+        let at = self.at.load(Ordering::Relaxed);
+        at != 0 && (now.saturating_sub(at) as f64) < ticks
+    }
+
+    /// Claude: waits until `cycles` more cycles have run, or `limit` passed.
+    /// Returns whether they ran.
+    pub fn wait(&self, cycles: u64, limit: Duration) -> bool {
+        let target = self.count.load(Ordering::Acquire) + cycles;
+        let deadline = Instant::now() + limit;
+        while self.count.load(Ordering::Acquire) < target {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
     }
 }
 
@@ -147,6 +204,25 @@ mod tests {
         assert_eq!(fader.ramp(2, 0.0).collect::<Vec<_>>(), [0.5, 0.0]);
         assert_eq!(fader.ramp(0, 1.0).count(), 0);
         assert_eq!(fader.ramp(1, 0.0).collect::<Vec<_>>(), [0.0]);
+    }
+
+    #[test]
+    fn waiting_for_cycles_returns_once_they_run_or_gives_up() {
+        let cycles = std::sync::Arc::new(Cycles::new());
+        assert!(!cycles.running(Duration::from_secs(1)));
+        assert!(!cycles.wait(1, Duration::from_millis(20)));
+        let ticking = std::thread::spawn({
+            let cycles = std::sync::Arc::clone(&cycles);
+            move || {
+                for _ in 0..3 {
+                    std::thread::sleep(Duration::from_millis(5));
+                    cycles.tick(unsafe { AudioGetCurrentHostTime() });
+                }
+            }
+        });
+        assert!(cycles.wait(2, Duration::from_secs(1)));
+        ticking.join().unwrap();
+        assert!(cycles.running(Duration::from_secs(1)));
     }
 
     #[test]

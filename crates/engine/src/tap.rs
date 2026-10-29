@@ -10,8 +10,10 @@ use coreaudio_sys::*;
 use spaghetti_common::ipc_protocol::{AppInfo, FlowStatus, TapMode};
 
 use crate::abl;
+use crate::bus::is_running_output;
 use crate::delivery::DeliverySpan;
 use crate::flow::{FlowMeter, Link};
+use crate::mixer::{Cycles, START_LIMIT};
 use crate::ring::{CHANNELS, Ring};
 use crate::sinks::{MAX_SINKS, Sinks, SourceTiming};
 
@@ -104,6 +106,7 @@ struct CaptureState {
     sinks: Sinks,
     meter: FlowMeter,
     delivery: Arc<DeliverySpan>,
+    cycles: Cycles,
     logged_once: AtomicBool,
 }
 
@@ -118,7 +121,13 @@ impl Capture {
     /// Claude: a tap aggregate runs only one IOProc. Starting a second one halts IO
     /// for every IOProc on the device, and removing it does not resume IO, so all
     /// routes on a tap share this IOProc and get their frames through `Sinks`.
-    fn start(device: AudioObjectID, state: Arc<CaptureState>) -> Result<Self, String> {
+    /// While the tapped processes play, it returns once the IOProc has run, so a
+    /// tap that mutes them already does when it returns.
+    fn start(
+        device: AudioObjectID,
+        state: Arc<CaptureState>,
+        playing: bool,
+    ) -> Result<Self, String> {
         let mut ioproc_id: AudioDeviceIOProcID = None;
         let status = unsafe {
             AudioDeviceCreateIOProcID(
@@ -134,11 +143,14 @@ impl Capture {
         let capture = Self {
             device,
             ioproc_id,
-            _state: state,
+            _state: Arc::clone(&state),
         };
         let status = unsafe { AudioDeviceStart(device, ioproc_id) };
         if status != 0 {
             return Err(format!("AudioDeviceStart (IOProc) failed: {status:#010x}"));
+        }
+        if playing {
+            state.cycles.wait(2, START_LIMIT);
         }
         Ok(capture)
     }
@@ -219,6 +231,7 @@ impl TapSource {
                 sinks: Sinks::new(),
                 meter: FlowMeter::new(),
                 delivery: Arc::new(DeliverySpan::new(0.0)),
+                cycles: Cycles::new(),
                 logged_once: AtomicBool::new(false),
             }),
             opened: None,
@@ -282,7 +295,8 @@ impl TapSource {
             .insert(Box::new(ring))
             .map_err(|_| format!("a source can feed at most {MAX_SINKS} routes"))?;
         if self.capture.is_none() {
-            match Capture::start(aggregate, Arc::clone(&self.state)) {
+            let playing = self.pids.iter().any(|&pid| is_running_output(pid));
+            match Capture::start(aggregate, Arc::clone(&self.state), playing) {
                 Ok(capture) => self.capture = Some(capture),
                 Err(e) => {
                     self.state.sinks.remove(slot);
@@ -396,6 +410,7 @@ unsafe extern "C" fn capture_ioproc(
     state
         .meter
         .record((frames * CHANNELS * std::mem::size_of::<f32>()) as u64, now);
+    state.cycles.tick(now);
 
     if !state.logged_once.swap(true, Ordering::Relaxed)
         && let Some(first) = buffers.first()

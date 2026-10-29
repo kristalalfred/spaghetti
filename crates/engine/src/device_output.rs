@@ -7,7 +7,7 @@ use spaghetti_common::ipc_protocol::FlowStatus;
 use crate::abl;
 use crate::audio;
 use crate::flow::{FlowMeter, Link};
-use crate::mixer::Fader;
+use crate::mixer::{Cycles, Fader};
 use crate::playout::{Playout, PlayoutHealth, Schedule};
 use crate::ring::{CHANNELS, Ring};
 use crate::sinks::SourceTiming;
@@ -24,6 +24,7 @@ pub struct DeviceOutput {
     unit: OutputUnit,
     health: Arc<PlayoutHealth>,
     meter: Arc<FlowMeter>,
+    cycles: Arc<Cycles>,
     reported_glitches: [u32; 4],
     scheduled: bool,
 }
@@ -91,11 +92,21 @@ impl DeviceOutput {
         );
 
         let meter = Arc::new(FlowMeter::new());
-        unsafe { unit.connect(ring, playout, volume, Arc::clone(&meter)) }?;
+        let cycles = Arc::new(Cycles::new());
+        unsafe {
+            unit.connect(
+                ring,
+                playout,
+                volume,
+                Arc::clone(&meter),
+                Arc::clone(&cycles),
+            )
+        }?;
         Ok(Self {
             unit,
             health,
             meter,
+            cycles,
             reported_glitches: [0; 4],
             scheduled: schedule.is_some(),
         })
@@ -112,6 +123,11 @@ impl DeviceOutput {
 
     pub fn start(&self) -> Result<(), String> {
         unsafe { self.unit.start() }
+    }
+
+    /// Claude: the render callback's cycles.
+    pub fn cycles(&self) -> &Cycles {
+        &self.cycles
     }
 
     pub fn log_health(&mut self, route_id: u32, ring: &Ring) {
@@ -161,6 +177,7 @@ struct OutputCallbackState {
     volume: Arc<AtomicU32>,
     fader: Fader,
     meter: Arc<FlowMeter>,
+    cycles: Arc<Cycles>,
     logged_once: bool,
 }
 
@@ -263,6 +280,7 @@ impl OutputUnit {
         playout: Playout,
         volume: Arc<AtomicU32>,
         meter: Arc<FlowMeter>,
+        cycles: Arc<Cycles>,
     ) -> Result<(), String> {
         self.render_state = Box::into_raw(Box::new(OutputCallbackState {
             ring,
@@ -270,6 +288,7 @@ impl OutputUnit {
             fader: Fader::new(f32::from_bits(volume.load(Ordering::Relaxed))),
             volume,
             meter,
+            cycles,
             logged_once: false,
         }));
 
@@ -373,6 +392,7 @@ unsafe extern "C" fn route_render_callback(
 
     let volume = f32::from_bits(state.volume.load(Ordering::Relaxed));
     state.fader.planar(&mut out, volume);
+    state.cycles.tick(now);
 
     if !state.logged_once {
         state.logged_once = true;

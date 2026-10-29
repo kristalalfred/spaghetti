@@ -10,7 +10,7 @@ use spaghetti_common::ipc_protocol::TapMode;
 
 use crate::abl;
 use crate::flow::FlowMeter;
-use crate::mixer::Fader;
+use crate::mixer::{Cycles, Fader, START_LIMIT};
 use crate::ring::CHANNELS;
 use crate::rt_slots::RtSlots;
 use crate::tap::AGGREGATE_UID_PREFIX;
@@ -99,6 +99,7 @@ struct SlotMix {
     volume: Arc<AtomicU32>,
     fader: Fader,
     meter: Arc<FlowMeter>,
+    cycles: Arc<Cycles>,
 }
 
 struct BusState {
@@ -262,13 +263,16 @@ impl DeviceBus {
     }
 
     /// Claude: mixes the processes into the device at the route's volume from
-    /// now on, returning the slot that does it.
+    /// now on, returning the slot that does it. While the processes play, it
+    /// returns once the bus has read the slot, so a tap that mutes them already
+    /// does when it returns.
     pub fn attach(
         &mut self,
         pids: &[u32],
         mode: TapMode,
         volume: Arc<AtomicU32>,
         meter: Arc<FlowMeter>,
+        cycles: Arc<Cycles>,
     ) -> Result<usize, String> {
         if lock(&self.watched.running).is_none() {
             self.restart()?;
@@ -286,6 +290,7 @@ impl DeviceBus {
             volume,
             fader: Fader::new(gain),
             meter,
+            cycles: Arc::clone(&cycles),
         };
         let index = self
             .state
@@ -298,6 +303,9 @@ impl DeviceBus {
         }
         self.attached[slot] = Some(index);
         lock(&self.watched.pids)[slot] = pids.to_vec();
+        if pids.iter().any(|&pid| is_running_output(pid)) {
+            cycles.wait(2, START_LIMIT);
+        }
         Ok(slot)
     }
 
@@ -392,7 +400,7 @@ fn watch(watched: &Watched, device_uid: &str) {
     }
 }
 
-fn is_running_output(pid: u32) -> bool {
+pub fn is_running_output(pid: u32) -> bool {
     let address = |selector| AudioObjectPropertyAddress {
         mSelector: selector,
         mScope: kAudioObjectPropertyScopeGlobal,
@@ -542,6 +550,7 @@ unsafe extern "C" fn bus_ioproc(
             }
             mix.meter
                 .record((frames * CHANNELS * std::mem::size_of::<f32>()) as u64, now);
+            mix.cycles.tick(now);
         })
     };
     out.clamp();
