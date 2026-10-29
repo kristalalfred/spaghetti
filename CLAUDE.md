@@ -30,7 +30,7 @@ Daemon logs: `~/Library/Logs/spaghetti/spaghettid.log`. Follow with `spaghetti d
 
 ## Architecture: source → route pipeline
 
-The routing path is the trickiest part. A tap routed to a device goes through that device's bus:
+The routing path is the trickiest part. A tap routed to a device without a delay goes through that device's bus:
 
 ```
 target apps
@@ -44,7 +44,7 @@ target apps
 
 Changing an aggregate's tap list while it runs drops 20–35 ms of audio for every tap in it, but pointing a tap at other processes does not, so a bus keeps a fixed set of slot taps, points free ones at no process, and doubles them in one rebuild when full. Every tap costs `coreaudiod` CPU each cycle, empty or not. A started aggregate waits for a tapped app to play before it runs but keeps running after the apps stop, so the bus watcher restarts it once no slot's process has played for 3 s.
 
-Every other route goes through a ring. Flow for a tap routed to SRT or WebRTC:
+Every other route goes through a ring. Flow for a tap routed to SRT, WebRTC or a device on a delay:
 
 ```
 target app
@@ -70,12 +70,20 @@ SRT destination: the route's ring → encoder thread (every 5 ms, 1024-frame chu
 
 WebRTC source: str0m MediaData (40 ms reorder timeout) → decoder thread: one AudioToolbox
   Opus decode per packet, an empty-packet concealment per missing 20 ms of RTP time
-  → 48 kHz stereo into the same per route rings
+  → 48 kHz stereo into the same per route rings, dated by the sender's clock once known
 
 WebRTC destination: the route's ring → encoder thread (every 5 ms, 960-frame chunks)
   → AudioToolbox Opus 48 kHz stereo, 20 ms packets, RTP time +960 each, wallclock = capture time
   → one str0m Writer::write per packet, dropped until connected
+
+WebRTC clock: the offerer adds an unordered, unretransmitted "clock" data channel. The
+  receiving end probes every 100 ms, then every second after ten round trips; the sending end
+  replies with its host clock and the RTP and capture time of its latest packet. `SenderClock`
+  filters the round trips into the sender's offset and drift, and dates each decoded frame
+  as captured on this host's clock, net of Opus's 312-frame pre-skip
 ```
+
+Ring pushes carry the host time their first frame was captured, when the source knows it: a tap's IOProc input time, or a WebRTC source's date from its sender's clock. A device route with a delay plays on a schedule rather than on its fill: unprimed, `Playout` drops frames already too late and starts the earliest mid-render behind silence; primed, the PI controller trims the ratio against how far the tail frame runs from sounding `delay` after its capture, counting the device's own and its stream's latency. Routes with one delay play their source in step, within a frame or two on one host and within the clock estimate across hosts. SRT sources do not date their frames.
 
 A source reports its `SourceTiming`: its rate, and its `DeliverySpan`, how far behind their capture its frames may land. A tap publishes its IOProc buffer; SRT and WebRTC sources measure the span from each push's media time and arrival, growing it at once past a stall it fell short of and shedding it slowly once delivery calms. `Playout` holds the live span on top of what the resampler needs, and re-primes once when the span grows under a playing route rather than resample audibly up to it.
 
@@ -84,8 +92,9 @@ Key files:
 - `crates/engine/src/bus.rs` — `DeviceBus`: the slot taps and aggregate device that mix taps into one device, `bus_ioproc`, and the watcher that lets an idle bus wait for an app to play.
 - `crates/engine/src/tap.rs` — `TapSource`: a process tap, its private aggregate device and the capture IOProc (`capture_ioproc`) that pushes into every attached route's ring, opened only while a ring route needs them. FFI wrappers around the ObjC bridge, and `list_audio_apps`.
 - `crates/engine/src/device_output.rs` — `DeviceOutput`: a route's output AUHAL and `route_render_callback`.
-- `crates/engine/src/playout.rs` — `Playout`, a route's output side: the resampler, jitter buffer and clock-drift controller between the ring and the render callback.
-- `crates/engine/src/ring.rs` — the SPSC ring of interleaved stereo frames.
+- `crates/engine/src/playout.rs` — `Playout`, a route's output side: the resampler, jitter buffer and clock-drift controller between the ring and the render callback, or on a `Schedule`, the same controller holding each frame to its capture time plus the delay.
+- `crates/engine/src/clock.rs` — `ClockFilter`, a two-state Kalman filter over a remote clock's offset and drift after Sendspin's time filter, the clock channel's `ClockMessage`s, and `SenderClock`, which dates a WebRTC source's frames.
+- `crates/engine/src/ring.rs` — the SPSC ring of interleaved stereo frames, with the capture time of its latest push.
 - `crates/engine/src/delivery.rs` — `DeliverySpan`, the span a source shares with its routes, and `DeliveryMeter`, which measures it for network sources.
 - `crates/engine/src/sinks.rs` + `rt_slots.rs` — `Sinks`, the rings a source feeds, held in `RtSlots`, the lock-free handoff that lets routes join and leave a running capture.
 - `crates/engine/bridge/tap_bridge.m` + `.h` — ObjC bridge for `AudioHardwareCreateProcessTap`, retargeting taps, and aggregate device creation. Compiled by `build.rs`.

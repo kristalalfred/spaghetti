@@ -8,6 +8,11 @@ use crate::ring::CHANNELS;
 /// Claude: every stream is decoded at this rate, so a source can report its
 /// timing before its first packet says what the stream's rate is.
 pub const DECODED_RATE: u32 = 48000;
+/// Claude: how many frames at 48 kHz a decoded Opus packet's audio trails its
+/// RTP time by, its decoded frames ending where the packet's span ends: the
+/// encoder's pre-skip. AudioToolbox drops part of it from the first packet, so
+/// that packet decodes short.
+pub const OPUS_DELAY_FRAMES: u32 = 312;
 /// Claude: returned by the input callbacks once their packet is consumed. The
 /// converter stops filling and hands the status back to `AudioConverterFillComplexBuffer`.
 const DRAINED: OSStatus = 0x64726e64;
@@ -569,5 +574,50 @@ pub mod tests {
         );
         let (hz, _) = measure(&pcm[pcm.len() / 2..], 2, 48000.0);
         assert!((hz - 1000.0).abs() < 5.0, "{hz} Hz");
+    }
+    #[test]
+    fn opus_audio_trails_its_rtp_time_by_its_known_frames() {
+        let mut encoder = Encoder::new(Codec::Opus, 48000).unwrap();
+        let chunk = encoder.frames_per_packet();
+        let onset = chunk * 5 + 123;
+        let total = chunk * 20;
+        let sweep = |f: usize| {
+            let t = f.saturating_sub(onset) as f64 / 48000.0;
+            let phase = 2.0 * std::f64::consts::PI * (700.0 * t + 2300.0 * t * t);
+            if f < onset {
+                0.0
+            } else {
+                0.5 * phase.sin() as f32
+            }
+        };
+        let pcm: Vec<f32> = (0..total).flat_map(|f| [sweep(f); CHANNELS]).collect();
+        let mut units = Vec::new();
+        for chunk in pcm.chunks(chunk * CHANNELS) {
+            encoder
+                .encode(chunk, |unit| units.push(unit.to_vec()))
+                .unwrap();
+        }
+        let mut decoder = Decoder::new(Codec::Opus, encoder.format()).unwrap();
+        let mut by_rtp_time = vec![0.0f32; total];
+        for (packet, unit) in units.iter().enumerate() {
+            let mut decoded = Vec::new();
+            let frames = decoder.decode(unit, &mut decoded).unwrap();
+            let start = (packet + 1) * chunk - frames;
+            for (frame, samples) in decoded.chunks(CHANNELS).enumerate() {
+                by_rtp_time[start + frame] = samples[0];
+            }
+        }
+        let correlation = |delay: usize| -> f32 {
+            (onset..onset + 4000)
+                .map(|f| sweep(f) * by_rtp_time.get(f + delay).copied().unwrap_or(0.0))
+                .sum()
+        };
+        let delay = (0..1500)
+            .max_by(|&a, &b| correlation(a).total_cmp(&correlation(b)))
+            .unwrap();
+        assert!(
+            delay.abs_diff(OPUS_DELAY_FRAMES as usize) <= 1,
+            "Opus audio trails its RTP time by {delay} frames"
+        );
     }
 }

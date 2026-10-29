@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use coreaudio_sys::AudioGetCurrentHostTime;
 use spaghetti_common::ipc_protocol::{FlowState, FlowStatus, PeerRole, TurnServer, WebRtcPeer};
 use str0m::change::{SdpAnswer, SdpOffer, SdpPendingOffer};
+use str0m::channel::{ChannelConfig, ChannelData, ChannelId, Reliability};
 use str0m::format::{Codec, FormatParams};
 use str0m::media::{Direction, Frequency, MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{Protocol, Receive, Transmit};
@@ -15,6 +16,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio_util::sync::{CancellationToken, DropGuard};
 
+use crate::clock::{Capture, ClockMessage, SenderClock, now_nanos};
 use crate::flow::FlowMeter;
 use crate::stun;
 use crate::turn::{Received, Relays};
@@ -32,14 +34,24 @@ const OPUS_PT: u8 = 111;
 const DATAGRAM_MAX: usize = 2048;
 const ARRIVALS_MAX: usize = 256;
 const CLOSE_PASSES: usize = 4;
+/// Claude: the data channel on which a receiver learns its sender's clock.
+const CLOCK_CHANNEL: &str = "clock";
+/// Claude: a receiver probes this often at first, so the clock is known soon
+/// after the link connects, and every `PROBE_INTERVAL` once it has
+/// `QUICK_PROBES` round trips.
+const QUICK_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+const QUICK_PROBES: u32 = 10;
+const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 static CRYPTO: Once = Once::new();
 
-/// Claude: one Opus packet on its way out: its RTP time at 48 kHz and when its
-/// audio was captured.
+/// Claude: one Opus packet on its way out: its RTP time at 48 kHz, when its
+/// audio was captured, and the host time in nanoseconds its first frame was
+/// captured when the source knows it.
 pub struct OutgoingPacket {
     pub rtp_time: u64,
     pub captured: Instant,
+    pub captured_nanos: Option<u64>,
     pub data: Vec<u8>,
 }
 
@@ -49,10 +61,14 @@ pub struct IncomingPacket {
     pub data: Arc<[u8]>,
 }
 
-/// Claude: the media a link carries, and which way.
+/// Claude: the media a link carries, and which way. A receiver learns the
+/// sender's clock into `clock` as the link runs.
 pub enum Media {
     Send(mpsc::Receiver<OutgoingPacket>),
-    Receive(SyncSender<IncomingPacket>),
+    Receive {
+        packets: SyncSender<IncomingPacket>,
+        clock: Arc<SenderClock>,
+    },
 }
 
 impl Media {
@@ -64,7 +80,7 @@ impl Media {
     async fn outgoing(&mut self) -> Option<OutgoingPacket> {
         match self {
             Self::Send(packets) => packets.recv().await,
-            Self::Receive(_) => std::future::pending().await,
+            Self::Receive { .. } => std::future::pending().await,
         }
     }
 }
@@ -611,6 +627,12 @@ impl Gathering {
         };
         let mut changes = rtc.sdp_api();
         let mid = changes.add_media(MediaKind::Audio, direction, None, None, None);
+        changes.add_channel_with_config(ChannelConfig {
+            label: CLOCK_CHANNEL.into(),
+            ordered: false,
+            reliability: Reliability::MaxRetransmits { retransmits: 0 },
+            ..ChannelConfig::default()
+        });
         let (offer, pending) = changes.apply().expect("new media needs an offer");
         let mut session = self.into_session(rtc, gathered, mid);
         session.pending = Some(pending);
@@ -711,6 +733,10 @@ impl Gathering {
             connected: false,
             paths: RecentPaths::default(),
             pt: None,
+            clock: None,
+            probes: 0,
+            probe_at: None,
+            latest: None,
         }
     }
 }
@@ -763,6 +789,13 @@ struct Session {
     connected: bool,
     paths: RecentPaths,
     pt: Option<Pt>,
+    /// Claude: the clock channel, once open.
+    clock: Option<ChannelId>,
+    /// Claude: a receiver's probes so far, and when it sends the next.
+    probes: u32,
+    probe_at: Option<Instant>,
+    /// Claude: a sender's latest packet with a known capture time.
+    latest: Option<Capture>,
 }
 
 impl Session {
@@ -784,7 +817,7 @@ impl Session {
             if self.shared.state().phase.is_final() {
                 break;
             }
-            let wake = [self.connect_by, self.relays.timeout()]
+            let wake = [self.connect_by, self.relays.timeout(), self.probe_at]
                 .into_iter()
                 .flatten()
                 .fold(timeout, Instant::min);
@@ -853,8 +886,19 @@ impl Session {
             Event::StreamPaused(paused) => self.shared.enter(Phase::Receiving {
                 paused: paused.paused,
             }),
+            Event::ChannelOpen(id, label) if label == CLOCK_CHANNEL => {
+                self.clock = Some(id);
+                if !self.media.is_send() {
+                    self.probe_at = Some(Instant::now());
+                }
+            }
+            Event::ChannelClose(id) if self.clock == Some(id) => {
+                self.clock = None;
+                self.probe_at = None;
+            }
+            Event::ChannelData(data) if self.clock == Some(data.id) => self.on_clock(&data),
             Event::MediaData(data) => {
-                let Media::Receive(packets) = &self.media else {
+                let Media::Receive { packets, .. } = &self.media else {
                     return;
                 };
                 self.shared
@@ -925,8 +969,53 @@ impl Session {
         address == self.local || self.others.iter().any(|(_, local)| *local == address)
     }
 
+    /// Claude: a sender answers each probe with its clock and latest capture;
+    /// a receiver feeds each reply to its sender's clock.
+    fn on_clock(&mut self, data: &ChannelData) {
+        let arrived = now_nanos();
+        match (ClockMessage::decode(&data.data), &self.media) {
+            (Some(ClockMessage::Probe { sent }), Media::Send(_)) => {
+                let reply = ClockMessage::Reply {
+                    probe: sent,
+                    received: arrived,
+                    sent: now_nanos(),
+                    latest: self.latest,
+                };
+                self.send_clock(&reply);
+            }
+            (Some(reply @ ClockMessage::Reply { .. }), Media::Receive { clock, .. }) => {
+                clock.record(reply, arrived);
+            }
+            _ => tracing::debug!(link = self.link, "ignored a clock message"),
+        }
+    }
+
+    fn send_clock(&mut self, message: &ClockMessage) {
+        let Some(mut channel) = self.clock.and_then(|id| self.rtc.channel(id)) else {
+            return;
+        };
+        if let Err(e) = channel.write(true, &message.encode()) {
+            tracing::debug!(link = self.link, error = %e, "clock message not sent");
+        }
+    }
+
+    fn probe(&mut self, now: Instant) {
+        if self.probe_at.is_none_or(|at| now < at) {
+            return;
+        }
+        self.send_clock(&ClockMessage::Probe { sent: now_nanos() });
+        self.probes += 1;
+        let interval = if self.probes < QUICK_PROBES {
+            QUICK_PROBE_INTERVAL
+        } else {
+            PROBE_INTERVAL
+        };
+        self.probe_at = Some(now + interval);
+    }
+
     fn tick(&mut self) {
         let now = Instant::now();
+        self.probe(now);
         if self.connect_by.is_some_and(|by| now >= by) {
             self.end(
                 Phase::Unreachable,
@@ -983,6 +1072,12 @@ impl Session {
                 *self.pt.insert(params.pt())
             }
         };
+        if let Some(captured) = packet.captured_nanos {
+            self.latest = Some(Capture {
+                rtp_time: packet.rtp_time,
+                captured,
+            });
+        }
         let len = packet.data.len() as u64;
         let time = MediaTime::new(packet.rtp_time, Frequency::FORTY_EIGHT_KHZ);
         match writer.write(pt, packet.captured, time, packet.data) {

@@ -345,18 +345,20 @@ fn buffer_frames(buffers: &[AudioBuffer]) -> usize {
     }
 }
 
-fn push_buffers(ring: &Ring, buffers: &[AudioBuffer], now: u64) {
+fn push_buffers(ring: &Ring, buffers: &[AudioBuffer], now: u64, captured: u64) {
     let frames = buffer_frames(buffers);
     match buffers {
         [] => {}
         [left, right, ..] => {
             let planes = unsafe { [abl::samples(left), abl::samples(right)] };
-            ring.push_with(frames, now, |f, ch| planes[ch].map_or(0.0, |s| s[f]));
+            ring.push_with(frames, now, Some(captured), |f, ch| {
+                planes[ch].map_or(0.0, |s| s[f])
+            });
         }
         [only] => {
             let channels = only.mNumberChannels.max(1) as usize;
             let samples = unsafe { abl::samples(only) };
-            ring.push_with(frames, now, |f, ch| {
+            ring.push_with(frames, now, Some(captured), |f, ch| {
                 samples.map_or(0.0, |s| s[f * channels + ch.min(channels - 1)])
             });
         }
@@ -367,7 +369,7 @@ unsafe extern "C" fn capture_ioproc(
     _in_device: AudioObjectID,
     _in_now: *const AudioTimeStamp,
     in_input_data: *const AudioBufferList,
-    _in_input_time: *const AudioTimeStamp,
+    in_input_time: *const AudioTimeStamp,
     _out_output_data: *mut AudioBufferList,
     _in_output_time: *const AudioTimeStamp,
     in_client_data: *mut std::ffi::c_void,
@@ -377,13 +379,20 @@ unsafe extern "C" fn capture_ioproc(
     }
 
     let now = unsafe { AudioGetCurrentHostTime() };
+    let captured = unsafe { in_input_time.as_ref() }
+        .filter(|time| time.mFlags & kAudioTimeStampHostTimeValid != 0)
+        .map_or(now, |time| time.mHostTime);
     let state = unsafe { &*(in_client_data as *const CaptureState) };
     let buffers = unsafe { abl::buffers(in_input_data) };
     let frames = buffer_frames(buffers);
     if frames > 0 {
         state.delivery.publish(frames as f64);
     }
-    unsafe { state.sinks.for_each(|ring| push_buffers(ring, buffers, now)) };
+    unsafe {
+        state
+            .sinks
+            .for_each(|ring| push_buffers(ring, buffers, now, captured))
+    };
     state
         .meter
         .record((frames * CHANNELS * std::mem::size_of::<f32>()) as u64, now);

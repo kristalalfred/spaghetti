@@ -163,6 +163,66 @@ fn get_output_channel_count(device_id: AudioObjectID) -> u32 {
     buffers.iter().map(|b| b.mNumberChannels).sum()
 }
 
+/// Claude: how many frames the device takes from its output time stamp until
+/// they sound: its own latency plus its first output stream's.
+pub fn output_latency_frames(device_id: AudioObjectID) -> u32 {
+    let device = get_u32(
+        device_id,
+        kAudioDevicePropertyLatency,
+        kAudioObjectPropertyScopeOutput,
+    );
+    let stream = first_output_stream(device_id).and_then(|stream| {
+        get_u32(
+            stream,
+            kAudioStreamPropertyLatency,
+            kAudioObjectPropertyScopeGlobal,
+        )
+    });
+    device.unwrap_or(0) + stream.unwrap_or(0)
+}
+
+fn get_u32(object: AudioObjectID, selector: u32, scope: u32) -> Option<u32> {
+    let property_address = AudioObjectPropertyAddress {
+        mSelector: selector,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut value: u32 = 0;
+    let mut size = mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            object,
+            &property_address,
+            0,
+            ptr::null(),
+            &mut size,
+            (&mut value as *mut u32).cast(),
+        )
+    };
+    (status == 0).then_some(value)
+}
+
+fn first_output_stream(device_id: AudioObjectID) -> Option<AudioObjectID> {
+    let property_address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyStreams,
+        mScope: kAudioObjectPropertyScopeOutput,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut streams = [0 as AudioObjectID; 16];
+    let mut size = mem::size_of_val(&streams) as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            device_id,
+            &property_address,
+            0,
+            ptr::null(),
+            &mut size,
+            streams.as_mut_ptr().cast(),
+        )
+    };
+    (status == 0 && size >= mem::size_of::<AudioObjectID>() as u32).then_some(streams[0])
+}
+
 /// Get the UID string for a given audio device.
 fn get_device_uid(device_id: AudioObjectID) -> Option<String> {
     let property_address = AudioObjectPropertyAddress {

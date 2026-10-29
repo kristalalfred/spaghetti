@@ -155,39 +155,56 @@ fn direct(sdp: &str, _: bool) -> String {
     sdp.to_string()
 }
 
-/// Claude: feeds a source in real time with a 1 kHz tone, `LEFT` loud on the
-/// left and `RIGHT` on the right, until dropped. While paused it pushes nothing
+/// Claude: feeds a source in real time, by default with a 1 kHz tone `LEFT`
+/// loud on the left and `RIGHT` on the right, until dropped. Each frame is
+/// dated by when real time reached it, so without pauses frame `n` was
+/// captured `n / rate` seconds after `origin`. While paused it pushes nothing
 /// and resumes where it stopped.
 struct Producer {
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    origin: u64,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Producer {
     fn start(sinks: Arc<Sinks>, rate: f64) -> Self {
+        Self::feeding(sinks, rate, move |frame, channel| {
+            let phase = 2.0 * std::f64::consts::PI * TONE_HZ * frame as f64 / rate;
+            [LEFT, RIGHT][channel] * phase.sin() as f32
+        })
+    }
+
+    /// Claude: `sample(frame, channel)` is the source's audio.
+    fn feeding(
+        sinks: Arc<Sinks>,
+        rate: f64,
+        sample: impl Fn(usize, usize) -> f32 + Send + 'static,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
+        let ticks_per_second = unsafe { AudioGetHostClockFrequency() };
+        let origin = unsafe { AudioGetCurrentHostTime() };
         let thread = std::thread::spawn({
             let (stop, paused) = (Arc::clone(&stop), Arc::clone(&paused));
             move || {
                 let chunk = (rate / 100.0) as usize;
-                let (mut start, mut base, mut sent) = (Instant::now(), 0usize, 0usize);
+                let (mut start, mut base, mut sent) = (origin, 0usize, 0usize);
                 while !stop.load(Ordering::Relaxed) {
+                    let now = unsafe { AudioGetCurrentHostTime() };
                     if paused.load(Ordering::Relaxed) {
-                        (start, base) = (Instant::now(), sent);
+                        (start, base) = (now, sent);
                     } else {
-                        let due = base + (start.elapsed().as_secs_f64() * rate) as usize;
+                        let elapsed = (now - start) as f64 / ticks_per_second;
+                        let due = base + (elapsed * rate) as usize;
                         while sent + chunk <= due {
                             let at = sent;
-                            let now = unsafe { AudioGetCurrentHostTime() };
+                            let captured =
+                                start + ((at - base) as f64 / rate * ticks_per_second) as u64;
                             unsafe {
                                 sinks.for_each(|ring| {
-                                    ring.push_with(chunk, now, |f, ch| {
-                                        let phase =
-                                            2.0 * std::f64::consts::PI * TONE_HZ * (at + f) as f64
-                                                / rate;
-                                        [LEFT, RIGHT][ch] * phase.sin() as f32
+                                    ring.push_with(chunk, now, Some(captured), |f, ch| {
+                                        sample(at + f, ch)
                                     });
                                 });
                             }
@@ -201,6 +218,7 @@ impl Producer {
         Self {
             stop,
             paused,
+            origin,
             thread: Some(thread),
         }
     }
@@ -233,6 +251,35 @@ async fn collect(ring: &Arc<Ring>, seconds: f64) -> Vec<f32> {
             std::thread::sleep(Duration::from_millis(10));
         }
         out
+    })
+    .await
+    .unwrap()
+}
+
+/// Claude: the left channel of what reaches `ring` over the next `seconds`,
+/// each frame with the host time the ring dates it by; frames it cannot date
+/// are left out.
+async fn collect_dated(ring: &Arc<Ring>, rate: f64, seconds: f64) -> Vec<(u64, f32)> {
+    let ring = Arc::clone(ring);
+    tokio::task::spawn_blocking(move || {
+        let ticks_per_frame = unsafe { AudioGetHostClockFrequency() } / rate;
+        let mut dated = Vec::new();
+        let mut buffer = vec![0.0; 4096 * CHANNELS];
+        ring.discard(ring.available());
+        let start = Instant::now();
+        while start.elapsed().as_secs_f64() < seconds {
+            let captured =
+                ring.tail_captured(ticks_per_frame, unsafe { AudioGetCurrentHostTime() });
+            let frames = ring.pop_into(&mut buffer);
+            if let Some(captured) = captured {
+                dated.extend((0..frames).map(|f| {
+                    let at = captured as f64 + f as f64 * ticks_per_frame;
+                    (at as u64, buffer[f * CHANNELS])
+                }));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        dated
     })
     .await
     .unwrap()
@@ -271,7 +318,7 @@ async fn play(
     let ring = Arc::clone(ring);
     tokio::task::spawn_blocking(move || {
         let ticks_per_second = unsafe { AudioGetHostClockFrequency() };
-        let mut playout = Playout::new(&timing, 48000.0, ticks_per_second).unwrap();
+        let mut playout = Playout::new(&timing, 48000.0, ticks_per_second, None).unwrap();
         let health = playout.health();
         let frames = 512;
         let period = Duration::from_secs_f64(frames as f64 / 48000.0);
@@ -285,9 +332,8 @@ async fn play(
             if let Some(wait) = due.checked_duration_since(Instant::now()) {
                 std::thread::sleep(wait);
             }
-            playout.render(&ring, &mut [&mut left, &mut right], unsafe {
-                AudioGetCurrentHostTime()
-            });
+            let now = unsafe { AudioGetCurrentHostTime() };
+            playout.render(&ring, &mut [&mut left, &mut right], now, now);
             out.extend_from_slice(&left);
             renders += 1;
             worst_correction_ppm = worst_correction_ppm.max(health.report().correction_ppm.abs());
@@ -1118,4 +1164,70 @@ async fn concealment_keeps_a_lossy_reordered_stream_continuous() {
     let (hz, rms) = measure(steady, 1, 48000.0);
     assert!((hz - TONE_HZ).abs() < 5.0, "{hz} Hz");
     assert!((rms - LEFT / 2f32.sqrt()).abs() < 0.03, "rms {rms}");
+}
+
+/// Claude: a fixed noise sample per frame, the same on both channels.
+fn noise(frame: usize) -> f32 {
+    let mut x = (frame as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    ((x >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.5
+}
+
+/// Claude: once the receiver knows the sender's clock, every frame it passes on
+/// is dated by when the sender captured it. The source plays noise, so the
+/// audio lines up with its dates at one offset only.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_receiving_source_dates_frames_by_when_the_sender_captured_them() {
+    for rate in [48000.0, 44100.0] {
+        let engine = Engine::new();
+        let (fixture, sinks) = engine.fixture(rate);
+        let producer = Producer::feeding(sinks, rate, |frame, _| noise(frame));
+        let source_id = engine.create_source(peer(PeerRole::Answer, "dated")).await;
+        let route = PeerRef::Route(
+            engine
+                .create_route(fixture, peer(PeerRole::Offer, "dated"))
+                .await,
+        );
+        let source = PeerRef::Source(source_id);
+        let (ring, _) = engine.sink(source_id);
+        engine.exchange(route, source, direct).await;
+        engine
+            .wait_for(source, FlowState::Flowing, Duration::from_secs(5))
+            .await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let dated = collect_dated(&ring, 48000.0, 1.0).await;
+        assert!(
+            dated.len() > 24000,
+            "{rate} Hz: {} dated frames",
+            dated.len()
+        );
+        let ticks_per_frame = unsafe { AudioGetHostClockFrequency() } / rate;
+        let frames: Vec<(f64, f32)> = dated
+            .iter()
+            .map(|&(at, sample)| ((at - producer.origin) as f64 / ticks_per_frame, sample))
+            .collect();
+        let correlation = |shift: i64| -> f64 {
+            frames
+                .iter()
+                .step_by(2)
+                .map(|&(frame, sample)| {
+                    let source = (frame.round() as i64 + shift).max(0) as usize;
+                    f64::from(sample) * f64::from(noise(source))
+                })
+                .sum()
+        };
+        let window = (0.02 * rate) as i64;
+        let shift = (-window..=window)
+            .max_by(|&a, &b| correlation(a).total_cmp(&correlation(b)))
+            .unwrap();
+        let late = -shift as f64 / rate;
+        assert!(
+            late.abs() < 0.0005,
+            "{rate} Hz: frames dated {} µs after their capture",
+            late * 1e6
+        );
+    }
 }

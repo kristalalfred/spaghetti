@@ -151,7 +151,7 @@ fn decode(received: Receiver<Bytes>, mut meter: DeliveryMeter, sinks: &Sinks, st
                 media = end;
                 unsafe {
                     sinks.for_each(|ring| {
-                        ring.push_with(frames, stamp, |f, ch| {
+                        ring.push_with(frames, stamp, None, |f, ch| {
                             pcm[f * channels + ch.min(channels - 1)]
                         });
                     });
@@ -181,7 +181,7 @@ fn fill_silence(
         let stamp = (meter.record(start..end, arrival) * ticks_per_second) as u64;
         unsafe {
             sinks.for_each(|ring| {
-                ring.push_with(frames, stamp, |_, _| 0.0);
+                ring.push_with(frames, stamp, None, |_, _| 0.0);
             });
         }
         start = end;
@@ -300,7 +300,7 @@ mod tests {
                 let due = (start.elapsed().as_secs_f64() * 48000.0) as usize;
                 while sent + 480 <= due {
                     let offset = sent % 48000;
-                    ring.push_with(480, unsafe { AudioGetCurrentHostTime() }, |f, ch| {
+                    ring.push_with(480, unsafe { AudioGetCurrentHostTime() }, None, |f, ch| {
                         pcm[((offset + f) % 48000) * CHANNELS + ch]
                     });
                     sent += 480;

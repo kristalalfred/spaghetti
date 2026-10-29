@@ -5,19 +5,22 @@ use coreaudio_sys::*;
 use spaghetti_common::ipc_protocol::FlowStatus;
 
 use crate::abl;
+use crate::audio;
 use crate::flow::{FlowMeter, Link};
 use crate::mixer::Fader;
-use crate::playout::{Playout, PlayoutHealth};
+use crate::playout::{Playout, PlayoutHealth, Schedule};
 use crate::ring::{CHANNELS, Ring};
 use crate::sinks::SourceTiming;
 
 /// Claude: a route's output to a Core Audio device. The device pulls through the
 /// render callback, and `Playout` resamples the route's ring to the device rate.
+/// With a delay, each frame sounds that many seconds after its capture.
 pub struct DeviceOutput {
     unit: OutputUnit,
     health: Arc<PlayoutHealth>,
     meter: Arc<FlowMeter>,
     reported_glitches: [u32; 4],
+    scheduled: bool,
 }
 
 impl DeviceOutput {
@@ -26,6 +29,7 @@ impl DeviceOutput {
         source: SourceTiming,
         ring: Arc<Ring>,
         volume: Arc<AtomicU32>,
+        delay: Option<f64>,
     ) -> Result<Self, String> {
         let mut unit = unsafe { OutputUnit::new(device) }?;
 
@@ -49,9 +53,23 @@ impl DeviceOutput {
         );
         unsafe { unit.set_client_format(&dst_asbd) }?;
 
-        let playout = Playout::new(&source, dst_asbd.mSampleRate, unsafe {
-            AudioGetHostClockFrequency()
-        })?;
+        let schedule = delay.map(|delay| Schedule {
+            delay,
+            latency: f64::from(audio::output_latency_frames(device)) / device_format.mSampleRate,
+        });
+        if let Some(schedule) = schedule {
+            tracing::info!(
+                delay_ms = schedule.delay * 1000.0,
+                latency_ms = schedule.latency * 1000.0,
+                "scheduled playout"
+            );
+        }
+        let playout = Playout::new(
+            &source,
+            dst_asbd.mSampleRate,
+            unsafe { AudioGetHostClockFrequency() },
+            schedule,
+        )?;
         let health = playout.health();
         tracing::info!(
             src_rate = source.sample_rate,
@@ -67,6 +85,7 @@ impl DeviceOutput {
             health,
             meter,
             reported_glitches: [0; 4],
+            scheduled: schedule.is_some(),
         })
     }
 
@@ -99,6 +118,9 @@ impl DeviceOutput {
             target_ms = to_ms(report.target_frames as f64),
             delivery_ms = to_ms(report.delivery_frames),
             correction_ppm = report.correction_ppm,
+            late_ms = self
+                .scheduled
+                .then(|| to_ms(f64::from(report.lateness_frames))),
             underruns = glitches[0],
             reprimes = glitches[1],
             resyncs = glitches[2],
@@ -302,7 +324,7 @@ fn output_planes(buffers: &mut [AudioBuffer], frames: usize) -> Option<[&mut [f3
 unsafe extern "C" fn route_render_callback(
     in_ref_con: *mut std::ffi::c_void,
     _io_action_flags: *mut AudioUnitRenderActionFlags,
-    _in_time_stamp: *const AudioTimeStamp,
+    in_time_stamp: *const AudioTimeStamp,
     _in_bus_number: u32,
     in_number_frames: u32,
     io_data: *mut AudioBufferList,
@@ -326,7 +348,10 @@ unsafe extern "C" fn route_render_callback(
         return 0;
     };
 
-    state.playout.render(&state.ring, &mut out, now);
+    let output = unsafe { in_time_stamp.as_ref() }
+        .filter(|time| time.mFlags & kAudioTimeStampHostTimeValid != 0)
+        .map_or(now, |time| time.mHostTime);
+    state.playout.render(&state.ring, &mut out, now, output);
     if state.playout.is_playing() {
         state.meter.record(
             (in_number_frames as usize * CHANNELS * std::mem::size_of::<f32>()) as u64,

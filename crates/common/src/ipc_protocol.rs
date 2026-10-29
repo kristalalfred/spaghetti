@@ -22,7 +22,7 @@ impl TapMode {
 
 /// Claude: changes whenever a request or response changes shape, so a client
 /// can refuse a daemon it does not speak.
-pub const IPC_VERSION: u32 = 3;
+pub const IPC_VERSION: u32 = 4;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
@@ -78,8 +78,15 @@ pub enum SourceSpec {
 /// Where a route sends its source's audio.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Destination {
-    /// A Core Audio output device, by UID.
-    Device { uid: String },
+    /// A Core Audio output device, by UID. With `delay_ms`, each frame sounds
+    /// that long after its source captured it, so routes with one delay play
+    /// in step, on this Mac and on Macs receiving the source over WebRTC.
+    /// Taps and WebRTC sources date their frames; SRT sources do not.
+    Device {
+        uid: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delay_ms: Option<u32>,
+    },
     /// AAC in MPEG-TS sent over SRT.
     Srt(SrtSocket),
     /// Opus sent to one WebRTC peer: 48 kHz stereo in 20 ms packets.
@@ -342,6 +349,24 @@ mod tests {
             packets_lost: 0,
             packets_retransmitted: 0,
         }
+    }
+
+    #[test]
+    fn a_device_destination_carries_its_delay_only_when_it_has_one() {
+        golden(
+            &Destination::Device {
+                uid: "Speakers".into(),
+                delay_ms: None,
+            },
+            r#"{"Device":{"uid":"Speakers"}}"#,
+        );
+        golden(
+            &Destination::Device {
+                uid: "Speakers".into(),
+                delay_ms: Some(300),
+            },
+            r#"{"Device":{"uid":"Speakers","delay_ms":300}}"#,
+        );
     }
 
     #[test]

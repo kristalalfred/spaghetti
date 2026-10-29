@@ -20,8 +20,14 @@ pub struct Ring {
     /// Claude: the head after the latest push in the high half and that push's
     /// host time in the low half, both truncated to u32 so one atomic holds them.
     last_push: AtomicU64,
+    /// Claude: the head before the latest push in the high half and the host
+    /// time its first frame was captured in the low half, both truncated to u32,
+    /// or `UNTIMED` when that push carried no capture time.
+    captured: AtomicU64,
     overflows: AtomicU32,
 }
+
+const UNTIMED: u64 = u64::MAX;
 
 /// Claude: what the consumer can see of the latest push.
 pub struct LastPush {
@@ -42,6 +48,7 @@ impl Ring {
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
             last_push: AtomicU64::new(0),
+            captured: AtomicU64::new(UNTIMED),
             overflows: AtomicU32::new(0),
         }
     }
@@ -55,12 +62,14 @@ impl Ring {
         self.overflows.load(Ordering::Relaxed)
     }
 
-    /// Claude: producer only. Appends `frames` frames stamped with host time `now`,
-    /// or drops them all when they do not fit.
+    /// Claude: producer only. Appends `frames` frames stamped with host time `now`
+    /// and, when the source knows it, the host time `captured` of their first
+    /// frame, or drops them all when they do not fit.
     pub fn push_with(
         &self,
         frames: usize,
         now: u64,
+        captured: Option<u64>,
         mut sample: impl FnMut(usize, usize) -> f32,
     ) -> bool {
         let head = self.head.load(Ordering::Relaxed);
@@ -78,6 +87,8 @@ impl Ring {
         let new_head = head.wrapping_add(frames);
         self.last_push
             .store(((new_head as u64) << 32) | (now & 0xffff_ffff), Ordering::Release);
+        let captured = captured.map_or(UNTIMED, |at| ((head as u64) << 32) | (at & 0xffff_ffff));
+        self.captured.store(captured, Ordering::Release);
         self.head.store(new_head, Ordering::Release);
         true
     }
@@ -104,6 +115,21 @@ impl Ring {
             / ticks_per_second;
         let age = since_push + last.buffered as f64 / sample_rate;
         now.checked_sub(Duration::from_secs_f64(age)).unwrap_or(now)
+    }
+
+    /// Claude: consumer only. The host time at which the frame at the tail was
+    /// captured, from the latest push's capture time and the frames between, at
+    /// `ticks_per_frame`. `now` places the truncated stamp in full host time.
+    pub fn tail_captured(&self, ticks_per_frame: f64, now: u64) -> Option<u64> {
+        let packed = self.captured.load(Ordering::Acquire);
+        if packed == UNTIMED {
+            return None;
+        }
+        let tail = self.tail.load(Ordering::Relaxed) as u32;
+        let frames = tail.wrapping_sub((packed >> 32) as u32) as i32;
+        let age = (now as u32).wrapping_sub(packed as u32) as i32;
+        let first = now as f64 - f64::from(age);
+        Some((first + f64::from(frames) * ticks_per_frame).max(0.0) as u64)
     }
 
     /// Claude: consumer only. Fills `dst` with up to `dst.len() / CHANNELS` frames
@@ -137,7 +163,9 @@ mod tests {
     use super::*;
 
     fn push_counting(ring: &Ring, start: usize, frames: usize) -> bool {
-        ring.push_with(frames, 0, |f, ch| ((start + f) * CHANNELS + ch) as f32)
+        ring.push_with(frames, 0, None, |f, ch| {
+            ((start + f) * CHANNELS + ch) as f32
+        })
     }
 
     #[test]
@@ -182,12 +210,26 @@ mod tests {
     #[test]
     fn reports_frames_buffered_up_to_the_latest_push() {
         let ring = Ring::new();
-        assert!(ring.push_with(100, 7, |_, _| 0.0));
-        assert!(ring.push_with(50, (1u64 << 32) + 9, |_, _| 0.0));
+        assert!(ring.push_with(100, 7, None, |_, _| 0.0));
+        assert!(ring.push_with(50, (1u64 << 32) + 9, None, |_, _| 0.0));
         let mut dst = vec![0.0; 30 * CHANNELS];
         ring.pop_into(&mut dst);
         let last = ring.last_push();
         assert_eq!((last.buffered, last.at), (120, 9));
+    }
+
+    #[test]
+    fn dates_the_tail_from_the_latest_capture() {
+        let ring = Ring::new();
+        let now = (7u64 << 32) + 5_000;
+        assert_eq!(ring.tail_captured(10.0, now), None);
+        assert!(ring.push_with(100, now, Some(now - 3_000), |_, _| 0.0));
+        assert!(ring.push_with(50, now, Some(now - 2_000), |_, _| 0.0));
+        assert_eq!(ring.tail_captured(10.0, now), Some(now - 3_000));
+        ring.discard(120);
+        assert_eq!(ring.tail_captured(10.0, now), Some(now - 1_800));
+        assert!(ring.push_with(10, now, None, |_, _| 0.0));
+        assert_eq!(ring.tail_captured(10.0, now), None);
     }
 
     #[test]

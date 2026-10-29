@@ -6,7 +6,8 @@ use std::time::Duration;
 use coreaudio_sys::{AudioGetCurrentHostTime, AudioGetHostClockFrequency};
 use spaghetti_common::ipc_protocol::{FlowStatus, WebRtcPeer};
 
-use crate::codec::{Codec, DECODED_RATE, Decoder, StreamFormat};
+use crate::clock::SenderClock;
+use crate::codec::{Codec, DECODED_RATE, Decoder, OPUS_DELAY_FRAMES, StreamFormat};
 use crate::delivery::{DeliveryMeter, DeliverySpan};
 use crate::ring::{CHANNELS, Ring};
 use crate::sinks::{MAX_SINKS, Sinks, SourceTiming};
@@ -42,7 +43,12 @@ impl WebRtcSource {
             },
         )?;
         let (packets, received) = std::sync::mpsc::sync_channel(QUEUED_PACKETS);
-        let link = PeerLink::open(peer, Media::Receive(packets))?;
+        let clock = Arc::new(SenderClock::default());
+        let media = Media::Receive {
+            packets,
+            clock: Arc::clone(&clock),
+        };
+        let link = PeerLink::open(peer, media)?;
         let sinks = Arc::new(Sinks::new());
         let meter = DeliveryMeter::new(f64::from(DECODED_RATE), DELIVERY_JITTER);
         let delivery = meter.span();
@@ -54,7 +60,7 @@ impl WebRtcSource {
                 let sinks = Arc::clone(&sinks);
                 let concealed = Arc::clone(&concealed);
                 let stop = Arc::clone(&stop);
-                move || decode(decoder, received, meter, &sinks, &concealed, &stop)
+                move || decode(decoder, received, meter, &clock, &sinks, &concealed, &stop)
             })
             .map_err(|e| format!("start WebRTC decoder: {e}"))?;
         Ok(Self {
@@ -112,11 +118,15 @@ impl Drop for WebRtcSource {
 /// one decoded or concealed is dropped. Concealment bridges gaps the routes'
 /// jitter buffers outlast; after a longer one they have re-primed and would
 /// only discard it. Each 20 ms lands as a push of its own, so a concealed gap
-/// reads as the late delivery it is, not as one long push.
+/// reads as the late delivery it is, not as one long push. A packet's frames
+/// end where its RTP span ends, since the decoder drops part of the pre-skip
+/// from the first one. Once the sender's clock is known, each push carries
+/// when the sender captured its audio.
 fn decode(
     mut decoder: Decoder,
     received: Receiver<IncomingPacket>,
     mut meter: DeliveryMeter,
+    clock: &SenderClock,
     sinks: &Sinks,
     concealed: &AtomicU64,
     stop: &AtomicBool,
@@ -152,15 +162,19 @@ fn decode(
         }
         last = Some(packet.rtp_time);
         let arrival = unsafe { AudioGetCurrentHostTime() } as f64 / ticks_per_second;
-        let first = packet.rtp_time - bridged * PACKET_FRAMES;
+        let decoded = (pcm.len() / CHANNELS) as u64;
+        let first = (packet.rtp_time + PACKET_FRAMES).wrapping_sub(decoded);
         for (slot, slot_pcm) in pcm.chunks(PACKET_FRAMES as usize * CHANNELS).enumerate() {
             let frames = slot_pcm.len() / CHANNELS;
-            let start = (first + slot as u64 * PACKET_FRAMES) as f64 / rate;
+            let rtp_time = first + slot as u64 * PACKET_FRAMES;
+            let start = rtp_time as f64 / rate;
             let due = meter.record(start..start + frames as f64 / rate, arrival);
             let stamp = (due * ticks_per_second) as u64;
+            let captured =
+                clock.captured(rtp_time.wrapping_sub(u64::from(OPUS_DELAY_FRAMES)), rate);
             unsafe {
                 sinks.for_each(|ring| {
-                    ring.push_with(frames, stamp, |f, ch| slot_pcm[f * CHANNELS + ch]);
+                    ring.push_with(frames, stamp, captured, |f, ch| slot_pcm[f * CHANNELS + ch]);
                 });
             }
         }

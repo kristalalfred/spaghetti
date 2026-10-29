@@ -29,6 +29,13 @@ spaghetti volume 1 0.8
 
 Use an output UID from `system-devices` and a route ID from `routes`.
 
+Play a source in step on several outputs by giving each route the same delay in milliseconds. Each frame then sounds that long after it was captured, including on Macs that receive the source over WebRTC. Taps and WebRTC sources can play on a delay; SRT sources cannot:
+
+```sh
+spaghetti route 1 BuiltInSpeakerDevice --delay 300
+spaghetti route 1 '<device-uid>' --delay 300
+```
+
 Send a source to another machine over SRT, and play what it receives. `srt://:PORT` listens, `srt://HOST:PORT` calls; one side of a link listens and the other calls:
 
 ```sh

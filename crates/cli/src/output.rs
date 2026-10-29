@@ -134,7 +134,14 @@ pub fn print_routes(routes: &[RouteInfo]) {
     let destinations: Vec<String> = routes
         .iter()
         .map(|route| match &route.destination {
-            Destination::Device { uid } => uid.clone(),
+            Destination::Device {
+                uid,
+                delay_ms: None,
+            } => uid.clone(),
+            Destination::Device {
+                uid,
+                delay_ms: Some(delay),
+            } => format!("{uid} +{delay} ms"),
             Destination::Srt(socket) => srt_label(socket),
             Destination::WebRtc(peer) => format!("webrtc {} ({})", peer.link, role_label(peer.role)),
         })
@@ -231,7 +238,10 @@ impl<'a> From<&'a RouteInfo> for RouteJson<'a> {
             route_id: route.route_id,
             source_id: route.source_id,
             destination: match &route.destination {
-                Destination::Device { uid } => EndpointJson::Device { uid },
+                Destination::Device { uid, delay_ms } => EndpointJson::Device {
+                    uid,
+                    delay_ms: *delay_ms,
+                },
                 Destination::Srt(socket) => EndpointJson::srt(socket),
                 Destination::WebRtc(peer) => EndpointJson::webrtc(peer),
             },
@@ -250,6 +260,8 @@ enum EndpointJson<'a> {
     },
     Device {
         uid: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        delay_ms: Option<u32>,
     },
     Srt {
         url: String,
@@ -420,6 +432,7 @@ mod tests {
         assert_eq!(
             route_json(Destination::Device {
                 uid: "SpaghettiDevice_UID".into(),
+                delay_ms: None,
             }),
             format!(
                 r#"{{"route_id":5,"source_id":3,"destination":{{"kind":"device","uid":"SpaghettiDevice_UID"}},"volume":0.8,"status":{FLOWING}}}"#

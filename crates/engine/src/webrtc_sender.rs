@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
-use coreaudio_sys::AudioGetHostClockFrequency;
+use coreaudio_sys::{
+    AudioConvertHostTimeToNanos, AudioGetCurrentHostTime, AudioGetHostClockFrequency,
+};
 use spaghetti_common::ipc_protocol::{FlowStatus, WebRtcPeer};
 use tokio::sync::mpsc::Sender;
 
@@ -84,7 +86,10 @@ impl Drop for WebRtcOutput {
 
 /// Claude: each packet the encoder emits advances the RTP time by its 960
 /// frames at 48 kHz, so the RTP clock counts audio, whatever rate the source
-/// runs at. A packet carries the capture time of the pop that completed it.
+/// runs at. A packet carries the capture time of the pop that completed it,
+/// and, when the source dates its frames, when its own first frame was
+/// captured: by the latest pop's date, the stream's first frame was captured
+/// `fed` source frames earlier, and the packet's lies its RTP time after that.
 fn encode(
     mut encoder: Encoder,
     source_rate: f64,
@@ -95,22 +100,35 @@ fn encode(
 ) {
     let frames_per_packet = encoder.frames_per_packet();
     let ticks_per_second = unsafe { AudioGetHostClockFrequency() };
+    let ticks_per_frame = ticks_per_second / source_rate;
+    let rtp_rate = f64::from(encoder.format().sample_rate);
     let mut pcm = vec![0.0; frames_per_packet * CHANNELS];
     let mut fader = Fader::new(f32::from_bits(volume.load(Ordering::Relaxed)));
     let mut rtp_time = 0u64;
+    let mut fed = 0u64;
     while !stop.load(Ordering::Relaxed) {
         if packets.is_closed() {
             ring.discard(ring.available());
         }
         while ring.available() >= frames_per_packet && !packets.is_closed() {
             let captured = ring.captured_at(source_rate, ticks_per_second);
+            let stream_start = ring
+                .tail_captured(ticks_per_frame, unsafe { AudioGetCurrentHostTime() })
+                .map(|ticks| {
+                    let nanos = unsafe { AudioConvertHostTimeToNanos(ticks) };
+                    nanos as f64 - fed as f64 * 1e9 / source_rate
+                });
             ring.pop_into(&mut pcm);
+            fed += frames_per_packet as u64;
             let gain = f32::from_bits(volume.load(Ordering::Relaxed));
             fader.interleaved(&mut pcm, CHANNELS, gain);
             let encoded = encoder.encode(&pcm, |packet| {
+                let captured_nanos =
+                    stream_start.map(|start| (start + rtp_time as f64 * 1e9 / rtp_rate) as u64);
                 let _ = packets.try_send(OutgoingPacket {
                     rtp_time,
                     captured,
+                    captured_nanos,
                     data: packet.to_vec(),
                 });
                 rtp_time += frames_per_packet as u64;

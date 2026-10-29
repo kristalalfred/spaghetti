@@ -64,6 +64,9 @@ enum Command {
         /// Initial volume (0.0-2.0)
         #[arg(short, long, default_value = "1.0")]
         volume: f32,
+        /// Play each frame this many milliseconds after its capture, in step with other routes given the same delay
+        #[arg(short, long)]
+        delay: Option<u32>,
         #[command(flatten)]
         srt: SrtArgs,
     },
@@ -301,6 +304,7 @@ fn run_command(cmd: Command, out: Output) -> Result<(), Box<dyn Error>> {
             source_id,
             destination,
             volume,
+            delay,
             srt,
         } => {
             check_volume(volume)?;
@@ -308,9 +312,15 @@ fn run_command(cmd: Command, out: Output) -> Result<(), Box<dyn Error>> {
                 return Err("--latency and --passphrase apply only to srt:// destinations".into());
             }
             let destination = if destination.starts_with("srt://") {
+                if delay.is_some() {
+                    return Err("--delay applies only to output devices".into());
+                }
                 Destination::Srt(srt.socket(&destination)?)
             } else {
-                Destination::Device { uid: destination }
+                Destination::Device {
+                    uid: destination,
+                    delay_ms: delay,
+                }
             };
             let Response::RouteCreated { route_id } = client::request(
                 &mut stream,

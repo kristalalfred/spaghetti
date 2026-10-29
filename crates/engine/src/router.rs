@@ -22,6 +22,10 @@ use crate::webrtc::PeerLink;
 use crate::webrtc_receiver::WebRtcSource;
 use crate::webrtc_sender::WebRtcOutput;
 
+/// Claude: the ring holds 2.7 s, which the delay and the source's own
+/// delivery must fit in.
+const MAX_DELAY_MS: u32 = 2000;
+
 enum Source {
     Tap(TapSource),
     Srt(SrtSource),
@@ -111,10 +115,11 @@ impl Output {
         volume: Arc<AtomicU32>,
     ) -> Result<Self, String> {
         match destination {
-            Destination::Device { uid } => {
+            Destination::Device { uid, delay_ms } => {
                 let device = audio::find_device_by_uid(uid)
                     .ok_or_else(|| format!("device '{uid}' not found"))?;
-                unsafe { DeviceOutput::open(device, source, ring, volume) }.map(Self::Device)
+                let delay = delay_ms.map(|ms| f64::from(ms) / 1000.0);
+                unsafe { DeviceOutput::open(device, source, ring, volume, delay) }.map(Self::Device)
             }
             Destination::Srt(socket) => SrtOutput::open(socket, source, ring, volume).map(Self::Srt),
             Destination::WebRtc(peer) => {
@@ -264,7 +269,7 @@ impl Router {
             unreachable!("matched as a tap above");
         };
         for route in self.routes.values().filter(|route| route.source_id == source_id) {
-            if let (Path::Bus { slot, .. }, Destination::Device { uid }) =
+            if let (Path::Bus { slot, .. }, Destination::Device { uid, .. }) =
                 (&route.path, &route.destination)
                 && let Some(bus) = self.buses.get(uid)
             {
@@ -328,9 +333,29 @@ impl Router {
             .get_mut(&source_id)
             .ok_or_else(|| format!("source {source_id} not found"))?;
 
+        if let Destination::Device {
+            delay_ms: Some(delay_ms),
+            ..
+        } = destination
+        {
+            if delay_ms > MAX_DELAY_MS {
+                return Err(format!("a delay is at most {MAX_DELAY_MS} ms"));
+            }
+            if matches!(entry.source, Source::Srt(_)) {
+                return Err(
+                    "an SRT source does not date its frames, so it cannot play on a delay".into(),
+                );
+            }
+        }
         let volume = Arc::new(AtomicU32::new(initial_volume.clamp(0.0, 2.0).to_bits()));
         let path = match (&entry.spec, &destination) {
-            (SourceSpec::Tap { pids, mode }, Destination::Device { uid }) => {
+            (
+                SourceSpec::Tap { pids, mode },
+                Destination::Device {
+                    uid,
+                    delay_ms: None,
+                },
+            ) => {
                 let bus = match self.buses.entry(uid.clone()) {
                     Entry::Occupied(bus) => bus.into_mut(),
                     Entry::Vacant(vacant) => vacant.insert(DeviceBus::open(uid)?),
@@ -401,7 +426,7 @@ impl Router {
                     entry.source.remove_sink(sink_slot);
                 }
             }
-            (Path::Bus { slot, .. }, Destination::Device { uid }) => {
+            (Path::Bus { slot, .. }, Destination::Device { uid, .. }) => {
                 if let Some(bus) = self.buses.get_mut(&uid) {
                     bus.detach(slot);
                     if bus.is_empty() {
@@ -474,7 +499,7 @@ impl Router {
     pub fn routes_targeting(&self, device_uid: &str) -> Vec<u32> {
         self.routes
             .iter()
-            .filter(|(_, r)| matches!(&r.destination, Destination::Device { uid } if uid == device_uid))
+            .filter(|(_, r)| matches!(&r.destination, Destination::Device { uid, .. } if uid == device_uid))
             .map(|(&id, _)| id)
             .collect()
     }

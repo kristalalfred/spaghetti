@@ -23,11 +23,35 @@ const MAX_CORRECTION: f64 = 0.005;
 const AUDIBLE_CORRECTION: f64 = 0.003;
 const CONTROL_RADIANS_PER_SECOND: f64 = 0.1;
 const CONTROL_DAMPING: f64 = 1.0;
+/// Claude: a scheduled playout further off its schedule than this re-primes
+/// rather than resample its way back.
+const RESCHEDULE_SECONDS: f64 = 0.02;
+
+/// Claude: a route that plays each frame `delay` seconds after the source
+/// captured it, on a device that takes `latency` seconds from a render's
+/// output time to sound. Routes with one delay play their source in step.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Schedule {
+    pub delay: f64,
+    pub latency: f64,
+}
+
+/// Claude: a schedule in host ticks.
+struct Scheduled {
+    delay: f64,
+    latency: f64,
+    ticks_per_source_frame: f64,
+    ticks_per_device_frame: f64,
+    /// Claude: how many source frames behind its schedule the playout runs,
+    /// smoothed over `FILL_SMOOTHING_SECONDS`.
+    lateness_avg: f64,
+}
 
 /// Claude: the output side of a route. Resamples source-rate frames from the ring
 /// to exactly the number of device-rate frames each render asks for, and keeps
-/// the ring at a fill that survives the jitter between the two clock domains.
-/// The resampling ratio is trimmed by `FillController` so the source and device
+/// the ring at a fill that survives the jitter between the two clock domains,
+/// or, on a schedule, plays each frame when its capture time says. The
+/// resampling ratio is trimmed by `FillController` so the source and device
 /// clocks stay matched however far they drift apart.
 pub struct Playout {
     resampler: Async<f32>,
@@ -42,6 +66,7 @@ pub struct Playout {
     primed: bool,
     fill_avg: f64,
     controller: FillController,
+    schedule: Option<Scheduled>,
     health: Arc<PlayoutHealth>,
 }
 
@@ -100,6 +125,7 @@ pub struct PlayoutHealth {
     resyncs: AtomicU32,
     glitch_span: AtomicU32,
     glitch_target: AtomicU32,
+    lateness: AtomicU32,
 }
 
 pub struct HealthReport {
@@ -114,6 +140,8 @@ pub struct HealthReport {
     /// Claude: the span and the target at the latest underrun, re-prime or resync.
     pub glitch_span_frames: u32,
     pub glitch_target_frames: u32,
+    /// Claude: how many source frames a scheduled playout runs behind its schedule.
+    pub lateness_frames: f32,
 }
 
 impl PlayoutHealth {
@@ -128,6 +156,7 @@ impl PlayoutHealth {
             resyncs: self.resyncs.load(Ordering::Relaxed),
             glitch_span_frames: self.glitch_span.load(Ordering::Relaxed),
             glitch_target_frames: self.glitch_target.load(Ordering::Relaxed),
+            lateness_frames: f32::from_bits(self.lateness.load(Ordering::Relaxed)),
         }
     }
 
@@ -146,11 +175,13 @@ impl PlayoutHealth {
 
 impl Playout {
     /// Claude: the jitter buffer holds the source's delivery span on top of what
-    /// the resampler needs, following the span as the source measures it.
+    /// the resampler needs, following the span as the source measures it. A
+    /// scheduled playout ignores the span and plays by its schedule instead.
     pub fn new(
         source: &SourceTiming,
         device_rate: f64,
         ticks_per_second: f64,
+        schedule: Option<Schedule>,
     ) -> Result<Self, String> {
         let source_rate = source.sample_rate;
         let params = SincInterpolationParameters::new(SINC_LEN, WindowFunction::BlackmanHarris2);
@@ -176,6 +207,13 @@ impl Playout {
             primed: false,
             fill_avg: 0.0,
             controller: FillController::new(source_rate),
+            schedule: schedule.map(|schedule| Scheduled {
+                delay: schedule.delay * ticks_per_second,
+                latency: schedule.latency * ticks_per_second,
+                ticks_per_source_frame: ticks_per_second / source_rate,
+                ticks_per_device_frame: ticks_per_second / device_rate,
+                lateness_avg: 0.0,
+            }),
             health: Arc::new(PlayoutHealth {
                 source_rate,
                 delivery: Arc::clone(&source.delivery),
@@ -187,6 +225,7 @@ impl Playout {
                 resyncs: AtomicU32::new(0),
                 glitch_span: AtomicU32::new(0),
                 glitch_target: AtomicU32::new(0),
+                lateness: AtomicU32::new(0),
             }),
         })
     }
@@ -205,8 +244,9 @@ impl Playout {
     }
 
     /// Claude: both channel slices must have the same length. `now` is the host
-    /// time in the same ticks the producer stamps its pushes with.
-    pub fn render(&mut self, ring: &Ring, out: &mut [&mut [f32]; CHANNELS], now: u64) {
+    /// time in the same ticks the producer stamps its pushes with, and `output`
+    /// the host time at which the device outputs the render's first frame.
+    pub fn render(&mut self, ring: &Ring, out: &mut [&mut [f32]; CHANNELS], now: u64, output: u64) {
         let frames = out[0].len();
         if frames == 0
             || frames > MAX_RENDER_FRAMES
@@ -216,7 +256,15 @@ impl Playout {
             silence(out);
             return;
         }
+        if self.schedule.is_some() {
+            self.render_scheduled(ring, out, now, output);
+        } else {
+            self.render_delivered(ring, out, now);
+        }
+    }
 
+    fn render_delivered(&mut self, ring: &Ring, out: &mut [&mut [f32]; CHANNELS], now: u64) {
+        let frames = out[0].len();
         let need = self.resampler.input_frames_next();
         let last = ring.last_push();
         // Claude: read after the ring, so the span a source publishes before a push
@@ -269,6 +317,87 @@ impl Playout {
         }
         // Claude: a new ratio changes how many input frames the resampler wants, so it
         // is applied after this render consumed exactly the `need` frames it asked for.
+        let _ = self
+            .resampler
+            .set_resample_ratio_relative(1.0 / (1.0 + self.controller.correction), true);
+    }
+
+    /// Claude: plays the frame at the ring's tail when the device makes it heard
+    /// `delay` after its capture. Unprimed, it drops the frames already too late
+    /// and starts the earliest one mid-render behind silence, so it plays on
+    /// schedule to the frame. Primed, the controller trims the ratio against
+    /// the lateness the way it trims a fill error.
+    fn render_scheduled(
+        &mut self,
+        ring: &Ring,
+        out: &mut [&mut [f32]; CHANNELS],
+        now: u64,
+        output: u64,
+    ) {
+        let frames = out[0].len();
+        let need = self.resampler.input_frames_next();
+        let schedule = self.schedule.as_ref().expect("a scheduled playout");
+        let heard = output as f64
+            + schedule.latency
+            + self.resampler.output_delay() as f64 * schedule.ticks_per_device_frame;
+        let lateness = ring
+            .tail_captured(schedule.ticks_per_source_frame, now)
+            .map(|captured| {
+                (heard - captured as f64 - schedule.delay) / schedule.ticks_per_source_frame
+            });
+        let Some(lateness) = lateness else {
+            if self.primed {
+                self.reprime(Glitch::Resync, 0.0, 0, out);
+            } else {
+                silence(out);
+            }
+            return;
+        };
+        let mut lead = 0;
+        if !self.primed {
+            if lateness > 0.0 {
+                let late = lateness.round() as usize;
+                if ring.discard(late) < late {
+                    silence(out);
+                    return;
+                }
+            } else {
+                lead = (-lateness).round() as usize;
+            }
+            if lead >= need || ring.available() < need - lead {
+                silence(out);
+                return;
+            }
+            self.primed = true;
+            self.schedule.as_mut().expect("scheduled").lateness_avg = 0.0;
+        } else if ring.available() < need {
+            self.reprime(Glitch::Underrun, 0.0, 0, out);
+            return;
+        } else if lateness.abs() > RESCHEDULE_SECONDS * self.health.source_rate {
+            self.reprime(Glitch::Resync, 0.0, 0, out);
+            return;
+        } else {
+            let seconds = frames as f64 / self.device_rate;
+            let schedule = self.schedule.as_mut().expect("scheduled");
+            schedule.lateness_avg +=
+                seconds / FILL_SMOOTHING_SECONDS * (lateness - schedule.lateness_avg);
+            self.controller.update(schedule.lateness_avg, seconds);
+        }
+        let lateness_avg = self.schedule.as_ref().expect("scheduled").lateness_avg;
+        self.health
+            .lateness
+            .store((lateness_avg as f32).to_bits(), Ordering::Relaxed);
+        self.health.correction_ppm.store(
+            ((self.controller.correction * 1e6) as f32).to_bits(),
+            Ordering::Relaxed,
+        );
+
+        self.input[..lead * CHANNELS].fill(0.0);
+        let got = ring.pop_into(&mut self.input[lead * CHANNELS..need * CHANNELS]);
+        self.indexing.partial_len = (lead + got < need).then_some(lead + got);
+        if !self.resample(need, out) {
+            silence(out);
+        }
         let _ = self
             .resampler
             .set_resample_ratio_relative(1.0 / (1.0 + self.controller.correction), true);
@@ -502,8 +631,12 @@ mod tests {
         next_push: usize,
         next_render: f64,
         rendered: Vec<f32>,
+        /// Claude: when the device output each render.
+        render_times: Vec<f64>,
         render_period: f64,
         worst_correction_ppm: f32,
+        /// Claude: whether pushes carry their media time as their capture time.
+        dated: bool,
     }
 
     impl Sim {
@@ -547,16 +680,67 @@ mod tests {
             };
             Self {
                 ring: Ring::new(),
-                playout: Playout::new(&timing, device_rate, TICKS_PER_SECOND).unwrap(),
+                playout: Playout::new(&timing, device_rate, TICKS_PER_SECOND, None).unwrap(),
                 source,
                 source_rate,
                 pushes,
                 next_push: 0,
                 next_render: 0.0013,
                 rendered: Vec::new(),
+                render_times: Vec::new(),
                 render_period: RENDER_FRAMES as f64 / (device_rate * (1.0 + device_ppm * 1e-6)),
                 worst_correction_ppm: 0.0,
+                dated: false,
             }
+        }
+
+        /// Claude: a source that dates each frame by its media time, played on
+        /// `schedule`. The device's first render comes at `start`.
+        fn scheduled(
+            source_rate: f64,
+            device_rate: f64,
+            device_ppm: f64,
+            schedule: Schedule,
+            pushes: Vec<Push>,
+            start: f64,
+        ) -> Self {
+            let mut sim = Self::delivering(
+                source_rate,
+                device_rate,
+                device_ppm,
+                Source::webrtc(),
+                pushes,
+            );
+            let timing = SourceTiming {
+                sample_rate: source_rate,
+                delivery: sim.source.span(),
+            };
+            sim.playout =
+                Playout::new(&timing, device_rate, TICKS_PER_SECOND, Some(schedule)).unwrap();
+            sim.dated = true;
+            sim.next_render = start;
+            sim
+        }
+
+        /// Claude: how late, in seconds, the last `seconds` of output sounded
+        /// against `schedule`, from the tone's phase: each sample should carry the
+        /// tone as captured `schedule.delay` before it sounds.
+        fn schedule_error(&self, schedule: Schedule, seconds: f64) -> f64 {
+            let renders = (seconds / self.render_period) as usize;
+            let first = self.render_times.len() - renders;
+            let frame = self.render_period / RENDER_FRAMES as f64;
+            let omega = 2.0 * std::f64::consts::PI * TONE_HZ;
+            let (mut i, mut q) = (0.0, 0.0);
+            for (render, &output) in self.render_times.iter().enumerate().skip(first) {
+                let samples = &self.rendered[render * RENDER_FRAMES..][..RENDER_FRAMES];
+                for (j, &sample) in samples.iter().enumerate() {
+                    let phase =
+                        omega * (output + j as f64 * frame + schedule.latency - schedule.delay);
+                    i += f64::from(sample) * phase.sin();
+                    q += f64::from(sample) * phase.cos();
+                }
+            }
+            (-q).atan2(i) / omega
         }
 
         /// Claude: the producer stops for `seconds` and resumes where it left off.
@@ -613,9 +797,10 @@ mod tests {
                         (vec![0.0; RENDER_FRAMES], vec![0.0; RENDER_FRAMES]);
                     let now = (self.next_render * TICKS_PER_SECOND) as u64;
                     self.playout
-                        .render(&self.ring, &mut [&mut left, &mut right], now);
+                        .render(&self.ring, &mut [&mut left, &mut right], now, now);
                     assert_eq!(left, right);
                     self.rendered.extend_from_slice(&left);
+                    self.render_times.push(self.next_render);
                     self.next_render += self.render_period;
                     let correction = self.playout.health.report().correction_ppm.abs();
                     self.worst_correction_ppm = self.worst_correction_ppm.max(correction);
@@ -628,11 +813,18 @@ mod tests {
         fn push(&mut self, push: Push) {
             let rate = self.source_rate;
             let stamp = self.source.publish(&push, rate);
-            self.ring
-                .push_with(push.frames, (stamp * TICKS_PER_SECOND) as u64, |f, _| {
+            let captured = self
+                .dated
+                .then(|| (push.media as f64 / rate * TICKS_PER_SECOND) as u64);
+            self.ring.push_with(
+                push.frames,
+                (stamp * TICKS_PER_SECOND) as u64,
+                captured,
+                |f, _| {
                     (0.5 * (2.0 * std::f64::consts::PI * TONE_HZ * (push.media + f) as f64 / rate)
                         .sin()) as f32
-                });
+                },
+            );
         }
 
         fn first_sound(&self) -> usize {
@@ -1119,12 +1311,12 @@ mod tests {
             sample_rate: 48000.0,
             delivery: Arc::new(DeliverySpan::new(4800.0)),
         };
-        let mut playout = Playout::new(&timing, 48000.0, TICKS_PER_SECOND).unwrap();
+        let mut playout = Playout::new(&timing, 48000.0, TICKS_PER_SECOND, None).unwrap();
         let ring = Ring::new();
         let now = (10.0 * TICKS_PER_SECOND) as u64;
-        ring.push_with(960, now + 1, |_, _| 0.25);
+        ring.push_with(960, now + 1, None, |_, _| 0.25);
         let (mut left, mut right) = (vec![0.0; RENDER_FRAMES], vec![0.0; RENDER_FRAMES]);
-        playout.render(&ring, &mut [&mut left, &mut right], now);
+        playout.render(&ring, &mut [&mut left, &mut right], now, now);
         assert!(
             !playout.is_playing(),
             "primed on 960 frames against a span of 4800"
@@ -1157,5 +1349,62 @@ mod tests {
         assert_eq!(report.underruns, 1);
         let tail = &sim.rendered[sim.rendered.len() - 8192..];
         assert!(worst_recurrence_error(tail, 48000.0) < 1e-3);
+    }
+    const SCHEDULE: Schedule = Schedule {
+        delay: 0.25,
+        latency: 0.012,
+    };
+
+    #[test]
+    fn plays_each_frame_its_delay_after_capture() {
+        for (source, device, push) in [
+            (48000.0, 48000.0, 960),
+            (48000.0, 44100.0, 960),
+            (44100.0, 48000.0, 470),
+        ] {
+            let mut pushes = on_time(source, push, 100.0);
+            let mut random = Lcg(7);
+            let mut latest = 0.0f64;
+            for push in &mut pushes {
+                push.arrival = latest.max(push.arrival + random.uniform(0.0, 0.15));
+                latest = push.arrival;
+            }
+            for start in [0.0013, 0.0071] {
+                let mut sim = Sim::scheduled(source, device, 0.0, SCHEDULE, pushes.clone(), start);
+                sim.run(10.0);
+                let error = sim.schedule_error(SCHEDULE, 2.0);
+                let label = format!("{source} -> {device}, first render at {start}");
+                assert!(error.abs() < 50e-6, "{label}: {} µs off", error * 1e6);
+                assert_eq!(sim.glitches(), [0; 3], "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn holds_its_schedule_against_clock_drift() {
+        for device_ppm in [300.0, -300.0] {
+            let pushes = on_time(48000.0, 960, 100.0);
+            let mut sim = Sim::scheduled(48000.0, 48000.0, device_ppm, SCHEDULE, pushes, 0.0013);
+            sim.run(60.0);
+            let mut worst = 0.0f64;
+            for _ in 0..20 {
+                sim.run(1.0);
+                worst = worst.max(sim.schedule_error(SCHEDULE, 1.0).abs());
+            }
+            assert!(worst < 300e-6, "{device_ppm} ppm: {} µs off", worst * 1e6);
+            assert!(sim.worst_correction_ppm < INAUDIBLE_PPM, "{device_ppm} ppm");
+            assert_eq!(sim.glitches(), [0; 3], "{device_ppm} ppm");
+        }
+    }
+
+    #[test]
+    fn drops_what_lands_past_its_time_and_plays_on_schedule_after() {
+        let mut pushes = on_time(48000.0, 960, 100.0);
+        stall(&mut pushes, 3.0, 0.5);
+        let mut sim = Sim::scheduled(48000.0, 48000.0, 0.0, SCHEDULE, pushes, 0.0013);
+        sim.run(8.0);
+        assert_eq!(sim.playout.health.report().underruns, 1);
+        let error = sim.schedule_error(SCHEDULE, 2.0);
+        assert!(error.abs() < 20e-6, "{} µs off", error * 1e6);
     }
 }

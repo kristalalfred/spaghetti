@@ -6,6 +6,7 @@ mod activity;
 mod adts;
 mod audio;
 mod bus;
+mod clock;
 mod codec;
 mod delivery;
 mod device_manager;
