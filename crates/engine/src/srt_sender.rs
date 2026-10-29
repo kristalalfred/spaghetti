@@ -103,7 +103,7 @@ fn encode(
     let ticks_per_second = unsafe { AudioGetHostClockFrequency() };
     let ticks_per_unit = frames_per_packet as u64 * 90_000;
     let mut pcm = vec![0.0; frames_per_packet * CHANNELS];
-    let mut fader = Fader::new(f32::from_bits(volume.load(Ordering::Relaxed)));
+    let mut fader = Fader::new(f32::from_bits(volume.load(Ordering::Relaxed)), source_rate);
     let mut muxer = TsMuxer::new();
     let (mut adts, mut stream) = (Vec::new(), Vec::new());
     let mut units = 0u64;

@@ -13,7 +13,7 @@ use crate::device_output::DeviceOutput;
 #[cfg(test)]
 use crate::fixture::FixtureSource;
 use crate::flow::{FlowMeter, Link};
-use crate::mixer::{Cycles, FADE_LIMIT, IDLE};
+use crate::mixer::{Cycles, FADE_LIMIT, IDLE, RAMP};
 use crate::ring::Ring;
 use crate::sinks::SourceTiming;
 use crate::srt_receiver::SrtSource;
@@ -434,10 +434,10 @@ impl Router {
         Ok(id)
     }
 
-    /// Claude: a route playing on a device fades out before it goes, its tap
-    /// still muting the app meanwhile: the cycle running when the volume drops
-    /// may miss it, the next ramps it down, and two more let the device play
-    /// out the ramp it queued before a bus closing with the route discards it.
+    /// Claude: a route playing on a device fades out over `RAMP` before it
+    /// goes, its tap still muting the app meanwhile. The cycle running when the
+    /// ramp ends may still be writing it, and two more let the device play out
+    /// what it queued before a bus closing with the route discards it.
     pub fn destroy_route(&mut self, route_id: u32) -> Result<(), String> {
         let Route {
             source_id,
@@ -450,7 +450,8 @@ impl Router {
             .ok_or_else(|| format!("route {route_id} not found"))?;
         if let Some(cycles) = path.cycles().filter(|cycles| cycles.running(IDLE)) {
             volume.store(0f32.to_bits(), Ordering::Release);
-            cycles.wait(4, FADE_LIMIT);
+            std::thread::sleep(RAMP);
+            cycles.wait(3, FADE_LIMIT);
         }
 
         match (path, destination) {
@@ -489,8 +490,8 @@ impl Router {
     }
 
     /// Claude: sets a route's volume and, while the route plays on a device,
-    /// returns once its output has ramped there: the cycle running when the
-    /// volume changes may miss it, and the next ramps it.
+    /// returns once its output has ramped there: the ramp lasts `RAMP`, and
+    /// the cycle running when it ends may still be writing it.
     pub fn fade_volume(&mut self, route_id: u32, volume: f32) -> Result<(), String> {
         self.set_volume(route_id, volume)?;
         let cycles = self
@@ -498,6 +499,7 @@ impl Router {
             .get(&route_id)
             .and_then(|route| route.path.cycles());
         if let Some(cycles) = cycles.filter(|cycles| cycles.running(IDLE)) {
+            std::thread::sleep(RAMP);
             cycles.wait(2, FADE_LIMIT);
         }
         Ok(())

@@ -103,7 +103,7 @@ fn encode(
     let ticks_per_frame = ticks_per_second / source_rate;
     let rtp_rate = f64::from(encoder.format().sample_rate);
     let mut pcm = vec![0.0; frames_per_packet * CHANNELS];
-    let mut fader = Fader::new(f32::from_bits(volume.load(Ordering::Relaxed)));
+    let mut fader = Fader::new(f32::from_bits(volume.load(Ordering::Relaxed)), source_rate);
     let mut rtp_time = 0u64;
     let mut fed = 0u64;
     while !stop.load(Ordering::Relaxed) {

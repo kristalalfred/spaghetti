@@ -72,16 +72,28 @@ impl Cycles {
     }
 }
 
+/// Claude: how long a volume change ramps. Stepping the gain clicks, and so
+/// does a ramp shorter than a bass wave, whatever the buffer size.
+pub const RAMP: Duration = Duration::from_millis(50);
+
 /// Claude: a route's volume, applied to consecutive buffers. A change ramps
-/// linearly across the next buffer, because stepping the gain between two
-/// buffers clicks. Scaled samples are clamped to [-1.0, 1.0].
+/// linearly over `RAMP`, across as many buffers as that takes. Scaled samples
+/// are clamped to [-1.0, 1.0].
 pub struct Fader {
     gain: f32,
+    target: f32,
+    step: f32,
+    ramp_frames: f32,
 }
 
 impl Fader {
-    pub fn new(gain: f32) -> Self {
-        Self { gain }
+    pub fn new(gain: f32, sample_rate: f64) -> Self {
+        Self {
+            gain,
+            target: gain,
+            step: 0.0,
+            ramp_frames: (RAMP.as_secs_f64() * sample_rate).max(1.0) as f32,
+        }
     }
 
     /// Scale channels held in separate planes of equal length.
@@ -109,29 +121,37 @@ impl Fader {
         }
     }
 
-    /// Claude: the gain for each of the next `frames` frames.
+    /// Claude: the gain for each of the next `frames` frames. A new target
+    /// starts a ramp to it from wherever the gain is.
     pub fn ramp(&mut self, frames: usize, target: f32) -> impl Iterator<Item = f32> + use<> {
-        let from = self.gain;
-        if frames > 0 {
-            self.gain = target;
+        if target != self.target {
+            self.target = target;
+            self.step = (target - self.gain) / self.ramp_frames;
         }
-        let step = (target - from) / frames.max(1) as f32;
-        (1..=frames).map(move |frame| {
-            if frame == frames {
-                target
-            } else {
-                from + step * frame as f32
-            }
-        })
+        let (from, step) = (self.gain, self.step);
+        self.gain = short_of(from + step * frames as f32, step, target);
+        if self.gain == target {
+            self.step = 0.0;
+        }
+        (1..=frames).map(move |frame| short_of(from + step * frame as f32, step, target))
     }
 
     /// Claude: the gain for each of `frames` frames, or none when the buffer
     /// stays at unity and needs no scaling.
     fn gains(&mut self, frames: usize, target: f32) -> Option<impl Iterator<Item = f32> + use<>> {
-        if frames == 0 || (self.gain == 1.0 && target == 1.0) {
+        if frames == 0 || (self.gain == 1.0 && self.target == 1.0 && target == 1.0) {
             return None;
         }
         Some(self.ramp(frames, target))
+    }
+}
+
+/// Claude: `gain`, unless a ramp by `step` has carried it past `target`.
+fn short_of(gain: f32, step: f32, target: f32) -> f32 {
+    if (step > 0.0 && gain > target) || (step < 0.0 && gain < target) {
+        target
+    } else {
+        gain
     }
 }
 
@@ -167,43 +187,52 @@ mod tests {
         let mut planes = [vec![1.5f32, -0.3], vec![0.2, 0.4]];
         let original = planes.clone();
         let [left, right] = &mut planes;
-        Fader::new(1.0).planar(&mut [left, right], 1.0);
+        Fader::new(1.0, 48000.0).planar(&mut [left, right], 1.0);
         assert_eq!(planes, original);
     }
 
     #[test]
     fn a_steady_fader_scales_and_clamps() {
         let mut buf = [0.5f32, -0.5, 0.9, -0.9];
-        Fader::new(0.5).interleaved(&mut buf, 2, 0.5);
+        Fader::new(0.5, 48000.0).interleaved(&mut buf, 2, 0.5);
         assert_eq!(buf, [0.25, -0.25, 0.45, -0.45]);
-        Fader::new(2.0).interleaved(&mut buf, 2, 2.0);
+        Fader::new(2.0, 48000.0).interleaved(&mut buf, 2, 2.0);
         assert_eq!(buf, [0.5, -0.5, 0.9, -0.9]);
         let mut loud = [0.9f32, -0.9];
-        Fader::new(2.0).interleaved(&mut loud, 2, 2.0);
+        Fader::new(2.0, 48000.0).interleaved(&mut loud, 2, 2.0);
         assert_eq!(loud, [1.0, -1.0]);
     }
 
+    /// Claude: at this rate `RAMP` lasts 4 frames.
+    const FOUR_FRAME_RAMP: f64 = 80.0;
+
     #[test]
-    fn a_volume_change_ramps_across_one_buffer_then_holds() {
-        let mut fader = Fader::new(1.0);
-        let mut left = vec![1.0f32; 4];
-        let mut right = vec![1.0f32; 4];
+    fn a_volume_change_ramps_over_its_length_across_buffers_then_holds() {
+        let mut fader = Fader::new(1.0, FOUR_FRAME_RAMP);
+        let mut left = vec![1.0f32; 3];
+        let mut right = vec![1.0f32; 3];
         fader.planar(&mut [&mut left, &mut right], 0.0);
-        assert_eq!(left, [0.75, 0.5, 0.25, 0.0]);
+        assert_eq!(left, [0.75, 0.5, 0.25]);
         assert_eq!(right, left);
 
-        let mut next = vec![1.0f32; 4];
+        let mut next = vec![1.0f32; 3];
         fader.planar(&mut [&mut next], 0.0);
-        assert_eq!(next, [0.0; 4]);
+        assert_eq!(next, [0.0; 3]);
+    }
+
+    #[test]
+    fn a_new_target_mid_ramp_ramps_from_where_the_gain_is() {
+        let mut fader = Fader::new(0.0, FOUR_FRAME_RAMP);
+        assert_eq!(fader.ramp(2, 1.0).collect::<Vec<_>>(), [0.25, 0.5]);
+        assert_eq!(fader.ramp(2, 0.0).collect::<Vec<_>>(), [0.375, 0.25]);
+        assert_eq!(fader.ramp(3, 0.0).collect::<Vec<_>>(), [0.125, 0.0, 0.0]);
     }
 
     #[test]
     fn a_ramp_yields_every_frame_even_at_unity() {
-        let mut fader = Fader::new(1.0);
+        let mut fader = Fader::new(1.0, FOUR_FRAME_RAMP);
         assert_eq!(fader.ramp(2, 1.0).collect::<Vec<_>>(), [1.0, 1.0]);
-        assert_eq!(fader.ramp(2, 0.0).collect::<Vec<_>>(), [0.5, 0.0]);
         assert_eq!(fader.ramp(0, 1.0).count(), 0);
-        assert_eq!(fader.ramp(1, 0.0).collect::<Vec<_>>(), [0.0]);
     }
 
     #[test]
@@ -227,9 +256,9 @@ mod tests {
 
     #[test]
     fn interleaved_channels_of_a_frame_share_its_gain() {
-        let mut fader = Fader::new(0.0);
+        let mut fader = Fader::new(0.0, FOUR_FRAME_RAMP);
         let mut buf = [1.0f32, -1.0, 1.0, -1.0];
         fader.interleaved(&mut buf, 2, 1.0);
-        assert_eq!(buf, [0.5, -0.5, 1.0, -1.0]);
+        assert_eq!(buf, [0.25, -0.25, 0.5, -0.5]);
     }
 }

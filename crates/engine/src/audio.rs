@@ -163,6 +163,28 @@ fn get_output_channel_count(device_id: AudioObjectID) -> u32 {
     buffers.iter().map(|b| b.mNumberChannels).sum()
 }
 
+/// Claude: the rate the device runs at.
+pub fn nominal_rate(device_id: AudioObjectID) -> Option<f64> {
+    let property_address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyNominalSampleRate,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut rate: f64 = 0.0;
+    let mut size = mem::size_of::<f64>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            device_id,
+            &property_address,
+            0,
+            ptr::null(),
+            &mut size,
+            (&mut rate as *mut f64).cast(),
+        )
+    };
+    (status == 0 && rate > 0.0).then_some(rate)
+}
+
 /// Claude: how many frames the device takes from its output time stamp until
 /// they sound: its own latency plus its first output stream's.
 pub fn output_latency_frames(device_id: AudioObjectID) -> u32 {

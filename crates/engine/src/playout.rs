@@ -8,6 +8,7 @@ use rubato::{
 };
 
 use crate::delivery::DeliverySpan;
+use crate::mixer::RAMP;
 use crate::ring::{CHANNELS, LastPush, Ring};
 use crate::sinks::SourceTiming;
 
@@ -26,9 +27,7 @@ const CONTROL_DAMPING: f64 = 1.0;
 /// Claude: a scheduled playout further off its schedule than this re-primes
 /// rather than resample its way back.
 const RESCHEDULE_SECONDS: f64 = 0.02;
-/// Claude: how long playback ramps up from silence once primed, so it starts
-/// without a click wherever in the waveform it begins.
-const FADE_IN_SECONDS: f64 = 0.005;
+
 
 /// Claude: a route that plays each frame `delay` seconds after the source
 /// captured it, on a device that takes `latency` seconds from a render's
@@ -213,7 +212,7 @@ impl Playout {
             primed: false,
             fill_avg: 0.0,
             controller: FillController::new(source_rate),
-            fade_in_frames: (FADE_IN_SECONDS * source_rate).ceil() as usize,
+            fade_in_frames: (RAMP.as_secs_f64() * source_rate).ceil() as usize,
             faded: 0,
             schedule: schedule.map(|schedule| Scheduled {
                 delay: schedule.delay * ticks_per_second,
@@ -1453,10 +1452,15 @@ mod tests {
             sim.run(2.0);
             let start = sim.rendered.iter().position(|s| *s != 0.0).unwrap();
             let opening = peak(&sim.rendered, start, 24);
-            let steady = peak(&sim.rendered, start + 960, 960);
+            let halfway = peak(&sim.rendered, start + 1140, 120);
+            let steady = peak(&sim.rendered, start + 4800, 960);
             assert!(
                 opening < 0.1 * steady,
                 "{label}: opens at {opening} of {steady}"
+            );
+            assert!(
+                (0.4 * steady..0.6 * steady).contains(&halfway),
+                "{label}: halfway at {halfway} of {steady}"
             );
             assert!((steady - 0.5).abs() < 0.01, "{label}: steady at {steady}");
         }

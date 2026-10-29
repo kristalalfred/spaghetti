@@ -97,6 +97,10 @@ impl DeviceOutput {
             unit.connect(
                 ring,
                 playout,
+                Fader::new(
+                    f32::from_bits(volume.load(Ordering::Relaxed)),
+                    dst_asbd.mSampleRate,
+                ),
                 volume,
                 Arc::clone(&meter),
                 Arc::clone(&cycles),
@@ -278,6 +282,7 @@ impl OutputUnit {
         &mut self,
         ring: Arc<Ring>,
         playout: Playout,
+        fader: Fader,
         volume: Arc<AtomicU32>,
         meter: Arc<FlowMeter>,
         cycles: Arc<Cycles>,
@@ -285,7 +290,7 @@ impl OutputUnit {
         self.render_state = Box::into_raw(Box::new(OutputCallbackState {
             ring,
             playout,
-            fader: Fader::new(f32::from_bits(volume.load(Ordering::Relaxed))),
+            fader,
             volume,
             meter,
             cycles,

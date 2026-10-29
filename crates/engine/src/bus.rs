@@ -226,6 +226,7 @@ pub struct DeviceBus {
     attached: Vec<Option<usize>>,
     state: Arc<BusState>,
     device_uid: String,
+    sample_rate: f64,
 }
 
 impl DeviceBus {
@@ -252,6 +253,9 @@ impl DeviceBus {
                 .map_err(|e| format!("starting the bus watcher failed: {e}"))?
         };
         tracing::info!(device_uid, slots = taps.len(), "opened device bus");
+        let sample_rate = crate::audio::find_device_by_uid(device_uid)
+            .and_then(crate::audio::nominal_rate)
+            .unwrap_or(48000.0);
         Ok(Self {
             watched,
             watcher: Some(watcher),
@@ -259,6 +263,7 @@ impl DeviceBus {
             taps,
             state,
             device_uid: device_uid.to_string(),
+            sample_rate,
         })
     }
 
@@ -288,7 +293,7 @@ impl DeviceBus {
         let mix = SlotMix {
             slot,
             volume,
-            fader: Fader::new(gain),
+            fader: Fader::new(gain, self.sample_rate),
             meter,
             cycles: Arc::clone(&cycles),
         };
