@@ -22,10 +22,6 @@ use crate::webrtc::PeerLink;
 use crate::webrtc_receiver::WebRtcSource;
 use crate::webrtc_sender::WebRtcOutput;
 
-/// Claude: the ring holds 2.7 s, which the delay and the source's own
-/// delivery must fit in.
-const MAX_DELAY_MS: u32 = 2000;
-
 enum Source {
     Tap(TapSource),
     Srt(SrtSource),
@@ -333,19 +329,17 @@ impl Router {
             .get_mut(&source_id)
             .ok_or_else(|| format!("source {source_id} not found"))?;
 
-        if let Destination::Device {
-            delay_ms: Some(delay_ms),
-            ..
-        } = destination
+        if matches!(
+            destination,
+            Destination::Device {
+                delay_ms: Some(_),
+                ..
+            }
+        ) && matches!(entry.source, Source::Srt(_))
         {
-            if delay_ms > MAX_DELAY_MS {
-                return Err(format!("a delay is at most {MAX_DELAY_MS} ms"));
-            }
-            if matches!(entry.source, Source::Srt(_)) {
-                return Err(
-                    "an SRT source does not date its frames, so it cannot play on a delay".into(),
-                );
-            }
+            return Err(
+                "an SRT source does not date its frames, so it cannot play on a delay".into(),
+            );
         }
         let volume = Arc::new(AtomicU32::new(initial_volume.clamp(0.0, 2.0).to_bits()));
         let path = match (&entry.spec, &destination) {

@@ -12,6 +12,11 @@ use crate::playout::{Playout, PlayoutHealth, Schedule};
 use crate::ring::{CHANNELS, Ring};
 use crate::sinks::SourceTiming;
 
+/// Claude: a delayed route holds each frame in its ring until the device needs
+/// it, its delay less the device's latency. The ring holds 2.7 s, which that
+/// and the source's own delivery must fit in.
+const MAX_HELD_SECONDS: f64 = 2.0;
+
 /// Claude: a route's output to a Core Audio device. The device pulls through the
 /// render callback, and `Playout` resamples the route's ring to the device rate.
 /// With a delay, each frame sounds that many seconds after its capture.
@@ -58,6 +63,13 @@ impl DeviceOutput {
             latency: f64::from(audio::output_latency_frames(device)) / device_format.mSampleRate,
         });
         if let Some(schedule) = schedule {
+            if schedule.delay - schedule.latency > MAX_HELD_SECONDS {
+                return Err(format!(
+                    "a delay may exceed the device's {:.0} ms latency by at most {:.0} ms",
+                    schedule.latency * 1000.0,
+                    MAX_HELD_SECONDS * 1000.0
+                ));
+            }
             tracing::info!(
                 delay_ms = schedule.delay * 1000.0,
                 latency_ms = schedule.latency * 1000.0,
