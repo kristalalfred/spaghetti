@@ -11,13 +11,15 @@ impl Browser {
         todo!()
     }
 
-    /// Claude: the receivers found so far. Waits until the browser has run long
-    /// enough for receivers already on the network to have answered, and fails
-    /// when browsing failed, so that no receivers is never a failure in disguise.
+    /// Claude: a live snapshot of the receivers found and resolved so far, taken
+    /// once the browser has run for a bounded warm-up. Fails when browsing
+    /// failed, so that no receivers is never a failure in disguise.
     pub fn receivers(&self) -> Result<Vec<Receiver>, String> {
         todo!()
     }
 
+    /// Claude: waits a bounded time for the receiver to be found and resolved;
+    /// `Ok(None)` means it was not found in that time.
     pub fn find(&self, id: &ReceiverId) -> Result<Option<Receiver>, String> {
         todo!()
     }
