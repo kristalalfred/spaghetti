@@ -15,10 +15,17 @@ fn init_logging() {
         .init();
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     init_logging();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run());
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    result
+}
 
+async fn run() -> anyhow::Result<()> {
     tracing::info!("spaghettid starting...");
 
     // Bootstrap the device config file before anything else. On a fresh
@@ -72,8 +79,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    server.shutdown().await;
+    let shutdown = server.shutdown().await;
     let _ = fs::remove_file(spaghetti_common::ipc_protocol::SOCKET_PATH);
+    shutdown.map_err(anyhow::Error::msg)?;
 
     Ok(())
 }

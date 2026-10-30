@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use spaghetti_common::ipc_protocol::*;
 use spaghetti_engine::{ActivityReader, DeviceManager, FpsTracker, Router};
@@ -11,7 +12,10 @@ use tokio_util::sync::CancellationToken;
 /// and the activity snapshot is considered stale (driver idle or gone).
 const ACTIVITY_FRESHNESS_NS: u64 = 200_000_000;
 
-const HEALTH_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+const HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(10);
+const CLIENT_DRAIN_LIMIT: Duration = Duration::from_secs(1);
+const CLIENT_ABORT_LIMIT: Duration = Duration::from_secs(1);
+const ROUTER_SHUTDOWN_LIMIT: Duration = Duration::from_secs(10);
 
 /// Shared daemon state accessible by all client handlers.
 pub struct DaemonState {
@@ -103,17 +107,55 @@ impl Server {
         }
     }
 
-    pub async fn shutdown(mut self) {
+    pub async fn shutdown(mut self) -> Result<(), String> {
         self.cancel.cancel();
-        let drained = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while self.clients.join_next().await.is_some() {}
-        })
-        .await;
-        if drained.is_err() {
-            self.clients.abort_all();
-            while self.clients.join_next().await.is_some() {}
+        let clients = stop_clients(&mut self.clients, CLIENT_DRAIN_LIMIT, CLIENT_ABORT_LIMIT).await;
+        let router = drop_with_timeout(self, ROUTER_SHUTDOWN_LIMIT).await;
+        clients.and(router)
+    }
+}
+
+async fn stop_clients(
+    clients: &mut JoinSet<()>,
+    drain_limit: Duration,
+    abort_limit: Duration,
+) -> Result<(), String> {
+    if drain_clients(clients, drain_limit).await {
+        return Ok(());
+    }
+    clients.abort_all();
+    if drain_clients(clients, abort_limit).await {
+        Ok(())
+    } else {
+        Err("client handlers did not stop before the abort deadline".into())
+    }
+}
+
+async fn drain_clients(clients: &mut JoinSet<()>, limit: Duration) -> bool {
+    tokio::time::timeout(limit, async {
+        while let Some(result) = clients.join_next().await {
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                tracing::error!(%error, "client handler failed during shutdown");
+            }
         }
-        drop(self);
+    })
+    .await
+    .is_ok()
+}
+
+async fn drop_with_timeout(value: impl Send + 'static, limit: Duration) -> Result<(), String> {
+    let mut dropping = tokio::task::spawn_blocking(move || drop(value));
+    match tokio::time::timeout(limit, &mut dropping).await {
+        Ok(result) => result.map_err(|error| format!("router teardown failed: {error}")),
+        Err(_) => {
+            dropping.abort();
+            Err(format!(
+                "router teardown exceeded {:.0} seconds",
+                limit.as_secs_f64()
+            ))
+        }
     }
 }
 
@@ -352,4 +394,108 @@ async fn read_frame_async(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn client_draining_allows_an_in_flight_response_to_finish() {
+        let done = Arc::new(AtomicBool::new(false));
+        let mut clients = JoinSet::new();
+        clients.spawn({
+            let done = Arc::clone(&done);
+            async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                done.store(true, Ordering::Release);
+            }
+        });
+        stop_clients(
+            &mut clients,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        assert!(done.load(Ordering::Acquire));
+        assert!(clients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_idle_client_is_aborted_and_releases_its_shared_state() {
+        let state = Arc::new(());
+        let weak = Arc::downgrade(&state);
+        let mut clients = JoinSet::new();
+        clients.spawn(async move {
+            std::future::pending::<()>().await;
+            drop(state);
+        });
+        stop_clients(
+            &mut clients,
+            Duration::from_millis(5),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        assert!(clients.is_empty());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn joining_an_uninterruptible_client_has_its_own_deadline() {
+        let mut clients = JoinSet::new();
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        clients.spawn_blocking(move || {
+            started.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        waiting.await.unwrap();
+        let before = Instant::now();
+        let result = stop_clients(
+            &mut clients,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        )
+        .await;
+        let elapsed = before.elapsed();
+        assert!(result.unwrap_err().contains("abort deadline"));
+        assert!(elapsed < Duration::from_millis(100), "waited {elapsed:?}");
+        while clients.join_next().await.is_some() {}
+    }
+
+    struct SlowDrop {
+        finished: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = self.finished.take().unwrap().send(());
+        }
+    }
+
+    #[tokio::test]
+    async fn router_teardown_has_a_deadline_even_when_drop_blocks() {
+        let (finished, waiting) = tokio::sync::oneshot::channel();
+        let before = Instant::now();
+        let result = drop_with_timeout(
+            SlowDrop {
+                finished: Some(finished),
+            },
+            Duration::from_millis(10),
+        )
+        .await;
+        let elapsed = before.elapsed();
+        assert!(result.unwrap_err().contains("teardown exceeded"));
+        assert!(elapsed < Duration::from_millis(100), "waited {elapsed:?}");
+        waiting.await.unwrap();
+        assert!(
+            drop_with_timeout((), Duration::from_millis(100))
+                .await
+                .is_ok()
+        );
+    }
 }
