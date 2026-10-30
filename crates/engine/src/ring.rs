@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use coreaudio_sys::AudioGetCurrentHostTime;
 
 pub const CHANNELS: usize = 2;
-pub const CAPACITY_FRAMES: usize = 1 << 19;
+pub const CAPACITY_FRAMES: usize = 1 << 18;
 const MASK: usize = CAPACITY_FRAMES - 1;
 
 /// Claude: single-producer single-consumer FIFO of interleaved stereo f32 frames.

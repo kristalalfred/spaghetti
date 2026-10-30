@@ -7,7 +7,7 @@ use rubato::{
     WindowFunction,
 };
 
-use crate::delivery::{DeliverySpan, MAX_SPAN};
+use crate::delivery::DeliverySpan;
 use crate::mixer::RAMP;
 use crate::ring::{CAPACITY_FRAMES, CHANNELS, LastPush, Ring};
 use crate::sinks::SourceTiming;
@@ -296,12 +296,13 @@ impl Playout {
         Arc::clone(&self.health)
     }
 
+    /// Claude: a scheduled playout pops each frame `delay - latency` after its
+    /// capture, so its ring holds no more than that however late frames arrive,
+    /// plus one render's input and the lateness it tolerates before rescheduling.
     pub fn max_held_seconds(&self) -> f64 {
         let rate = self.health.source_rate;
-        let span = self.delivery.frames().max(MAX_SPAN * rate).ceil() as usize;
-        let reserve = 2 * span
-            + (RESYNC_RENDERS + 1) * self.resampler.input_frames_max()
-            + self.margin_frames;
+        let reserve =
+            self.resampler.input_frames_max() + (RESCHEDULE_SECONDS * rate).ceil() as usize;
         CAPACITY_FRAMES.saturating_sub(reserve) as f64 / rate
     }
 
@@ -1497,6 +1498,25 @@ mod tests {
             let schedule = Schedule { delay: 2.5, latency: 0.0 };
             assert!(Playout::new(&timing, 44100.0, TICKS_PER_SECOND, Some(schedule)).is_ok());
         }
+    }
+
+    #[test]
+    fn holds_its_longest_delay_without_overflowing_when_frames_arrive_in_bursts() {
+        let rate = 48000.0;
+        let timing = SourceTiming {
+            sample_rate: rate,
+            delivery: Arc::new(DeliverySpan::new(rate)),
+        };
+        let limit = Playout::new(&timing, 44100.0, TICKS_PER_SECOND, None)
+            .unwrap()
+            .max_held_seconds();
+        let schedule = Schedule { delay: limit, latency: 0.0 };
+        let burst = (rate / 2.0) as usize;
+        let bursts = on_time(rate, burst, limit + 4.0);
+        let mut sim = Sim::scheduled(rate, 44100.0, 0.0, schedule, bursts, 0.0);
+        sim.run(limit + 4.0);
+        assert_eq!(sim.glitches(), [0; 3]);
+        assert!(sim.schedule_error(schedule, 2.0).abs() < 50e-6);
     }
 
     #[test]

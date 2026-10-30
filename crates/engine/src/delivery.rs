@@ -14,7 +14,7 @@ const HOLD: f64 = 120.0;
 const RELEASE: f64 = 0.002;
 /// Claude: the longest span a route buffers. A push later than this is a break
 /// in the stream, a stall too long to wait out or a jump in its media time.
-pub const MAX_SPAN: f64 = 1.0;
+const MAX_SPAN: f64 = 1.0;
 /// Claude: how fast the fastest transit may rise, so that a sender clock up to
 /// 1000 ppm slow against the host clock does not read as ever later delivery.
 const DRIFT: f64 = 0.001;
