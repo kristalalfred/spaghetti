@@ -1,13 +1,15 @@
-use crate::{Receiver, Render, Status};
+use crate::{Browser, ReceiverId, Render, Status};
 
-/// Claude: a session playing to one receiver. It connects in the background,
-/// then calls `render` for each packet `LATENCY` before the packet's play time.
+/// Claude: a session playing to one receiver. It connects in the background:
+/// it waits a bounded time for the browser to find the receiver, then for any
+/// earlier stream through the same browser to that receiver to finish, then
+/// calls `render` for each packet `LATENCY` before the packet's play time.
 /// Dropping it tears the session down at once; `finish` lets the receiver play
 /// what it holds first.
 pub struct Stream {}
 
 impl Stream {
-    pub fn start<R>(receiver: &Receiver, render: R) -> Self
+    pub fn start<R>(browser: &Browser, receiver: ReceiverId, render: R) -> Self
     where
         R: FnMut(Render<'_>) + Send + 'static,
     {
