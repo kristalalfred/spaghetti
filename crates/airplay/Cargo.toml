@@ -1,0 +1,10 @@
+[package]
+name = "airplay"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tracing = "0.1"
+libc = "0.2"
+getrandom = "0.4"

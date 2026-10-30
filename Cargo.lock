@@ -33,6 +33,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "airplay"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.2",
+ "libc",
+ "tracing",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
