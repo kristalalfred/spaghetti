@@ -11,8 +11,7 @@ use output::{
 };
 use serde_json::json;
 use spaghetti_common::ipc_protocol::{
-    AirPlayReceiverInfo, AirPlaySupport, Destination, Request, Response, SourceSpec, SrtMode,
-    SrtSocket, TapMode,
+    AirPlayReceiverInfo, Destination, Request, Response, SourceSpec, SrtMode, SrtSocket, TapMode,
 };
 use std::error::Error;
 use std::io::{ErrorKind, IsTerminal, Write};
@@ -217,34 +216,20 @@ fn route_destination(
             return Err("airplay:// requires a receiver name or id".into());
         }
         let receivers = receivers()?;
-        let receiver =
-            if let Some(receiver) = receivers.iter().find(|r| r.id.eq_ignore_ascii_case(name)) {
-                receiver
-            } else {
-                let matches: Vec<_> = receivers.iter().filter(|r| r.name == name).collect();
-                match matches.as_slice() {
-                    [] => return Err(format!("AirPlay receiver '{name}' not found")),
-                    [receiver] => *receiver,
-                    _ => {
-                        let mut ids: Vec<_> = matches.iter().map(|r| r.id.as_str()).collect();
-                        ids.sort_unstable();
-                        return Err(format!(
-                            "AirPlay name '{name}' is ambiguous; use an id: {}",
-                            ids.join(", ")
-                        ));
-                    }
-                }
-            };
-        if let AirPlaySupport::Unsupported { reason } = &receiver.support {
-            return Err(format!(
-                "AirPlay receiver '{}' is unsupported: {reason}",
-                receiver.name
-            ));
-        }
-        Ok(Destination::AirPlay {
-            receiver: receiver.id.clone(),
-            delay_ms,
-        })
+        let matches: Vec<_> = receivers.iter().filter(|r| r.name == name).collect();
+        let receiver = match matches.as_slice() {
+            [] => name.to_string(),
+            [receiver] => receiver.id.clone(),
+            _ => {
+                let mut ids: Vec<_> = matches.iter().map(|r| r.id.as_str()).collect();
+                ids.sort_unstable();
+                return Err(format!(
+                    "AirPlay name '{name}' is ambiguous; use an id: {}",
+                    ids.join(", ")
+                ));
+            }
+        };
+        Ok(Destination::AirPlay { receiver, delay_ms })
     } else if target.starts_with("srt://") {
         if delay.is_some() {
             return Err("--delay applies only to output devices and AirPlay receivers".into());
@@ -551,6 +536,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spaghetti_common::ipc_protocol::AirPlaySupport;
 
     fn srt() -> SrtArgs {
         SrtArgs {
@@ -629,13 +615,66 @@ mod tests {
         let error = route_destination("airplay://Kitchen", Some(2500), &srt(), list).unwrap_err();
         assert!(error.contains("ambiguous"));
         assert!(error.contains("C4:38:75:04:5E:80, C4:38:75:04:5E:81"));
-        for name in ["kitchen", "Kit", "Absent"] {
-            let error = route_destination(&format!("airplay://{name}"), Some(2500), &srt(), list)
-                .unwrap_err();
-            assert!(error.contains("not found"), "{error}");
+        for target in ["kitchen", "Kit", "Absent", "c4:38:75:04:5e:80"] {
+            let destination =
+                route_destination(&format!("airplay://{target}"), Some(2500), &srt(), list)
+                    .unwrap();
+            assert_eq!(
+                destination,
+                Destination::AirPlay {
+                    receiver: target.into(),
+                    delay_ms: 2500
+                }
+            );
         }
+    }
+
+    #[test]
+    fn undiscovered_ids_reach_the_daemon_unchanged() {
+        let id = "C4:38:75:04:5E:99";
+        let destination = route_destination(&format!("airplay://{id}"), Some(2500), &srt(), || {
+            Ok(vec![])
+        })
+        .unwrap();
+        assert_eq!(
+            destination,
+            Destination::AirPlay {
+                receiver: id.into(),
+                delay_ms: 2500
+            }
+        );
+    }
+
+    #[test]
+    fn an_exact_name_takes_precedence_over_a_matching_id() {
+        let target = "C4:38:75:04:5E:80";
         let destination =
-            route_destination("airplay://c4:38:75:04:5e:80", Some(2500), &srt(), list).unwrap();
+            route_destination(&format!("airplay://{target}"), Some(2500), &srt(), || {
+                Ok(vec![
+                    receiver(target, "Kitchen"),
+                    receiver("C4:38:75:04:5E:81", target),
+                ])
+            })
+            .unwrap();
+        assert_eq!(
+            destination,
+            Destination::AirPlay {
+                receiver: "C4:38:75:04:5E:81".into(),
+                delay_ms: 2500
+            }
+        );
+    }
+
+    #[test]
+    fn support_is_checked_by_the_stream_and_discovery_errors_are_reported() {
+        let mut unsupported = receiver("C4:38:75:04:5E:80", "Kitchen");
+        unsupported.support = AirPlaySupport::Unsupported {
+            reason: "pairing required".into(),
+        };
+        let destination = route_destination("airplay://Kitchen", Some(2500), &srt(), || {
+            Ok(vec![unsupported])
+        })
+        .unwrap();
         assert_eq!(
             destination,
             Destination::AirPlay {
@@ -643,19 +682,6 @@ mod tests {
                 delay_ms: 2500
             }
         );
-    }
-
-    #[test]
-    fn airplay_reports_support_and_discovery_errors() {
-        let mut unsupported = receiver("C4:38:75:04:5E:80", "Kitchen");
-        unsupported.support = AirPlaySupport::Unsupported {
-            reason: "pairing required".into(),
-        };
-        let error = route_destination("airplay://Kitchen", Some(2500), &srt(), || {
-            Ok(vec![unsupported])
-        })
-        .unwrap_err();
-        assert!(error.contains("pairing required"));
         assert_eq!(
             route_destination("airplay://Kitchen", Some(2500), &srt(), || Err(
                 "discovery failed".into()
