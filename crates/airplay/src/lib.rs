@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 pub use browse::Browser;
-pub use stream::Stream;
+pub use stream::{Finishing, Stream};
 
 pub const SAMPLE_RATE: u32 = 44_100;
 pub const FRAMES_PER_PACKET: usize = 352;
