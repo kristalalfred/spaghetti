@@ -44,7 +44,8 @@ impl AirPlayOutput {
     }
 
     pub fn open(
-        receiver: &airplay::Receiver,
+        browser: &airplay::Browser,
+        receiver: airplay::ReceiverId,
         playout: Playout,
         ring: Arc<Ring>,
         volume: Arc<AtomicU32>,
@@ -64,7 +65,8 @@ impl AirPlayOutput {
             cycles: Arc::clone(&cycles),
         };
         let frequency = unsafe { AudioGetHostClockFrequency() };
-        let stream = airplay::Stream::start(receiver, move |mut render| {
+        let receiver_name = receiver.to_string();
+        let stream = airplay::Stream::start(browser, receiver, move |mut render| {
             let before = Instant::now();
             let now = unsafe { AudioGetCurrentHostTime() };
             let after = Instant::now();
@@ -76,7 +78,7 @@ impl AirPlayOutput {
         });
         Self {
             stream,
-            receiver: receiver.id.to_string(),
+            receiver: receiver_name,
             health,
             meter,
             cycles,

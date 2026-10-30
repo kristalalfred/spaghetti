@@ -213,7 +213,7 @@ pub struct Router {
     routes: HashMap<u32, Route>,
     sources: HashMap<u32, SourceEntry>,
     buses: HashMap<String, DeviceBus>,
-    finishing: HashMap<String, airplay::Finishing>,
+    finishing: Vec<airplay::Finishing>,
     next_source_id: u32,
     next_route_id: u32,
 }
@@ -224,7 +224,7 @@ impl Router {
             routes: HashMap::new(),
             sources: HashMap::new(),
             buses: HashMap::new(),
-            finishing: HashMap::new(),
+            finishing: Vec::new(),
             next_source_id: 1,
             next_route_id: 1,
         }
@@ -423,20 +423,10 @@ impl Router {
                                 .iter()
                                 .map(|(&id, route)| (id, &route.destination)),
                         )?;
-                        self.finishing
-                            .retain(|_, finishing| !finishing.is_finished());
-                        if let Some(finishing) = self.finishing.remove(id.as_str()) {
-                            finishing.wait();
-                        }
-                        let found = airplay_browser()
-                            .find(&id)?
-                            .ok_or_else(|| format!("AirPlay receiver '{id}' not found"))?;
-                        found.support().map_err(|reason| {
-                            format!("AirPlay receiver '{}' is unsupported: {reason}", found.name)
-                        })?;
-                        *receiver = found.id.to_string();
+                        *receiver = id.to_string();
                         Output::AirPlay(AirPlayOutput::open(
-                            &found,
+                            airplay_browser(),
+                            id,
                             playout,
                             Arc::clone(&ring),
                             Arc::clone(&volume),
@@ -511,8 +501,8 @@ impl Router {
                 destination,
             ) => {
                 match (output, destination) {
-                    (Output::AirPlay(output), Destination::AirPlay { receiver, .. }) => {
-                        self.finishing.insert(receiver, output.finish());
+                    (Output::AirPlay(output), Destination::AirPlay { .. }) => {
+                        self.finishing.push(output.finish());
                     }
                     (output, _) => drop(output),
                 }
@@ -584,7 +574,7 @@ impl Router {
 
     pub fn log_health(&mut self) {
         self.finishing
-            .retain(|_, finishing| !finishing.is_finished());
+            .retain(|finishing| !finishing.is_finished());
         for (&route_id, route) in &mut self.routes {
             if let Path::Ring { ring, output, .. } = &mut route.path {
                 output.log_health(route_id, ring);
@@ -646,7 +636,7 @@ fn validate_receiver_available<'a>(
 ) -> Result<(), String> {
     for (route_id, destination) in destinations {
         if let Destination::AirPlay { receiver: used, .. } = destination
-            && receiver.eq_ignore_ascii_case(used)
+            && receiver == used
         {
             return Err(format!(
                 "AirPlay receiver '{receiver}' already has route {route_id}"
@@ -662,7 +652,7 @@ impl Drop for Router {
         for route in routes {
             let _ = self.destroy_route(route);
         }
-        for (_, finishing) in self.finishing.drain() {
+        for finishing in self.finishing.drain(..) {
             finishing.wait();
         }
     }
@@ -769,7 +759,7 @@ mod tests {
     fn a_receiver_accepts_only_one_route() {
         let destinations = [airplay("C4:38:75:04:5E:80", 2500)];
         let existing = || destinations.iter().map(|d| (9, d));
-        for id in ["C4:38:75:04:5E:80", "c4:38:75:04:5e:80"] {
+        for id in ["C4:38:75:04:5E:80"] {
             assert!(
                 validate_receiver_available(id, existing())
                     .unwrap_err()
