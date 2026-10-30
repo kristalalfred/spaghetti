@@ -39,8 +39,11 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let server = server::Server::bind(activity_reader, device_manager).await?;
-    tracing::info!("Listening on {}", spaghetti_common::ipc_protocol::SOCKET_PATH);
+    let mut server = server::Server::bind(activity_reader, device_manager).await?;
+    tracing::info!(
+        "Listening on {}",
+        spaghetti_common::ipc_protocol::SOCKET_PATH
+    );
 
     // Probe for the virtual device in the background so we log whether the
     // driver is installed without blocking the socket bind.
@@ -53,6 +56,8 @@ async fn main() -> anyhow::Result<()> {
 
     let mut sigterm = signal::unix::signal(SignalKind::terminate())?;
 
+    let cancel = server.cancel.clone();
+
     // Run server until a shutdown request, Ctrl-C, or SIGTERM (launchd stop).
     tokio::select! {
         _ = server.run() => {},
@@ -62,11 +67,12 @@ async fn main() -> anyhow::Result<()> {
         _ = sigterm.recv() => {
             tracing::info!("Shutting down (SIGTERM)...");
         }
-        () = server.cancel.cancelled() => {
+        () = cancel.cancelled() => {
             tracing::info!("Shutting down...");
         }
     }
 
+    server.shutdown().await;
     let _ = fs::remove_file(spaghetti_common::ipc_protocol::SOCKET_PATH);
 
     Ok(())

@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use spaghetti_common::ipc_protocol::{
-    Destination, FlowState, FlowStatus, PeerRef, RouteInfo, SourceInfo, SourceSpec,
+    AirPlayReceiverInfo, AirPlaySupport, Destination, FlowState, FlowStatus, PeerRef, RouteInfo,
+    SourceInfo, SourceSpec,
 };
 
+use crate::airplay_sender::AirPlayOutput;
 use crate::audio;
 use crate::bus::DeviceBus;
 use crate::device_output::DeviceOutput;
@@ -100,41 +102,23 @@ impl Source {
 
 enum Output {
     Device(DeviceOutput),
+    AirPlay(AirPlayOutput),
     Srt(SrtOutput),
     WebRtc(WebRtcOutput),
 }
 
 impl Output {
-    fn open(
-        destination: &Destination,
-        source: SourceTiming,
-        ring: Arc<Ring>,
-        volume: Arc<AtomicU32>,
-    ) -> Result<Self, String> {
-        match destination {
-            Destination::Device { uid, delay_ms } => {
-                let device = audio::find_device_by_uid(uid)
-                    .ok_or_else(|| format!("device '{uid}' not found"))?;
-                let delay = delay_ms.map(|ms| f64::from(ms) / 1000.0);
-                unsafe { DeviceOutput::open(device, source, ring, volume, delay) }.map(Self::Device)
-            }
-            Destination::Srt(socket) => SrtOutput::open(socket, source, ring, volume).map(Self::Srt),
-            Destination::WebRtc(peer) => {
-                WebRtcOutput::open(peer, source, ring, volume).map(Self::WebRtc)
-            }
-        }
-    }
-
     fn start(&self) -> Result<(), String> {
         match self {
             Self::Device(device) => device.start(),
-            Self::Srt(_) | Self::WebRtc(_) => Ok(()),
+            Self::AirPlay(_) | Self::Srt(_) | Self::WebRtc(_) => Ok(()),
         }
     }
 
     fn status(&self) -> FlowStatus {
         match self {
             Self::Device(device) => device.status(),
+            Self::AirPlay(airplay) => airplay.status(),
             Self::Srt(srt) => srt.status(),
             Self::WebRtc(webrtc) => webrtc.status(),
         }
@@ -143,6 +127,7 @@ impl Output {
     fn log_health(&mut self, route_id: u32, ring: &Ring) {
         match self {
             Self::Device(device) => device.log_health(route_id, ring),
+            Self::AirPlay(airplay) => airplay.log_health(route_id, ring),
             Self::Srt(srt) => srt.log_health(route_id, ring),
             Self::WebRtc(webrtc) => webrtc.log_health(route_id, ring),
         }
@@ -158,6 +143,7 @@ impl Output {
     fn cycles(&self) -> Option<&Cycles> {
         match self {
             Self::Device(device) => Some(device.cycles()),
+            Self::AirPlay(airplay) => Some(airplay.cycles()),
             Self::Srt(_) | Self::WebRtc(_) => None,
         }
     }
@@ -227,6 +213,7 @@ pub struct Router {
     routes: HashMap<u32, Route>,
     sources: HashMap<u32, SourceEntry>,
     buses: HashMap<String, DeviceBus>,
+    finishing: HashMap<String, airplay::Finishing>,
     next_source_id: u32,
     next_route_id: u32,
 }
@@ -237,6 +224,7 @@ impl Router {
             routes: HashMap::new(),
             sources: HashMap::new(),
             buses: HashMap::new(),
+            finishing: HashMap::new(),
             next_source_id: 1,
             next_route_id: 1,
         }
@@ -334,6 +322,27 @@ impl Router {
         link.set_remote_description(generation, sdp)
     }
 
+    pub fn list_airplay_receivers(&self) -> Result<Vec<AirPlayReceiverInfo>, String> {
+        let mut receivers: Vec<_> = airplay_browser()
+            .receivers()?
+            .into_iter()
+            .map(|receiver| {
+                let support = match receiver.support() {
+                    Ok(()) => AirPlaySupport::Supported,
+                    Err(reason) => AirPlaySupport::Unsupported { reason },
+                };
+                AirPlayReceiverInfo {
+                    id: receiver.id.to_string(),
+                    name: receiver.name,
+                    model: receiver.model,
+                    support,
+                }
+            })
+            .collect();
+        receivers.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        Ok(receivers)
+    }
+
     pub fn source_count(&self) -> u32 {
         self.sources.len() as u32
     }
@@ -341,7 +350,7 @@ impl Router {
     pub fn create_route(
         &mut self,
         source_id: u32,
-        destination: Destination,
+        mut destination: Destination,
         initial_volume: f32,
     ) -> Result<u32, String> {
         let entry = self
@@ -349,18 +358,7 @@ impl Router {
             .get_mut(&source_id)
             .ok_or_else(|| format!("source {source_id} not found"))?;
 
-        if matches!(
-            destination,
-            Destination::Device {
-                delay_ms: Some(_),
-                ..
-            }
-        ) && matches!(entry.source, Source::Srt(_))
-        {
-            return Err(
-                "an SRT source does not date its frames, so it cannot play on a delay".into(),
-            );
-        }
+        validate_schedule_source(&entry.spec, &destination)?;
         let volume = Arc::new(AtomicU32::new(initial_volume.clamp(0.0, 2.0).to_bits()));
         let path = match (&entry.spec, &destination) {
             (
@@ -400,12 +398,63 @@ impl Router {
             _ => {
                 let source = &mut entry.source;
                 let ring = Arc::new(Ring::new());
-                let output = Output::open(
-                    &destination,
-                    source.timing()?,
-                    Arc::clone(&ring),
-                    Arc::clone(&volume),
-                )?;
+                let timing = source.timing()?;
+                let output = match &mut destination {
+                    Destination::Device { uid, delay_ms } => {
+                        let device = audio::find_device_by_uid(uid)
+                            .ok_or_else(|| format!("device '{uid}' not found"))?;
+                        let delay = delay_ms.map(|ms| f64::from(ms) / 1000.0);
+                        Output::Device(unsafe {
+                            DeviceOutput::open(
+                                device,
+                                timing,
+                                Arc::clone(&ring),
+                                Arc::clone(&volume),
+                                delay,
+                            )
+                        }?)
+                    }
+                    Destination::AirPlay { receiver, delay_ms } => {
+                        let playout = AirPlayOutput::playout(&timing, *delay_ms)?;
+                        let id: airplay::ReceiverId = receiver.parse()?;
+                        validate_receiver_available(
+                            id.as_str(),
+                            self.routes
+                                .iter()
+                                .map(|(&id, route)| (id, &route.destination)),
+                        )?;
+                        self.finishing
+                            .retain(|_, finishing| !finishing.is_finished());
+                        if let Some(finishing) = self.finishing.remove(id.as_str()) {
+                            finishing.wait();
+                        }
+                        let found = airplay_browser()
+                            .find(&id)?
+                            .ok_or_else(|| format!("AirPlay receiver '{id}' not found"))?;
+                        found.support().map_err(|reason| {
+                            format!("AirPlay receiver '{}' is unsupported: {reason}", found.name)
+                        })?;
+                        *receiver = found.id.to_string();
+                        Output::AirPlay(AirPlayOutput::open(
+                            &found,
+                            playout,
+                            Arc::clone(&ring),
+                            Arc::clone(&volume),
+                        ))
+                    }
+                    Destination::Srt(socket) => Output::Srt(SrtOutput::open(
+                        socket,
+                        timing,
+                        Arc::clone(&ring),
+                        Arc::clone(&volume),
+                    )?),
+                    Destination::WebRtc(peer) => Output::WebRtc(WebRtcOutput::open(
+                        peer,
+                        timing,
+                        Arc::clone(&ring),
+                        Arc::clone(&volume),
+                    )?),
+                };
                 let sink_slot = source.add_sink(Arc::clone(&ring))?;
                 if let Err(e) = output.start() {
                     source.remove_sink(sink_slot);
@@ -455,8 +504,18 @@ impl Router {
         }
 
         match (path, destination) {
-            (Path::Ring { sink_slot, output, .. }, _) => {
-                drop(output);
+            (
+                Path::Ring {
+                    sink_slot, output, ..
+                },
+                destination,
+            ) => {
+                match (output, destination) {
+                    (Output::AirPlay(output), Destination::AirPlay { receiver, .. }) => {
+                        self.finishing.insert(receiver, output.finish());
+                    }
+                    (output, _) => drop(output),
+                }
                 if let Some(entry) = self.sources.get_mut(&source_id) {
                     entry.source.remove_sink(sink_slot);
                 }
@@ -524,6 +583,8 @@ impl Router {
     }
 
     pub fn log_health(&mut self) {
+        self.finishing
+            .retain(|_, finishing| !finishing.is_finished());
         for (&route_id, route) in &mut self.routes {
             if let Path::Ring { ring, output, .. } = &mut route.path {
                 output.log_health(route_id, ring);
@@ -553,6 +614,57 @@ impl Router {
             .filter(|(_, r)| matches!(&r.destination, Destination::Device { uid, .. } if uid == device_uid))
             .map(|(&id, _)| id)
             .collect()
+    }
+}
+
+fn airplay_browser() -> &'static airplay::Browser {
+    static BROWSER: OnceLock<airplay::Browser> = OnceLock::new();
+    BROWSER.get_or_init(airplay::Browser::start)
+}
+
+fn validate_schedule_source(source: &SourceSpec, destination: &Destination) -> Result<(), String> {
+    let scheduled = match destination {
+        Destination::Device { delay_ms, .. } => delay_ms.is_some(),
+        Destination::AirPlay { .. } => true,
+        Destination::Srt(_) | Destination::WebRtc(_) => false,
+    };
+    let dated = match source {
+        SourceSpec::Tap { .. } | SourceSpec::WebRtc(_) => true,
+        SourceSpec::Srt(_) => false,
+    };
+    if scheduled && !dated {
+        return Err(
+            "an SRT source does not date its frames, so it cannot play on a schedule".into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_receiver_available<'a>(
+    receiver: &str,
+    destinations: impl Iterator<Item = (u32, &'a Destination)>,
+) -> Result<(), String> {
+    for (route_id, destination) in destinations {
+        if let Destination::AirPlay { receiver: used, .. } = destination
+            && receiver.eq_ignore_ascii_case(used)
+        {
+            return Err(format!(
+                "AirPlay receiver '{receiver}' already has route {route_id}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl Drop for Router {
+    fn drop(&mut self) {
+        let routes: Vec<_> = self.routes.keys().copied().collect();
+        for route in routes {
+            let _ = self.destroy_route(route);
+        }
+        for (_, finishing) in self.finishing.drain() {
+            finishing.wait();
+        }
     }
 }
 
@@ -599,6 +711,100 @@ impl Router {
         match &self.routes.get(&route_id).expect("the route exists").path {
             Path::Ring { ring, .. } => Arc::clone(ring),
             Path::Bus { .. } => panic!("route {route_id} is mixed by a bus"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spaghetti_common::ipc_protocol::{SrtMode, SrtSocket, TapMode};
+
+    fn airplay(receiver: &str, delay_ms: u32) -> Destination {
+        Destination::AirPlay {
+            receiver: receiver.into(),
+            delay_ms,
+        }
+    }
+
+    #[test]
+    fn undated_sources_are_rejected_for_every_scheduled_destination() {
+        let source = SourceSpec::Srt(SrtSocket {
+            mode: SrtMode::Listen { port: 9000 },
+            latency_ms: 200,
+            passphrase: None,
+            key_size: None,
+        });
+        for destination in [
+            airplay("C4:38:75:04:5E:80", 2500),
+            Destination::Device {
+                uid: "Speakers".into(),
+                delay_ms: Some(2500),
+            },
+        ] {
+            assert!(
+                validate_schedule_source(&source, &destination)
+                    .unwrap_err()
+                    .contains("does not date")
+            );
+            let tap = SourceSpec::Tap {
+                pids: vec![],
+                mode: TapMode::Mirror,
+            };
+            assert!(validate_schedule_source(&tap, &destination).is_ok());
+        }
+        assert!(
+            validate_schedule_source(
+                &source,
+                &Destination::Device {
+                    uid: "Speakers".into(),
+                    delay_ms: None,
+                }
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_receiver_accepts_only_one_route() {
+        let destinations = [airplay("C4:38:75:04:5E:80", 2500)];
+        let existing = || destinations.iter().map(|d| (9, d));
+        for id in ["C4:38:75:04:5E:80", "c4:38:75:04:5e:80"] {
+            assert!(
+                validate_receiver_available(id, existing())
+                    .unwrap_err()
+                    .contains("already has route 9")
+            );
+        }
+        assert!(validate_receiver_available("C4:38:75:04:5E:81", existing()).is_ok());
+        assert!(validate_receiver_available("C4:38:75:04:5E:80", std::iter::empty()).is_ok());
+    }
+
+    #[test]
+    fn airplay_delay_rejections_happen_before_any_discovery_or_session() {
+        for rate in [48000.0, 96000.0] {
+            let mut router = Router::new();
+            let (source, _) = router.create_fixture_source(rate);
+            for delay in [0, 1999, 2000, 2050] {
+                let error = router
+                    .create_route(source, airplay("C4:38:75:04:5E:80", delay), 1.0)
+                    .unwrap_err();
+                assert!(error.contains("at least"), "{rate} Hz, {delay} ms: {error}");
+            }
+            let error = router
+                .create_route(source, airplay("C4:38:75:04:5E:80", 10000), 1.0)
+                .unwrap_err();
+            assert!(error.contains("held-audio limit"), "{error}");
+            let timing = router
+                .sources
+                .get_mut(&source)
+                .unwrap()
+                .source
+                .timing()
+                .unwrap();
+            assert!(AirPlayOutput::playout(&timing, 2200).is_ok());
+            assert!(AirPlayOutput::playout(&timing, 2500).is_ok());
+            assert_eq!(router.route_count(), 0);
         }
     }
 }

@@ -4,6 +4,7 @@ use spaghetti_common::ipc_protocol::*;
 use spaghetti_engine::{ActivityReader, DeviceManager, FpsTracker, Router};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 /// Freshness window for the driver's last WriteMix timestamp — older than this
@@ -47,6 +48,7 @@ struct Shared {
 pub struct Server {
     listener: UnixListener,
     shared: Arc<Shared>,
+    clients: JoinSet<()>,
     pub cancel: CancellationToken,
 }
 
@@ -61,6 +63,7 @@ impl Server {
         let cancel = CancellationToken::new();
         Ok(Self {
             listener,
+            clients: JoinSet::new(),
             shared: Arc::new(Shared {
                 state: Mutex::new(DaemonState::new()),
                 devices: device_manager,
@@ -74,7 +77,7 @@ impl Server {
         })
     }
 
-    pub async fn run(&self) {
+    pub async fn run(&mut self) {
         let mut health_log = tokio::time::interval(HEALTH_LOG_INTERVAL);
         loop {
             tokio::select! {
@@ -82,9 +85,14 @@ impl Server {
                 accept = self.listener.accept() => {
                     match accept {
                         Ok((stream, _)) => {
-                            tokio::spawn(handle_client(stream, Arc::clone(&self.shared)));
+                            self.clients.spawn(handle_client(stream, Arc::clone(&self.shared)));
                         }
                         Err(e) => tracing::error!("accept error: {e}"),
+                    }
+                }
+                Some(result) = self.clients.join_next() => {
+                    if let Err(error) = result {
+                        tracing::error!(%error, "client handler failed");
                     }
                 }
                 () = self.shared.cancel.cancelled() => {
@@ -94,12 +102,30 @@ impl Server {
             }
         }
     }
+
+    pub async fn shutdown(mut self) {
+        self.cancel.cancel();
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while self.clients.join_next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            self.clients.abort_all();
+            while self.clients.join_next().await.is_some() {}
+        }
+        drop(self);
+    }
 }
 
 async fn handle_client(mut stream: UnixStream, shared: Arc<Shared>) {
     let peer = stream.peer_addr().map(|a| format!("{a:?}")).unwrap_or_else(|_| "unknown".into());
     loop {
-        let response = match read_frame_async(&mut stream).await {
+        let frame = tokio::select! {
+            biased;
+            () = shared.cancel.cancelled() => return,
+            frame = read_frame_async(&mut stream) => frame,
+        };
+        let response = match frame {
             Ok(buf) => match serde_json::from_slice::<Request>(&buf) {
                 Ok(req) => dispatch(req, &shared).await,
                 Err(e) => {
@@ -228,6 +254,10 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
         Request::ListDevices => Response::Devices(shared.devices.list_devices()),
         Request::GetActivity => Response::Activity(read_activity(&shared.activity)),
         Request::ListSystemDevices => Response::SystemDevices(spaghetti_engine::list_all_devices()),
+        Request::ListAirPlayReceivers => match lock_state(state).router.list_airplay_receivers() {
+            Ok(receivers) => Response::AirPlayReceivers(receivers),
+            Err(message) => Response::Error { message },
+        },
         Request::Shutdown => {
             tracing::info!("shutdown requested by client");
             shared.cancel.cancel();

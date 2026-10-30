@@ -22,7 +22,7 @@ impl TapMode {
 
 /// Claude: changes whenever a request or response changes shape, so a client
 /// can refuse a daemon it does not speak.
-pub const IPC_VERSION: u32 = 4;
+pub const IPC_VERSION: u32 = 5;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
@@ -45,6 +45,7 @@ pub enum Request {
     ListDevices,
     GetActivity,
     ListSystemDevices,
+    ListAirPlayReceivers,
     Shutdown,
 }
 
@@ -62,6 +63,7 @@ pub enum Response {
     Devices(Vec<DeviceInfo>),
     Activity(ActivityInfo),
     SystemDevices(Vec<SystemDeviceInfo>),
+    AirPlayReceivers(Vec<AirPlayReceiverInfo>),
 }
 
 /// Where a route's audio comes from.
@@ -86,6 +88,10 @@ pub enum Destination {
         uid: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         delay_ms: Option<u32>,
+    },
+    AirPlay {
+        receiver: String,
+        delay_ms: u32,
     },
     /// AAC in MPEG-TS sent over SRT.
     Srt(SrtSocket),
@@ -278,6 +284,20 @@ pub struct SystemDeviceInfo {
     pub is_output: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AirPlayReceiverInfo {
+    pub id: String,
+    pub name: String,
+    pub model: Option<String>,
+    pub support: AirPlaySupport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AirPlaySupport {
+    Supported,
+    Unsupported { reason: String },
+}
+
 /// Socket path for daemon IPC.
 pub const SOCKET_PATH: &str = "/tmp/spaghetti.sock";
 
@@ -366,6 +386,45 @@ mod tests {
                 delay_ms: Some(300),
             },
             r#"{"Device":{"uid":"Speakers","delay_ms":300}}"#,
+        );
+    }
+
+    #[test]
+    fn airplay_messages_have_a_fixed_wire_shape() {
+        golden(&Request::ListAirPlayReceivers, r#""ListAirPlayReceivers""#);
+        golden(
+            &Request::CreateRoute {
+                source_id: 4,
+                destination: Destination::AirPlay {
+                    receiver: "C4:38:75:04:5E:80".into(),
+                    delay_ms: 2500,
+                },
+                volume: 1.0,
+            },
+            r#"{"CreateRoute":{"source_id":4,"destination":{"AirPlay":{"receiver":"C4:38:75:04:5E:80","delay_ms":2500}},"volume":1.0}}"#,
+        );
+        assert!(
+            serde_json::from_str::<Destination>(r#"{"AirPlay":{"receiver":"C4:38:75:04:5E:80"}}"#)
+                .is_err()
+        );
+        golden(
+            &Response::AirPlayReceivers(vec![
+                AirPlayReceiverInfo {
+                    id: "C4:38:75:04:5E:80".into(),
+                    name: "Kitchen".into(),
+                    model: Some("Speaker".into()),
+                    support: AirPlaySupport::Supported,
+                },
+                AirPlayReceiverInfo {
+                    id: "C4:38:75:04:5E:81".into(),
+                    name: "Living room".into(),
+                    model: None,
+                    support: AirPlaySupport::Unsupported {
+                        reason: "pairing required".into(),
+                    },
+                },
+            ]),
+            r#"{"AirPlayReceivers":[{"id":"C4:38:75:04:5E:80","name":"Kitchen","model":"Speaker","support":"Supported"},{"id":"C4:38:75:04:5E:81","name":"Living room","model":null,"support":{"Unsupported":{"reason":"pairing required"}}}]}"#,
         );
     }
 
