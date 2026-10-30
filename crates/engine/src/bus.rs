@@ -96,6 +96,7 @@ impl Drop for SlotTap {
 /// Claude: what the IOProc mixes for one attached route.
 struct SlotMix {
     slot: usize,
+    sample_rate: f64,
     volume: Arc<AtomicU32>,
     fader: Fader,
     meter: Arc<FlowMeter>,
@@ -292,6 +293,7 @@ impl DeviceBus {
         let gain = f32::from_bits(volume.load(Ordering::Relaxed));
         let mix = SlotMix {
             slot,
+            sample_rate: self.sample_rate,
             volume,
             fader: Fader::new(gain, self.sample_rate),
             meter,
@@ -555,7 +557,7 @@ unsafe extern "C" fn bus_ioproc(
             }
             mix.meter
                 .record((frames * CHANNELS * std::mem::size_of::<f32>()) as u64, now);
-            mix.cycles.tick(now);
+            mix.cycles.tick(now, frames, mix.sample_rate);
         })
     };
     out.clamp();

@@ -314,6 +314,10 @@ impl Playout {
                 / self.health.source_rate
     }
 
+    pub fn device_rate(&self) -> f64 {
+        self.device_rate
+    }
+
     pub fn delay_frames(&self) -> usize {
         self.resampler.output_delay()
     }

@@ -354,7 +354,9 @@ unsafe extern "C" fn route_render_callback(
 
     let volume = f32::from_bits(state.volume.load(Ordering::Relaxed));
     state.fader.planar(&mut out, volume);
-    state.cycles.tick(now);
+    state
+        .cycles
+        .tick(now, in_number_frames as usize, state.playout.device_rate());
 
     if !state.logged_once {
         state.logged_once = true;

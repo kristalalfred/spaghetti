@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use core_foundation::bundle::CFBundle;
 use core_foundation::string::CFString;
@@ -103,6 +103,7 @@ impl Drop for ProcessTap {
 /// A tap's frames land in its rings a buffer at a time as the IOProc captures
 /// them, so the IOProc publishes its buffer as the tap's delivery span.
 struct CaptureState {
+    sample_rate: AtomicU64,
     sinks: Sinks,
     meter: FlowMeter,
     delivery: Arc<DeliverySpan>,
@@ -228,6 +229,7 @@ impl TapSource {
         Ok(Self {
             capture: None,
             state: Arc::new(CaptureState {
+                sample_rate: AtomicU64::new(0),
                 sinks: Sinks::new(),
                 meter: FlowMeter::new(),
                 delivery: Arc::new(DeliverySpan::new(0.0)),
@@ -244,7 +246,11 @@ impl TapSource {
 
     fn open(&mut self) -> Result<&Opened, String> {
         if self.opened.is_none() {
-            self.opened = Some(Opened::open(self.source_id, &self.pids, self.mode)?);
+            let opened = Opened::open(self.source_id, &self.pids, self.mode)?;
+            self.state
+                .sample_rate
+                .store(opened.sample_rate.to_bits(), Ordering::Relaxed);
+            self.opened = Some(opened);
         }
         Ok(self.opened.as_ref().expect("opened above"))
     }
@@ -410,7 +416,11 @@ unsafe extern "C" fn capture_ioproc(
     state
         .meter
         .record((frames * CHANNELS * std::mem::size_of::<f32>()) as u64, now);
-    state.cycles.tick(now);
+    state.cycles.tick(
+        now,
+        frames,
+        f64::from_bits(state.sample_rate.load(Ordering::Relaxed)),
+    );
 
     if !state.logged_once.swap(true, Ordering::Relaxed)
         && let Some(first) = buffers.first()

@@ -95,6 +95,10 @@ impl AirPlayOutput {
         &self.cycles
     }
 
+    pub fn is_playing(&self) -> bool {
+        matches!(self.stream.status(), airplay::Status::Streaming(_))
+    }
+
     pub fn status(&self) -> FlowStatus {
         flow_status(&self.stream.status(), &self.meter, &self.receiver)
     }
@@ -153,7 +157,8 @@ impl Renderer {
         }
         self.fader
             .planar(out, f32::from_bits(self.volume.load(Ordering::Relaxed)));
-        self.cycles.tick(now);
+        self.cycles
+            .tick(now, out[0].len(), f64::from(airplay::SAMPLE_RATE));
     }
 }
 

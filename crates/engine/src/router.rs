@@ -15,7 +15,7 @@ use crate::device_output::DeviceOutput;
 #[cfg(test)]
 use crate::fixture::FixtureSource;
 use crate::flow::{FlowMeter, Link};
-use crate::mixer::{Cycles, FADE_LIMIT, IDLE, RAMP};
+use crate::mixer::{Cycles, FADE_LIMIT, IDLE};
 use crate::ring::Ring;
 use crate::sinks::SourceTiming;
 use crate::srt_receiver::SrtSource;
@@ -140,10 +140,10 @@ impl Output {
         }
     }
 
-    fn cycles(&self) -> Option<&Cycles> {
+    fn playing_cycles(&self) -> Option<&Cycles> {
         match self {
-            Self::Device(device) => Some(device.cycles()),
-            Self::AirPlay(airplay) => Some(airplay.cycles()),
+            Self::Device(device) => Some(device.cycles()).filter(|cycles| cycles.running(IDLE)),
+            Self::AirPlay(airplay) => airplay.is_playing().then(|| airplay.cycles()),
             Self::Srt(_) | Self::WebRtc(_) => None,
         }
     }
@@ -196,11 +196,10 @@ impl Path {
         }
     }
 
-    /// Claude: the cycles of whatever plays the route on a device.
-    fn cycles(&self) -> Option<&Cycles> {
+    fn playing_cycles(&self) -> Option<&Cycles> {
         match self {
-            Self::Ring { output, .. } => output.cycles(),
-            Self::Bus { cycles, .. } => Some(cycles),
+            Self::Ring { output, .. } => output.playing_cycles(),
+            Self::Bus { cycles, .. } => Some(cycles.as_ref()).filter(|cycles| cycles.running(IDLE)),
         }
     }
 }
@@ -416,7 +415,9 @@ impl Router {
                     }
                     Destination::AirPlay { receiver, delay_ms } => {
                         let playout = AirPlayOutput::playout(&timing, *delay_ms)?;
-                        let id: airplay::ReceiverId = receiver.parse()?;
+                        let id: airplay::ReceiverId = receiver.parse().map_err(|reason| {
+                            format!("invalid AirPlay receiver id '{receiver}': {reason}")
+                        })?;
                         validate_receiver_available(
                             id.as_str(),
                             self.routes
@@ -473,10 +474,6 @@ impl Router {
         Ok(id)
     }
 
-    /// Claude: a route playing on a device fades out over `RAMP` before it
-    /// goes, its tap still muting the app meanwhile. The cycle running when the
-    /// ramp ends may still be writing it, and two more let the device play out
-    /// what it queued before a bus closing with the route discards it.
     pub fn destroy_route(&mut self, route_id: u32) -> Result<(), String> {
         let Route {
             source_id,
@@ -487,10 +484,9 @@ impl Router {
             .routes
             .remove(&route_id)
             .ok_or_else(|| format!("route {route_id} not found"))?;
-        if let Some(cycles) = path.cycles().filter(|cycles| cycles.running(IDLE)) {
+        if let Some(cycles) = path.playing_cycles() {
             volume.store(0f32.to_bits(), Ordering::Release);
-            std::thread::sleep(RAMP);
-            cycles.wait(3, FADE_LIMIT);
+            cycles.wait_fade(3, FADE_LIMIT);
         }
 
         match (path, destination) {
@@ -538,18 +534,14 @@ impl Router {
         Ok(())
     }
 
-    /// Claude: sets a route's volume and, while the route plays on a device,
-    /// returns once its output has ramped there: the ramp lasts `RAMP`, and
-    /// the cycle running when it ends may still be writing it.
     pub fn fade_volume(&mut self, route_id: u32, volume: f32) -> Result<(), String> {
         self.set_volume(route_id, volume)?;
         let cycles = self
             .routes
             .get(&route_id)
-            .and_then(|route| route.path.cycles());
-        if let Some(cycles) = cycles.filter(|cycles| cycles.running(IDLE)) {
-            std::thread::sleep(RAMP);
-            cycles.wait(2, FADE_LIMIT);
+            .and_then(|route| route.path.playing_cycles());
+        if let Some(cycles) = cycles {
+            cycles.wait_fade(2, FADE_LIMIT);
         }
         Ok(())
     }
@@ -759,13 +751,11 @@ mod tests {
     fn a_receiver_accepts_only_one_route() {
         let destinations = [airplay("C4:38:75:04:5E:80", 2500)];
         let existing = || destinations.iter().map(|d| (9, d));
-        for id in ["C4:38:75:04:5E:80"] {
-            assert!(
-                validate_receiver_available(id, existing())
-                    .unwrap_err()
-                    .contains("already has route 9")
-            );
-        }
+        assert!(
+            validate_receiver_available("C4:38:75:04:5E:80", existing())
+                .unwrap_err()
+                .contains("already has route 9")
+        );
         assert!(validate_receiver_available("C4:38:75:04:5E:81", existing()).is_ok());
         assert!(validate_receiver_available("C4:38:75:04:5E:80", std::iter::empty()).is_ok());
     }

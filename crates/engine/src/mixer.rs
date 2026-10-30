@@ -30,23 +30,45 @@ pub const IDLE: Duration = Duration::from_millis(100);
 /// Claude: counts the cycles of an IOProc or render callback and when the
 /// latest ran, so the control side can wait for a change to take effect there.
 pub struct Cycles {
-    count: AtomicU64,
+    sequence: AtomicU64,
+    rendered_ns: AtomicU64,
     at: AtomicU64,
+}
+
+struct Progress {
+    cycles: u64,
+    rendered_ns: u64,
 }
 
 impl Cycles {
     pub fn new() -> Self {
         Self {
-            count: AtomicU64::new(0),
+            sequence: AtomicU64::new(0),
+            rendered_ns: AtomicU64::new(0),
             at: AtomicU64::new(0),
         }
     }
 
-    /// Claude: real-time safe, called once a cycle's output is written. `now`
-    /// is the cycle's host time.
-    pub fn tick(&self, now: u64) {
+    // Codex: one callback writes this counter. Odd sequences exclude a partial
+    // tick from snapshots; readers retry through their deadline, never spin.
+    pub fn tick(&self, now: u64, frames: usize, rate: f64) {
+        let rendered_ns = (frames as f64 * 1e9 / rate) as u64;
+        self.sequence.fetch_add(1, Ordering::SeqCst);
+        self.rendered_ns.fetch_add(rendered_ns, Ordering::SeqCst);
         self.at.store(now, Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Release);
+        self.sequence.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn progress(&self) -> Option<Progress> {
+        let before = self.sequence.load(Ordering::SeqCst);
+        if !before.is_multiple_of(2) {
+            return None;
+        }
+        let rendered_ns = self.rendered_ns.load(Ordering::SeqCst);
+        (self.sequence.load(Ordering::SeqCst) == before).then_some(Progress {
+            cycles: before / 2,
+            rendered_ns,
+        })
     }
 
     /// Claude: whether a cycle ran within `within`.
@@ -57,18 +79,41 @@ impl Cycles {
         at != 0 && (now.saturating_sub(at) as f64) < ticks
     }
 
-    /// Claude: waits until `cycles` more cycles have run, or `limit` passed.
-    /// Returns whether they ran.
-    pub fn wait(&self, cycles: u64, limit: Duration) -> bool {
-        let target = self.count.load(Ordering::Acquire) + cycles;
+    pub fn wait_fade(&self, queued_cycles: u64, limit: Duration) -> bool {
         let deadline = Instant::now() + limit;
-        while self.count.load(Ordering::Acquire) < target {
+        let before = self.sequence.load(Ordering::SeqCst) / 2;
+        let Some(start) = self.wait_until(deadline, |p| p.cycles > before) else {
+            return false;
+        };
+        let Some(faded) = self.wait_until(deadline, |p| {
+            p.rendered_ns.saturating_sub(start.rendered_ns) >= RAMP.as_nanos() as u64
+        }) else {
+            return false;
+        };
+        self.wait_until(deadline, |p| p.cycles >= faded.cycles + queued_cycles)
+            .is_some()
+    }
+
+    pub fn wait(&self, cycles: u64, limit: Duration) -> bool {
+        let target = self.sequence.load(Ordering::SeqCst) / 2 + cycles;
+        self.wait_until(Instant::now() + limit, |p| p.cycles >= target)
+            .is_some()
+    }
+
+    fn wait_until(
+        &self,
+        deadline: Instant,
+        condition: impl Fn(&Progress) -> bool,
+    ) -> Option<Progress> {
+        loop {
+            if let Some(progress) = self.progress().filter(&condition) {
+                return Some(progress);
+            }
             if Instant::now() >= deadline {
-                return false;
+                return None;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        true
     }
 }
 
@@ -245,13 +290,79 @@ mod tests {
             move || {
                 for _ in 0..3 {
                     std::thread::sleep(Duration::from_millis(5));
-                    cycles.tick(unsafe { AudioGetCurrentHostTime() });
+                    cycles.tick(unsafe { AudioGetCurrentHostTime() }, 352, 44100.0);
                 }
             }
         });
         assert!(cycles.wait(2, Duration::from_secs(1)));
         ticking.join().unwrap();
         assert!(cycles.running(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_fade_waits_for_rendered_audio_after_a_stall_longer_than_idle() {
+        use std::sync::{Arc, atomic::AtomicUsize};
+        let cycles = Arc::new(Cycles::new());
+        cycles.tick(unsafe { AudioGetCurrentHostTime() }, 352, 44100.0);
+        let rendered = Arc::new(AtomicUsize::new(0));
+        let ticking = std::thread::spawn({
+            let cycles = Arc::clone(&cycles);
+            let rendered = Arc::clone(&rendered);
+            move || {
+                std::thread::sleep(IDLE + Duration::from_millis(10));
+                for _ in 0..11 {
+                    std::thread::sleep(Duration::from_millis(8));
+                    rendered.fetch_add(352, Ordering::Release);
+                    cycles.tick(unsafe { AudioGetCurrentHostTime() }, 352, 44100.0);
+                }
+            }
+        });
+        let finished = cycles.wait_fade(3, FADE_LIMIT);
+        let frames = rendered.load(Ordering::Acquire);
+        ticking.join().unwrap();
+        assert!(finished);
+        assert!(frames >= 11 * 352, "finished after only {frames} frames");
+    }
+
+    #[test]
+    fn a_fade_counts_rendered_duration_across_different_rates_and_sizes() {
+        use std::sync::{Arc, atomic::AtomicUsize};
+        let cycles = Arc::new(Cycles::new());
+        let rendered = Arc::new(AtomicUsize::new(0));
+        let ticking = std::thread::spawn({
+            let cycles = Arc::clone(&cycles);
+            let rendered = Arc::clone(&rendered);
+            move || {
+                for (frames, rate) in [
+                    (352, 44100.0),
+                    (480, 48000.0),
+                    (960, 96000.0),
+                    (441, 44100.0),
+                    (960, 96000.0),
+                    (480, 48000.0),
+                    (352, 44100.0),
+                    (352, 44100.0),
+                ] {
+                    std::thread::sleep(Duration::from_millis(8));
+                    rendered.fetch_add(1, Ordering::Release);
+                    cycles.tick(unsafe { AudioGetCurrentHostTime() }, frames, rate);
+                }
+            }
+        });
+        let finished = cycles.wait_fade(2, FADE_LIMIT);
+        let rendered = rendered.load(Ordering::Acquire);
+        ticking.join().unwrap();
+        assert!(finished);
+        assert_eq!(rendered, 8);
+    }
+
+    #[test]
+    fn a_fade_that_never_resumes_has_one_bounded_deadline() {
+        let cycles = Cycles::new();
+        cycles.tick(unsafe { AudioGetCurrentHostTime() }, 352, 44100.0);
+        let started = Instant::now();
+        assert!(!cycles.wait_fade(3, FADE_LIMIT));
+        assert!(started.elapsed() < FADE_LIMIT + Duration::from_millis(40));
     }
 
     #[test]
