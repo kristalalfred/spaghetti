@@ -1,7 +1,8 @@
 use serde::Serialize;
 use spaghetti_common::ipc_protocol::{
-    ActivityInfo, AppInfo, DaemonStatus, Destination, DeviceInfo, FlowState, FlowStatus, PeerRole,
-    RouteInfo, SourceInfo, SourceSpec, SrtMode, SrtSocket, SystemDeviceInfo, WebRtcPeer,
+    ActivityInfo, AirPlayReceiverInfo, AirPlaySupport, AppInfo, DaemonStatus, Destination,
+    DeviceInfo, FlowState, FlowStatus, PeerRole, RouteInfo, SourceInfo, SourceSpec, SrtMode,
+    SrtSocket, SystemDeviceInfo, WebRtcPeer,
 };
 use std::fmt::Display;
 use std::io::IsTerminal;
@@ -126,6 +127,24 @@ pub fn print_sources(sources: &[SourceInfo]) {
     }
 }
 
+fn destination_label(destination: &Destination) -> String {
+    match destination {
+        Destination::Device {
+            uid,
+            delay_ms: None,
+        } => uid.clone(),
+        Destination::Device {
+            uid,
+            delay_ms: Some(delay),
+        } => format!("{uid} +{delay} ms"),
+        Destination::AirPlay { receiver, delay_ms } => {
+            format!("airplay://{receiver} +{delay_ms} ms")
+        }
+        Destination::Srt(socket) => srt_label(socket),
+        Destination::WebRtc(peer) => format!("webrtc {} ({})", peer.link, role_label(peer.role)),
+    }
+}
+
 pub fn print_routes(routes: &[RouteInfo]) {
     if routes.is_empty() {
         println!("No active routes.");
@@ -133,18 +152,7 @@ pub fn print_routes(routes: &[RouteInfo]) {
     }
     let destinations: Vec<String> = routes
         .iter()
-        .map(|route| match &route.destination {
-            Destination::Device {
-                uid,
-                delay_ms: None,
-            } => uid.clone(),
-            Destination::Device {
-                uid,
-                delay_ms: Some(delay),
-            } => format!("{uid} +{delay} ms"),
-            Destination::Srt(socket) => srt_label(socket),
-            Destination::WebRtc(peer) => format!("webrtc {} ({})", peer.link, role_label(peer.role)),
-        })
+        .map(|route| destination_label(&route.destination))
         .collect();
     let dest_w = col_width(destinations.iter().map(String::as_str), 30);
     println!("{:<6} {:<7} {:<dest_w$} {:<7} STATE", "ID", "SOURCE", "DESTINATION", "VOLUME");
@@ -177,6 +185,35 @@ pub fn print_system_devices(devices: &[SystemDeviceInfo]) {
         let kind = if d.is_output { "output" } else { "input" };
         println!("{:<uid_w$} {:<name_w$} {:<8} {}", d.uid, d.name, d.channels, kind);
     }
+}
+
+pub fn print_airplay_receivers(receivers: &[AirPlayReceiverInfo]) {
+    print!("{}", format_airplay_receivers(receivers));
+}
+
+fn format_airplay_receivers(receivers: &[AirPlayReceiverInfo]) -> String {
+    use std::fmt::Write;
+    if receivers.is_empty() {
+        return "No AirPlay receivers found.\n".into();
+    }
+    let name_w = col_width(receivers.iter().map(|r| r.name.as_str()), 24);
+    let mut text = format!("{:<17} {:<name_w$} {:<20} SUPPORT\n", "ID", "NAME", "MODEL");
+    for receiver in receivers {
+        let support = match &receiver.support {
+            AirPlaySupport::Supported => "supported",
+            AirPlaySupport::Unsupported { reason } => reason,
+        };
+        writeln!(
+            text,
+            "{:<17} {:<name_w$} {:<20} {}",
+            receiver.id,
+            receiver.name,
+            receiver.model.as_deref().unwrap_or("-"),
+            support
+        )
+        .unwrap();
+    }
+    text
 }
 
 pub fn print_devices(devices: &[DeviceInfo]) {
@@ -242,6 +279,10 @@ impl<'a> From<&'a RouteInfo> for RouteJson<'a> {
                     uid,
                     delay_ms: *delay_ms,
                 },
+                Destination::AirPlay { receiver, delay_ms } => EndpointJson::AirPlay {
+                    receiver,
+                    delay_ms: *delay_ms,
+                },
                 Destination::Srt(socket) => EndpointJson::srt(socket),
                 Destination::WebRtc(peer) => EndpointJson::webrtc(peer),
             },
@@ -262,6 +303,11 @@ enum EndpointJson<'a> {
         uid: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
         delay_ms: Option<u32>,
+    },
+    #[serde(rename = "airplay")]
+    AirPlay {
+        receiver: &'a str,
+        delay_ms: u32,
     },
     Srt {
         url: String,
@@ -458,6 +504,64 @@ mod tests {
             format!(
                 r#"{{"route_id":5,"source_id":3,"destination":{{"kind":"webrtc","link":"link-7","generation":2,"role":"offer"}},"volume":0.8,"status":{FLOWING}}}"#
             ),
+        );
+    }
+    #[test]
+    fn airplay_routes_show_the_receiver_and_required_delay_in_text_and_json() {
+        let destination = Destination::AirPlay {
+            receiver: "C4:38:75:04:5E:80".into(),
+            delay_ms: 2500,
+        };
+        assert_eq!(
+            destination_label(&destination),
+            "airplay://C4:38:75:04:5E:80 +2500 ms"
+        );
+        assert_eq!(
+            route_json(destination),
+            format!(
+                r#"{{"route_id":5,"source_id":3,"destination":{{"kind":"airplay","receiver":"C4:38:75:04:5E:80","delay_ms":2500}},"volume":0.8,"status":{FLOWING}}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn receiver_listings_show_support_reasons_and_models() {
+        let receivers = vec![
+            AirPlayReceiverInfo {
+                id: "C4:38:75:04:5E:80".into(),
+                name: "Kitchen".into(),
+                model: Some("Speaker".into()),
+                support: AirPlaySupport::Supported,
+            },
+            AirPlayReceiverInfo {
+                id: "C4:38:75:04:5E:81".into(),
+                name: "Living room".into(),
+                model: None,
+                support: AirPlaySupport::Unsupported {
+                    reason: "pairing required".into(),
+                },
+            },
+        ];
+        let text = format_airplay_receivers(&receivers);
+        for expected in [
+            "Kitchen",
+            "Speaker",
+            "supported",
+            "C4:38:75:04:5E:81",
+            "Living room",
+            "pairing required",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+        let json = serde_json::to_value(&receivers).unwrap();
+        assert_eq!(json[0]["support"], "Supported");
+        assert_eq!(
+            json[1]["support"]["Unsupported"]["reason"],
+            "pairing required"
+        );
+        assert_eq!(
+            format_airplay_receivers(&[]),
+            "No AirPlay receivers found.\n"
         );
     }
 }

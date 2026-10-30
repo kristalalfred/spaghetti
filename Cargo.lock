@@ -1755,6 +1755,7 @@ dependencies = [
 name = "spaghetti-engine"
 version = "0.1.0"
 dependencies = [
+ "airplay",
  "bytes",
  "cc",
  "core-foundation",

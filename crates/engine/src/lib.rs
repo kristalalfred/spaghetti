@@ -4,6 +4,7 @@
 mod abl;
 mod activity;
 mod adts;
+mod airplay_sender;
 mod audio;
 mod bus;
 mod clock;

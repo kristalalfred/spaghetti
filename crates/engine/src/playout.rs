@@ -305,6 +305,14 @@ impl Playout {
         CAPACITY_FRAMES.saturating_sub(reserve) as f64 / rate
     }
 
+    pub fn minimum_delay(&self, render_ahead: f64) -> f64 {
+        render_ahead
+            + (self.delivery.frames()
+                + self.resampler.input_frames_max() as f64
+                + self.margin_frames as f64)
+                / self.health.source_rate
+    }
+
     pub fn delay_frames(&self) -> usize {
         self.resampler.output_delay()
     }
