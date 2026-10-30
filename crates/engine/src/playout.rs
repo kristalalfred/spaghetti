@@ -7,9 +7,9 @@ use rubato::{
     WindowFunction,
 };
 
-use crate::delivery::DeliverySpan;
+use crate::delivery::{DeliverySpan, MAX_SPAN};
 use crate::mixer::RAMP;
-use crate::ring::{CHANNELS, LastPush, Ring};
+use crate::ring::{CAPACITY_FRAMES, CHANNELS, LastPush, Ring};
 use crate::sinks::SourceTiming;
 
 pub const MAX_RENDER_FRAMES: usize = 4096;
@@ -165,6 +165,51 @@ impl PlayoutHealth {
         }
     }
 
+    pub fn log(
+        &self,
+        route_id: u32,
+        ring: &Ring,
+        scheduled: bool,
+        reported_glitches: &mut [u32; 4],
+    ) {
+        let report = self.report();
+        let glitches = [
+            report.underruns,
+            report.reprimes,
+            report.resyncs,
+            ring.overflows(),
+        ];
+        let to_ms = |frames: f64| frames * 1000.0 / self.source_rate;
+        tracing::debug!(
+            route_id,
+            fill_frames = report.fill_avg_frames,
+            fill_ms = to_ms(report.fill_avg_frames as f64),
+            target_ms = to_ms(report.target_frames as f64),
+            delivery_ms = to_ms(report.delivery_frames),
+            correction_ppm = report.correction_ppm,
+            late_ms = scheduled
+                .then(|| to_ms(f64::from(report.lateness_frames))),
+            underruns = glitches[0],
+            reprimes = glitches[1],
+            resyncs = glitches[2],
+            overflows = glitches[3],
+            "route playout health"
+        );
+        if glitches != *reported_glitches {
+            tracing::info!(
+                route_id,
+                underruns = glitches[0] - reported_glitches[0],
+                reprimes = glitches[1] - reported_glitches[1],
+                resyncs = glitches[2] - reported_glitches[2],
+                overflows = glitches[3] - reported_glitches[3],
+                glitch_delivery_ms = to_ms(report.glitch_span_frames as f64),
+                glitch_target_ms = to_ms(report.glitch_target_frames as f64),
+                "route playout glitched since the last report"
+            );
+            *reported_glitches = glitches;
+        }
+    }
+
     fn glitched(&self, glitch: Glitch, span: f64, target: usize) {
         self.glitch_span
             .store(span.round() as u32, Ordering::Relaxed);
@@ -200,7 +245,7 @@ impl Playout {
         )
         .map_err(|e| format!("create resampler: {e}"))?;
         let input = vec![0.0; resampler.input_frames_max() * CHANNELS];
-        Ok(Self {
+        let playout = Self {
             resampler,
             input,
             indexing: Indexing::default(),
@@ -234,11 +279,30 @@ impl Playout {
                 glitch_target: AtomicU32::new(0),
                 lateness: AtomicU32::new(0),
             }),
-        })
+        };
+        if let Some(schedule) = schedule {
+            let limit = playout.max_held_seconds();
+            if schedule.delay - schedule.latency > limit {
+                return Err(format!(
+                    "delay exceeds the {:.0} ms held-audio limit at {:.0} Hz plus {:.0} ms output latency",
+                    (limit * 1000.0).floor(), source_rate, schedule.latency * 1000.0,
+                ));
+            }
+        }
+        Ok(playout)
     }
 
     pub fn health(&self) -> Arc<PlayoutHealth> {
         Arc::clone(&self.health)
+    }
+
+    pub fn max_held_seconds(&self) -> f64 {
+        let rate = self.health.source_rate;
+        let span = self.delivery.frames().max(MAX_SPAN * rate).ceil() as usize;
+        let reserve = 2 * span
+            + (RESYNC_RENDERS + 1) * self.resampler.input_frames_max()
+            + self.margin_frames;
+        CAPACITY_FRAMES.saturating_sub(reserve) as f64 / rate
     }
 
     pub fn delay_frames(&self) -> usize {
@@ -653,6 +717,7 @@ mod tests {
         pushes: Vec<Push>,
         next_push: usize,
         next_render: f64,
+        render_ahead: f64,
         rendered: Vec<f32>,
         /// Claude: when the device output each render.
         render_times: Vec<f64>,
@@ -709,6 +774,7 @@ mod tests {
                 pushes,
                 next_push: 0,
                 next_render: 0.0013,
+                render_ahead: 0.0,
                 rendered: Vec::new(),
                 render_times: Vec::new(),
                 render_period: RENDER_FRAMES as f64 / (device_rate * (1.0 + device_ppm * 1e-6)),
@@ -819,11 +885,16 @@ mod tests {
                     let (mut left, mut right) =
                         (vec![0.0; RENDER_FRAMES], vec![0.0; RENDER_FRAMES]);
                     let now = (self.next_render * TICKS_PER_SECOND) as u64;
-                    self.playout
-                        .render(&self.ring, &mut [&mut left, &mut right], now, now);
+                    let output = self.next_render + self.render_ahead;
+                    self.playout.render(
+                        &self.ring,
+                        &mut [&mut left, &mut right],
+                        now,
+                        (output * TICKS_PER_SECOND) as u64,
+                    );
                     assert_eq!(left, right);
                     self.rendered.extend_from_slice(&left);
-                    self.render_times.push(self.next_render);
+                    self.render_times.push(output);
                     self.next_render += self.render_period;
                     let correction = self.playout.health.report().correction_ppm.abs();
                     self.worst_correction_ppm = self.worst_correction_ppm.max(correction);
@@ -1399,6 +1470,45 @@ mod tests {
                 let label = format!("{source} -> {device}, first render at {start}");
                 assert!(error.abs() < 50e-6, "{label}: {} µs off", error * 1e6);
                 assert_eq!(sim.glitches(), [0; 3], "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn held_audio_limit_supports_shared_delays_at_48_and_96_khz() {
+        for rate in [48000.0, 96000.0] {
+            let timing = SourceTiming {
+                sample_rate: rate,
+                delivery: Arc::new(DeliverySpan::new(rate)),
+            };
+            let playout = Playout::new(&timing, 44100.0, TICKS_PER_SECOND, None).unwrap();
+            let limit = playout.max_held_seconds();
+            assert!(limit >= 2.5, "{rate} Hz: only {limit} s held");
+            let schedule = Schedule { delay: limit + 1.0 / rate, latency: 0.0 };
+            assert!(Playout::new(&timing, 44100.0, TICKS_PER_SECOND, Some(schedule)).is_err());
+            let schedule = Schedule { delay: 2.5, latency: 0.0 };
+            assert!(Playout::new(&timing, 44100.0, TICKS_PER_SECOND, Some(schedule)).is_ok());
+        }
+    }
+
+    #[test]
+    fn future_output_and_local_output_play_at_the_same_capture_plus_delay() {
+        for rate in [48000.0, 96000.0] {
+            for ahead in [0.0, 2.0] {
+                let schedule = Schedule { delay: 2.5, latency: 0.0 };
+                let mut sim = Sim::scheduled(
+                    rate, 44100.0, 0.0, schedule,
+                    on_time(rate, (rate * 0.02) as usize, 20.0), 0.0013,
+                );
+                sim.render_ahead = ahead;
+                sim.run(10.0);
+                assert_eq!(sim.glitches(), [0; 3], "{rate} Hz, {ahead} s ahead");
+                let error = sim.schedule_error(schedule, 2.0);
+                assert!(error.abs() < 50e-6, "{rate} Hz, {ahead} s ahead: {error} s off");
+                let first = sim.first_sound();
+                let output = sim.render_times[first / RENDER_FRAMES]
+                    + (first % RENDER_FRAMES) as f64 / 44100.0;
+                assert!((output - schedule.delay).abs() < 0.005, "first sound at {output}");
             }
         }
     }

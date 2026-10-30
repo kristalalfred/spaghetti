@@ -12,11 +12,6 @@ use crate::playout::{Playout, PlayoutHealth, Schedule};
 use crate::ring::{CHANNELS, Ring};
 use crate::sinks::SourceTiming;
 
-/// Claude: a delayed route holds each frame in its ring until the device needs
-/// it, its delay less the device's latency. The ring holds 2.7 s, which that
-/// and the source's own delivery must fit in.
-const MAX_HELD_SECONDS: f64 = 2.0;
-
 /// Claude: a route's output to a Core Audio device. The device pulls through the
 /// render callback, and `Playout` resamples the route's ring to the device rate.
 /// With a delay, each frame sounds that many seconds after its capture.
@@ -64,13 +59,6 @@ impl DeviceOutput {
             latency: f64::from(audio::output_latency_frames(device)) / device_format.mSampleRate,
         });
         if let Some(schedule) = schedule {
-            if schedule.delay - schedule.latency > MAX_HELD_SECONDS {
-                return Err(format!(
-                    "a delay may exceed the device's {:.0} ms latency by at most {:.0} ms",
-                    schedule.latency * 1000.0,
-                    MAX_HELD_SECONDS * 1000.0
-                ));
-            }
             tracing::info!(
                 delay_ms = schedule.delay * 1000.0,
                 latency_ms = schedule.latency * 1000.0,
@@ -135,43 +123,12 @@ impl DeviceOutput {
     }
 
     pub fn log_health(&mut self, route_id: u32, ring: &Ring) {
-        let report = self.health.report();
-        let glitches = [
-            report.underruns,
-            report.reprimes,
-            report.resyncs,
-            ring.overflows(),
-        ];
-        let to_ms = |frames: f64| frames * 1000.0 / self.health.source_rate;
-        tracing::debug!(
+        self.health.log(
             route_id,
-            fill_frames = report.fill_avg_frames,
-            fill_ms = to_ms(report.fill_avg_frames as f64),
-            target_ms = to_ms(report.target_frames as f64),
-            delivery_ms = to_ms(report.delivery_frames),
-            correction_ppm = report.correction_ppm,
-            late_ms = self
-                .scheduled
-                .then(|| to_ms(f64::from(report.lateness_frames))),
-            underruns = glitches[0],
-            reprimes = glitches[1],
-            resyncs = glitches[2],
-            overflows = glitches[3],
-            "route playout health"
+            ring,
+            self.scheduled,
+            &mut self.reported_glitches,
         );
-        if glitches != self.reported_glitches {
-            tracing::info!(
-                route_id,
-                underruns = glitches[0] - self.reported_glitches[0],
-                reprimes = glitches[1] - self.reported_glitches[1],
-                resyncs = glitches[2] - self.reported_glitches[2],
-                overflows = glitches[3] - self.reported_glitches[3],
-                glitch_delivery_ms = to_ms(report.glitch_span_frames as f64),
-                glitch_target_ms = to_ms(report.glitch_target_frames as f64),
-                "route playout glitched since the last report"
-            );
-            self.reported_glitches = glitches;
-        }
     }
 }
 
