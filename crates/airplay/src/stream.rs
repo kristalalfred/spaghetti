@@ -34,6 +34,7 @@ const WAKE_RETRY: Duration = Duration::from_millis(500);
 /// Claude: a session playing to one receiver. It connects in the background:
 /// it waits a bounded time for the browser to find the receiver, then for any
 /// earlier stream through the same browser to that receiver to finish, then
+/// picks its protocol from the receiver as browsing knows it by then and
 /// connects, retrying for a bounded time while the receiver wakes from
 /// standby, then calls `render` for each packet `LATENCY` before the packet's
 /// play time.
@@ -317,24 +318,30 @@ fn connect<'a, R>(
         Some(protocol) => found.service(protocol).map(|_| protocol),
         None => found.protocol(),
     };
+    let settled = |found: &Receiver| match choose(found) {
+        Ok(Protocol::AirPlay1) => settings.protocol.is_some() || !found.awaits_airplay2(),
+        chosen => chosen.is_ok(),
+    };
     let found = browser
-        .find(
-            receiver,
-            settings.lookup_window,
-            |found| choose(found).is_ok(),
-            &abort,
-        )?
+        .find(receiver, settings.lookup_window, settled, &abort)?
         .ok_or_else(|| {
             format!(
                 "no AirPlay receiver {receiver} was found within {:?}",
                 settings.lookup_window
             )
         })?;
-    let name = found.name.clone();
-    let protocol = choose(&found).map_err(|reason| format!("{name}: {reason}"))?;
+    let protocol = choose(&found).map_err(|reason| format!("{}: {reason}", found.name))?;
     if !turn.wait(&abort) {
         return Err("stopped".into());
     }
+    let (found, protocol) = match browser.receiver(receiver) {
+        Some(now) => match choose(&now) {
+            Ok(protocol) => (now, protocol),
+            Err(_) => (found, protocol),
+        },
+        None => (found, protocol),
+    };
+    let name = found.name.clone();
     let connector = Connector {
         browser,
         receiver,

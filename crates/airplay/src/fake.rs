@@ -428,6 +428,11 @@ impl Fake {
         self.state.events.lock().unwrap().answers.clone()
     }
 
+    /// Claude: how many TCP connections the fake has accepted.
+    pub(crate) fn accepted(&self) -> usize {
+        self.state.connections.lock().unwrap().len()
+    }
+
     pub(crate) fn close_connections(&self) {
         for connection in self.state.connections.lock().unwrap().iter() {
             let _ = connection.shutdown(Shutdown::Both);
