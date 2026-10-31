@@ -8,3 +8,6 @@ license.workspace = true
 tracing = "0.1"
 libc = "0.2"
 getrandom = "0.4"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
