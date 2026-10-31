@@ -87,6 +87,18 @@ impl Receiver {
         }
     }
 
+    /// Claude: whether a stream that picks its protocol should give browsing
+    /// time to resolve this receiver's `_airplay` service: its `_raop` record
+    /// says, by the same feature bits, that it takes AirPlay 2, and a receiver
+    /// advertising both may resolve either first.
+    pub(crate) fn awaits_airplay2(&self) -> bool {
+        self.airplay.is_none()
+            && self
+                .raop
+                .as_ref()
+                .is_some_and(|raop| raop.txt.features("ft") & AIRPLAY_2 == AIRPLAY_2)
+    }
+
     fn access(&self) -> Result<(), String> {
         let raop = self.raop.as_ref().map(|s| &s.txt);
         let flags = raop.map_or(0, |txt| txt.flags("sf"))
@@ -142,7 +154,7 @@ impl Receiver {
             return Err("it does not offer AirPlay 2".into());
         };
         let txt = &airplay.txt;
-        let features = txt.features();
+        let features = txt.features("features");
         let advertised = || txt.get("features").unwrap_or("");
         if features & AUDIO == 0 {
             return Err(format!(
@@ -186,6 +198,7 @@ impl std::fmt::Display for Protocol {
 
 const AUDIO: u64 = 1 << 9;
 const CORE_UTILS_PAIRING_AND_ENCRYPTION: u64 = 1 << 48;
+const AIRPLAY_2: u64 = AUDIO | CORE_UTILS_PAIRING_AND_ENCRYPTION;
 const PIN_REQUIRED: u64 = 0x8;
 const PASSWORD_REQUIRED: u64 = 0x80;
 const PAIRING_REQUIRED: u64 = 0x200;
@@ -240,10 +253,10 @@ impl Txt {
             .fold(0, |acc, v| acc | v)
     }
 
-    /// Claude: the `features` bit field, written as its lower 32 bits and,
-    /// after a comma, its upper 32.
-    fn features(&self) -> u64 {
-        let mut halves = self.list("features").map(|v| {
+    /// Claude: a feature bit field, `features` in `_airplay` and `ft` in
+    /// `_raop`, written as its lower 32 bits and, after a comma, its upper 32.
+    fn features(&self, key: &str) -> u64 {
+        let mut halves = self.list(key).map(|v| {
             u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap_or(0) & 0xFFFF_FFFF
         });
         let low = halves.next().unwrap_or(0);
@@ -369,11 +382,22 @@ pub(crate) mod tests {
     #[test]
     fn features_read_their_lower_half_then_their_upper_half() {
         assert_eq!(
-            txt("features=0x445F8A00,0x1C340").features(),
+            txt("features=0x445F8A00,0x1C340").features("features"),
             0x0001_C340_445F_8A00
         );
-        assert_eq!(txt("features=0x5A7FFFF7").features(), 0x5A7F_FFF7);
-        assert_eq!(txt("x=1").features(), 0);
+        assert_eq!(txt("features=0x5A7FFFF7").features("features"), 0x5A7F_FFF7);
+        assert_eq!(txt("x=1").features("features"), 0);
+        assert_eq!(txt(MOVE_2_RAOP).features("ft"), 0x0801_C340_445F_8A00);
+    }
+
+    #[test]
+    fn only_a_receiver_whose_raop_record_offers_airplay_2_awaits_its_airplay_service() {
+        assert!(receiver(Some(MOVE_2_RAOP), None).awaits_airplay2());
+        assert!(!receiver(Some(MOVE_2_RAOP), Some(MOVE_2_AIRPLAY)).awaits_airplay2());
+        assert!(!receiver(Some(SHAIRPORT_SYNC_RAOP), None).awaits_airplay2());
+        assert!(!receiver(None, Some(CITATION_AIRPLAY)).awaits_airplay2());
+        let without_transient_pairing = MOVE_2_RAOP.replace("0x801C340", "0x800C340");
+        assert!(!receiver(Some(&without_transient_pairing), None).awaits_airplay2());
     }
 
     #[test]

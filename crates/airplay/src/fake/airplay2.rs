@@ -2,7 +2,7 @@ use super::tests::{LATENCY, PROMPT, Renders, call_of, check_sync_mapping, settin
 use super::*;
 use crate::clock::PACKET_DURATION;
 use crate::packet::AIRPLAY2_PACKET_LEN;
-use crate::receiver::tests::SHAIRPORT_SYNC_RAOP;
+use crate::receiver::tests::{MOVE_2_RAOP, SHAIRPORT_SYNC_RAOP};
 use crate::stream::Settings;
 use crate::{Protocol, Status, Stream};
 use std::io::Write;
@@ -644,6 +644,108 @@ fn a_fallback_reaches_an_airplay_1_service_found_after_the_stream_started() {
         stream.status()
     );
     assert!(fake.methods().contains(&"ANNOUNCE".to_owned()));
+}
+
+#[test]
+fn an_automatic_stream_takes_airplay_2_whichever_service_resolves_first() {
+    for raop_first in [true, false] {
+        let raop = Fake::start(Behavior::default());
+        let airplay = Fake::start(Behavior::default());
+        let browser = Browser::offline();
+        let advertise = |raop_next: bool| {
+            if raop_next {
+                raop.advertise(&browser, MOVE_2_RAOP);
+            } else {
+                airplay.advertise_airplay(&browser, AIRPLAY_2_RECORD);
+            }
+        };
+        advertise(raop_first);
+        let stream = Stream::start_with(
+            &browser,
+            raop.id(),
+            Ok(automatic()),
+            Renders::default().renderer(None),
+        );
+        thread::sleep(Duration::from_millis(100));
+        advertise(!raop_first);
+        assert!(
+            wait_until(HANDSHAKE, || streaming(&stream)),
+            "{:?} with _raop first: {raop_first}",
+            stream.status()
+        );
+        assert_eq!(raop.accepted(), 0, "_raop first: {raop_first}");
+        assert_eq!(
+            uris(&airplay)[..2],
+            ["GET /info", "POST /pair-setup"],
+            "_raop first: {raop_first}"
+        );
+    }
+}
+
+#[test]
+fn a_receiver_whose_raop_record_offers_airplay_2_waits_for_it_within_the_lookup_window() {
+    let lookup = automatic().lookup_window;
+    let raop = Fake::start(Behavior::default());
+    let browser = raop.browser(MOVE_2_RAOP);
+    let started = Instant::now();
+    let stream = Stream::start_with(
+        &browser,
+        raop.id(),
+        Ok(automatic()),
+        Renders::default().renderer(None),
+    );
+    assert!(wait_until(HANDSHAKE, || streaming(&stream)));
+    let (first_at, _, request) = raop.requests()[0].clone();
+    assert_eq!(request.method, "OPTIONS");
+    let waited = first_at - started;
+    assert!(
+        waited >= lookup && waited < lookup + PROMPT,
+        "AirPlay 1 began after {waited:?}"
+    );
+
+    let classic = Fake::start(Behavior::default());
+    let browser = classic.browser(SHAIRPORT_SYNC_RAOP);
+    let started = Instant::now();
+    let stream = Stream::start_with(
+        &browser,
+        classic.id(),
+        Ok(automatic()),
+        Renders::default().renderer(None),
+    );
+    assert!(wait_until(HANDSHAKE, || streaming(&stream)));
+    let waited = classic.requests()[0].0 - started;
+    assert!(waited < PROMPT, "AirPlay 1 began after {waited:?}");
+}
+
+#[test]
+fn an_airplay_service_resolved_while_a_stream_waits_its_turn_is_taken() {
+    let raop = Fake::start(Behavior::default());
+    let airplay = Fake::start(Behavior::default());
+    let browser = raop.browser(MOVE_2_RAOP);
+    let first = Stream::start_with(
+        &browser,
+        raop.id(),
+        Ok(automatic()),
+        Renders::default().renderer(None),
+    );
+    assert!(wait_until(HANDSHAKE, || streaming(&first)));
+    let next = Stream::start_with(
+        &browser,
+        raop.id(),
+        Ok(automatic()),
+        Renders::default().renderer(None),
+    );
+    thread::sleep(automatic().lookup_window + Duration::from_millis(200));
+    assert_eq!(next.status(), Status::Connecting);
+    airplay.advertise_airplay(&browser, AIRPLAY_2_RECORD);
+    first.finish().wait();
+    assert!(
+        wait_until(HANDSHAKE, || streaming(&next)),
+        "{:?}",
+        next.status()
+    );
+    assert_eq!(raop.accepted(), 1);
+    assert_eq!(uris(&airplay)[0], "GET /info");
 }
 
 #[test]

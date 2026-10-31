@@ -254,19 +254,32 @@ impl Fake {
     }
 
     pub(crate) fn advertise(&self, browser: &Browser, record: &str) {
-        self.advertise_as(browser, Kind::Raop, INSTANCE, record);
+        self.advertise_on(browser, 1, record);
+    }
+
+    /// Claude: advertises the AirPlay 1 service as seen on `interface`, so
+    /// that fakes on several interfaces are one receiver with an address each.
+    pub(crate) fn advertise_on(&self, browser: &Browser, interface: u32, record: &str) {
+        self.advertise_as(browser, Kind::Raop, INSTANCE, interface, record);
     }
 
     /// Claude: advertises only the AirPlay 2 service, with `record`.
     pub(crate) fn advertise_airplay(&self, browser: &Browser, record: &str) {
-        self.advertise_as(browser, Kind::AirPlay, "fake", record);
+        self.advertise_as(browser, Kind::AirPlay, "fake", 1, record);
     }
 
-    fn advertise_as(&self, browser: &Browser, kind: Kind, name: &str, record: &str) {
+    fn advertise_as(
+        &self,
+        browser: &Browser,
+        kind: Kind,
+        name: &str,
+        interface: u32,
+        record: &str,
+    ) {
         let key = InstanceKey {
             kind,
             name: name.into(),
-            interface: 1,
+            interface,
         };
         browser.shared().apply([
             Event::Resolved {
@@ -426,6 +439,11 @@ impl Fake {
 
     pub(crate) fn event_answers(&self) -> Vec<Response> {
         self.state.events.lock().unwrap().answers.clone()
+    }
+
+    /// Claude: how many TCP connections the fake has accepted.
+    pub(crate) fn accepted(&self) -> usize {
+        self.state.connections.lock().unwrap().len()
     }
 
     pub(crate) fn close_connections(&self) {
@@ -1010,8 +1028,10 @@ pub(crate) mod tests {
     use super::*;
     use crate::clock::PACKET_DURATION;
     use crate::receiver::tests::{MOVE_2_RAOP, SHAIRPORT_SYNC_RAOP};
+    use crate::rtsp::{Connection, OpenError};
     use crate::stream::Settings;
     use crate::{Protocol, Render, Status, Stream};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
 
     pub(crate) const LATENCY: Duration = Duration::from_millis(300);
@@ -2077,7 +2097,7 @@ pub(crate) mod tests {
             connect_timeout: Duration::from_millis(100),
             ..settings()
         };
-        let (window, connect_timeout) = (asleep.wake_window, asleep.connect_timeout);
+        let window = asleep.wake_window;
         let stream = Stream::start_with(
             &browser,
             first.id(),
@@ -2103,7 +2123,7 @@ pub(crate) mod tests {
             "{reason}"
         );
         assert!(
-            waited >= window && waited < window + connect_timeout + PROMPT,
+            waited >= window && waited < window + PROMPT,
             "unreachable after {waited:?}"
         );
 
@@ -2138,6 +2158,103 @@ pub(crate) mod tests {
             fake_connections(&refusing) == [0],
             "a refused handshake was retried"
         );
+    }
+
+    #[test]
+    fn the_wake_window_bounds_every_attempt_across_addresses() {
+        let asleep: Vec<Fake> = (0..3).map(|_| Fake::asleep(Behavior::default())).collect();
+        let browser = Browser::offline();
+        for (interface, fake) in (1..).zip(&asleep) {
+            fake.advertise_on(&browser, interface, SHAIRPORT_SYNC_RAOP);
+        }
+        let several = Settings {
+            connect_timeout: Duration::from_millis(400),
+            wake_window: Duration::from_millis(500),
+            ..settings()
+        };
+        let window = several.wake_window;
+        let started = Instant::now();
+        let stream = Stream::start_with(
+            &browser,
+            asleep[0].id(),
+            Ok(several),
+            Renders::default().renderer(None),
+        );
+        assert!(wait_until(Duration::from_secs(3), || stream.status()
+            != Status::Connecting));
+        let waited = started.elapsed();
+        let Status::Unreachable(reason) = stream.status() else {
+            panic!("{:?}", stream.status())
+        };
+        assert!(waited < window + PROMPT, "unreachable after {waited:?}");
+        assert!(
+            reason.starts_with(&format!(
+                "fake: could not connect to {} (connection timed out)",
+                asleep[0].address
+            )),
+            "{reason}"
+        );
+
+        let (stays, wakes) = (
+            Fake::asleep(Behavior::default()),
+            Fake::asleep(Behavior::default()),
+        );
+        let browser = Browser::offline();
+        stays.advertise_on(&browser, 1, SHAIRPORT_SYNC_RAOP);
+        wakes.advertise_on(&browser, 2, SHAIRPORT_SYNC_RAOP);
+        let short = Settings {
+            connect_timeout: Duration::from_millis(400),
+            wake_window: Duration::from_millis(300),
+            ..settings()
+        };
+        let window = short.wake_window;
+        let started = Instant::now();
+        let stream = Stream::start_with(
+            &browser,
+            stays.id(),
+            Ok(short),
+            Renders::default().renderer(None),
+        );
+        thread::sleep((started + window + Duration::from_millis(50)) - Instant::now());
+        wakes.wake();
+        thread::sleep(Duration::from_millis(600));
+        assert!(
+            matches!(stream.status(), Status::Unreachable(_)),
+            "{:?}",
+            stream.status()
+        );
+        assert_eq!(
+            wakes.accepted(),
+            0,
+            "an attempt began after the wake window"
+        );
+    }
+
+    #[test]
+    fn a_connection_cancelled_during_one_address_tries_no_further_address() {
+        let refused = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .and_then(|listener| listener.local_addr())
+            .unwrap();
+        let fake = Fake::start(Behavior::default());
+        let checks = AtomicUsize::new(0);
+        let cancelled_during_the_first_attempt = || checks.fetch_add(1, Ordering::SeqCst) > 0;
+        let opened = Connection::open(
+            &[refused, fake.address],
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(1),
+            vec![],
+            &cancelled_during_the_first_attempt,
+        );
+        assert!(
+            matches!(opened, Err(OpenError::Stopped)),
+            "{:?}",
+            opened
+                .as_ref()
+                .map(Connection::peer_addr)
+                .map_err(ToString::to_string)
+        );
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(fake.accepted(), 0, "a cancelled attempt connected");
     }
 
     fn fake_connections(fake: &Fake) -> Vec<usize> {
