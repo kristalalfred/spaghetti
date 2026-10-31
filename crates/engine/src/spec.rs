@@ -26,10 +26,12 @@ pub enum Destination {
     Device {
         uid: String,
         delay_ms: Option<u32>,
+        latency_offset_ms: Option<i32>,
     },
     AirPlay {
         receiver: String,
         delay_ms: u32,
+        latency_offset_ms: Option<i32>,
     },
     /// Claude: AAC in MPEG-TS sent over SRT.
     Srt(SrtSocket),
@@ -99,10 +101,24 @@ impl From<wire::SourceSpec> for SourceSpec {
 impl From<wire::Destination> for Destination {
     fn from(destination: wire::Destination) -> Self {
         match destination {
-            wire::Destination::Device { uid, delay_ms } => Self::Device { uid, delay_ms },
-            wire::Destination::AirPlay { receiver, delay_ms } => {
-                Self::AirPlay { receiver, delay_ms }
-            }
+            wire::Destination::Device {
+                uid,
+                delay_ms,
+                latency_offset_ms,
+            } => Self::Device {
+                uid,
+                delay_ms,
+                latency_offset_ms,
+            },
+            wire::Destination::AirPlay {
+                receiver,
+                delay_ms,
+                latency_offset_ms,
+            } => Self::AirPlay {
+                receiver,
+                delay_ms,
+                latency_offset_ms,
+            },
             wire::Destination::Srt(socket) => Self::Srt(socket),
             wire::Destination::WebRtc(peer) => Self::WebRtc(peer),
         }
@@ -144,8 +160,24 @@ impl TryFrom<Destination> for wire::Destination {
 
     fn try_from(destination: Destination) -> Result<Self, InProcess> {
         match destination {
-            Destination::Device { uid, delay_ms } => Ok(Self::Device { uid, delay_ms }),
-            Destination::AirPlay { receiver, delay_ms } => Ok(Self::AirPlay { receiver, delay_ms }),
+            Destination::Device {
+                uid,
+                delay_ms,
+                latency_offset_ms,
+            } => Ok(Self::Device {
+                uid,
+                delay_ms,
+                latency_offset_ms,
+            }),
+            Destination::AirPlay {
+                receiver,
+                delay_ms,
+                latency_offset_ms,
+            } => Ok(Self::AirPlay {
+                receiver,
+                delay_ms,
+                latency_offset_ms,
+            }),
             Destination::Srt(socket) => Ok(Self::Srt(socket)),
             Destination::WebRtc(peer) => Ok(Self::WebRtc(peer)),
             Destination::Program { output, .. } => {
@@ -225,14 +257,17 @@ mod tests {
             wire::Destination::Device {
                 uid: "d".into(),
                 delay_ms: Some(300),
+                latency_offset_ms: None,
             },
             wire::Destination::Device {
                 uid: "d".into(),
                 delay_ms: None,
+                latency_offset_ms: None,
             },
             wire::Destination::AirPlay {
                 receiver: "AA:BB:CC:DD:EE:FF".into(),
                 delay_ms: 2500,
+                latency_offset_ms: None,
             },
             wire::Destination::Srt(srt()),
             wire::Destination::WebRtc(peer),
@@ -241,6 +276,18 @@ mod tests {
             let back: wire::Destination =
                 Destination::from(destination.clone()).try_into().unwrap();
             assert_eq!(back, destination);
+        }
+    }
+
+    #[test]
+    fn latency_offsets_survive_the_engine_wire_boundary() {
+        for encoded in [
+            r#"{"Device":{"uid":"Speakers","delay_ms":2500,"latency_offset_ms":83}}"#,
+            r#"{"AirPlay":{"receiver":"C4:38:75:04:5E:80","delay_ms":2500,"latency_offset_ms":-47}}"#,
+        ] {
+            let wire: wire::Destination = serde_json::from_str(encoded).unwrap();
+            let back: wire::Destination = Destination::from(wire).try_into().unwrap();
+            assert_eq!(serde_json::to_string(&back).unwrap(), encoded);
         }
     }
 

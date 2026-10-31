@@ -33,6 +33,7 @@ impl DeviceOutput {
         ring: Arc<Ring>,
         volume: Arc<AtomicU32>,
         delay: Option<f64>,
+        latency_offset_ms: Option<i32>,
     ) -> Result<Self, String> {
         let mut unit = unsafe { OutputUnit::new(device) }?;
 
@@ -58,7 +59,8 @@ impl DeviceOutput {
 
         let schedule = delay.map(|delay| Schedule {
             delay,
-            latency: f64::from(audio::output_latency_frames(device)) / device_format.mSampleRate,
+            latency: f64::from(audio::output_latency_frames(device)) / device_format.mSampleRate
+                + f64::from(latency_offset_ms.unwrap_or(0)) / 1000.0,
         });
         if let Some(schedule) = schedule {
             tracing::info!(

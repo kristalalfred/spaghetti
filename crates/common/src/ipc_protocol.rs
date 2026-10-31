@@ -88,10 +88,14 @@ pub enum Destination {
         uid: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         delay_ms: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        latency_offset_ms: Option<i32>,
     },
     AirPlay {
         receiver: String,
         delay_ms: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        latency_offset_ms: Option<i32>,
     },
     /// AAC in MPEG-TS sent over SRT.
     Srt(SrtSocket),
@@ -377,6 +381,7 @@ mod tests {
             &Destination::Device {
                 uid: "Speakers".into(),
                 delay_ms: None,
+                latency_offset_ms: None,
             },
             r#"{"Device":{"uid":"Speakers"}}"#,
         );
@@ -384,9 +389,23 @@ mod tests {
             &Destination::Device {
                 uid: "Speakers".into(),
                 delay_ms: Some(300),
+                latency_offset_ms: None,
             },
             r#"{"Device":{"uid":"Speakers","delay_ms":300}}"#,
         );
+    }
+
+    #[test]
+    fn latency_offsets_have_a_signed_optional_wire_shape() {
+        for encoded in [
+            r#"{"Device":{"uid":"Speakers","delay_ms":2500,"latency_offset_ms":-47}}"#,
+            r#"{"AirPlay":{"receiver":"C4:38:75:04:5E:80","delay_ms":2500,"latency_offset_ms":83}}"#,
+            r#"{"Device":{"uid":"Speakers","delay_ms":2500,"latency_offset_ms":0}}"#,
+        ] {
+            let destination: Destination = serde_json::from_str(encoded).unwrap();
+            golden(&destination, encoded);
+        }
+        assert_eq!(IPC_VERSION, 5);
     }
 
     #[test]
@@ -398,6 +417,7 @@ mod tests {
                 destination: Destination::AirPlay {
                     receiver: "C4:38:75:04:5E:80".into(),
                     delay_ms: 2500,
+                    latency_offset_ms: None,
                 },
                 volume: 1.0,
             },

@@ -332,8 +332,12 @@ impl Playout {
     }
 
     pub fn minimum_delay(&self, render_ahead: f64) -> f64 {
+        let latency_frames = self.schedule.as_ref().map_or(0.0, |schedule| {
+            schedule.latency * self.source_frames_per_tick
+        });
         render_ahead
-            + (self.delivery.frames()
+            + (latency_frames
+                + self.delivery.frames()
                 + self.resampler.input_frames_max() as f64
                 + self.margin_frames as f64)
                 / self.health.source_rate
@@ -1547,16 +1551,47 @@ mod tests {
             let playout = Playout::new(&timing, 44100.0, TICKS_PER_SECOND, None).unwrap();
             let limit = playout.max_held_seconds();
             assert!(limit >= 2.5, "{rate} Hz: only {limit} s held");
-            let schedule = Schedule {
-                delay: limit + 1.0 / rate,
-                latency: 0.0,
-            };
-            assert!(Playout::new(&timing, 44100.0, TICKS_PER_SECOND, Some(schedule)).is_err());
+            for latency in [-0.047, 0.0, 0.083] {
+                let schedule = Schedule {
+                    delay: limit + latency + 1.0 / rate,
+                    latency,
+                };
+                assert!(Playout::new(&timing, 44100.0, TICKS_PER_SECOND, Some(schedule)).is_err());
+                let schedule = Schedule {
+                    delay: limit + latency - 1.0 / rate,
+                    latency,
+                };
+                assert!(Playout::new(&timing, 44100.0, TICKS_PER_SECOND, Some(schedule)).is_ok());
+            }
             let schedule = Schedule {
                 delay: 2.5,
                 latency: 0.0,
             };
             assert!(Playout::new(&timing, 44100.0, TICKS_PER_SECOND, Some(schedule)).is_ok());
+        }
+    }
+
+    #[test]
+    fn latency_offsets_shift_the_minimum_delay_from_the_schedule() {
+        let timing = SourceTiming {
+            sample_rate: 48000.0,
+            delivery: Arc::new(DeliverySpan::new(960.0)),
+        };
+        let make = |latency| {
+            Playout::new(
+                &timing,
+                44100.0,
+                TICKS_PER_SECOND,
+                Some(Schedule {
+                    delay: 2.5,
+                    latency,
+                }),
+            )
+            .unwrap()
+        };
+        let minimum = make(0.0).minimum_delay(2.0);
+        for offset in [-0.047, 0.083] {
+            assert!((make(offset).minimum_delay(2.0) - minimum - offset).abs() < 1e-9);
         }
     }
 
@@ -1585,10 +1620,17 @@ mod tests {
     #[test]
     fn future_output_and_local_output_play_at_the_same_capture_plus_delay() {
         for rate in [48000.0, 96000.0] {
-            for ahead in [0.0, 2.0] {
+            for (ahead, latency) in [
+                (0.0, -0.047),
+                (0.0, 0.0),
+                (0.0, 0.083),
+                (2.0, -0.047),
+                (2.0, 0.0),
+                (2.0, 0.083),
+            ] {
                 let schedule = Schedule {
                     delay: 2.5,
-                    latency: 0.0,
+                    latency,
                 };
                 let mut sim = Sim::scheduled(
                     rate,
@@ -1600,15 +1642,20 @@ mod tests {
                 );
                 sim.render_ahead = ahead;
                 sim.run(10.0);
-                assert_eq!(sim.glitches(), [0; 3], "{rate} Hz, {ahead} s ahead");
+                assert_eq!(
+                    sim.glitches(),
+                    [0; 3],
+                    "{rate} Hz, {ahead} s ahead, {latency} s latency"
+                );
                 let error = sim.schedule_error(schedule, 2.0);
                 assert!(
                     error.abs() < 50e-6,
-                    "{rate} Hz, {ahead} s ahead: {error} s off"
+                    "{rate} Hz, {ahead} s ahead, {latency} s latency: {error} s off"
                 );
                 let first = sim.first_sound();
                 let output = sim.render_times[first / RENDER_FRAMES]
-                    + (first % RENDER_FRAMES) as f64 / 44100.0;
+                    + (first % RENDER_FRAMES) as f64 / 44100.0
+                    + latency;
                 assert!(
                     (output - schedule.delay).abs() < 0.005,
                     "first sound at {output}"

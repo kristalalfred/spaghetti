@@ -131,18 +131,33 @@ fn destination_label(destination: &Destination) -> String {
     match destination {
         Destination::Device {
             uid,
-            delay_ms: None,
-        } => uid.clone(),
-        Destination::Device {
-            uid,
-            delay_ms: Some(delay),
-        } => format!("{uid} +{delay} ms"),
-        Destination::AirPlay { receiver, delay_ms } => {
-            format!("airplay://{receiver} +{delay_ms} ms")
-        }
+            delay_ms,
+            latency_offset_ms,
+        } => scheduled_label(uid, *delay_ms, *latency_offset_ms),
+        Destination::AirPlay {
+            receiver,
+            delay_ms,
+            latency_offset_ms,
+        } => scheduled_label(
+            &format!("airplay://{receiver}"),
+            Some(*delay_ms),
+            *latency_offset_ms,
+        ),
         Destination::Srt(socket) => srt_label(socket),
         Destination::WebRtc(peer) => format!("webrtc {} ({})", peer.link, role_label(peer.role)),
     }
+}
+
+fn scheduled_label(target: &str, delay_ms: Option<u32>, latency_offset_ms: Option<i32>) -> String {
+    use std::fmt::Write;
+    let mut label = target.to_string();
+    if let Some(delay) = delay_ms {
+        write!(label, " +{delay} ms").unwrap();
+    }
+    if let Some(offset) = latency_offset_ms {
+        write!(label, " (latency offset {offset:+} ms)").unwrap();
+    }
+    label
 }
 
 pub fn print_routes(routes: &[RouteInfo]) {
@@ -275,13 +290,23 @@ impl<'a> From<&'a RouteInfo> for RouteJson<'a> {
             route_id: route.route_id,
             source_id: route.source_id,
             destination: match &route.destination {
-                Destination::Device { uid, delay_ms } => EndpointJson::Device {
+                Destination::Device {
+                    uid,
+                    delay_ms,
+                    latency_offset_ms,
+                } => EndpointJson::Device {
                     uid,
                     delay_ms: *delay_ms,
+                    latency_offset_ms: *latency_offset_ms,
                 },
-                Destination::AirPlay { receiver, delay_ms } => EndpointJson::AirPlay {
+                Destination::AirPlay {
+                    receiver,
+                    delay_ms,
+                    latency_offset_ms,
+                } => EndpointJson::AirPlay {
                     receiver,
                     delay_ms: *delay_ms,
+                    latency_offset_ms: *latency_offset_ms,
                 },
                 Destination::Srt(socket) => EndpointJson::srt(socket),
                 Destination::WebRtc(peer) => EndpointJson::webrtc(peer),
@@ -303,11 +328,15 @@ enum EndpointJson<'a> {
         uid: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
         delay_ms: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        latency_offset_ms: Option<i32>,
     },
     #[serde(rename = "airplay")]
     AirPlay {
         receiver: &'a str,
         delay_ms: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        latency_offset_ms: Option<i32>,
     },
     Srt {
         url: String,
@@ -479,6 +508,7 @@ mod tests {
             route_json(Destination::Device {
                 uid: "SpaghettiDevice_UID".into(),
                 delay_ms: None,
+                latency_offset_ms: None
             }),
             format!(
                 r#"{{"route_id":5,"source_id":3,"destination":{{"kind":"device","uid":"SpaghettiDevice_UID"}},"volume":0.8,"status":{FLOWING}}}"#
@@ -511,6 +541,7 @@ mod tests {
         let destination = Destination::AirPlay {
             receiver: "C4:38:75:04:5E:80".into(),
             delay_ms: 2500,
+            latency_offset_ms: None,
         };
         assert_eq!(
             destination_label(&destination),
@@ -522,6 +553,29 @@ mod tests {
                 r#"{{"route_id":5,"source_id":3,"destination":{{"kind":"airplay","receiver":"C4:38:75:04:5E:80","delay_ms":2500}},"volume":0.8,"status":{FLOWING}}}"#
             )
         );
+    }
+
+    #[test]
+    fn latency_offsets_are_visible_in_route_text_and_json() {
+        for (kind, endpoint, target) in [
+            ("Device", "uid", "Speakers"),
+            ("AirPlay", "receiver", "C4:38:75:04:5E:80"),
+        ] {
+            for offset in [-47, 83, 0] {
+                let destination: Destination = serde_json::from_value(serde_json::json!({
+                    kind: { endpoint: target, "delay_ms": 2500, "latency_offset_ms": offset }
+                }))
+                .unwrap();
+                let text = destination_label(&destination);
+                assert!(
+                    text.contains(&format!("latency offset {offset:+} ms")),
+                    "{text}"
+                );
+                let json: serde_json::Value =
+                    serde_json::from_str(&route_json(destination)).unwrap();
+                assert_eq!(json["destination"]["latency_offset_ms"], offset);
+            }
+        }
     }
 
     #[test]
