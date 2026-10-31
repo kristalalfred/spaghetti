@@ -11,8 +11,8 @@ use crate::playout::{Playout, PlayoutHealth, Schedule};
 use crate::ring::{CHANNELS, Ring};
 use crate::sinks::SourceTiming;
 
-pub struct AirPlayOutput<S = airplay::Stream> {
-    stream: S,
+pub struct AirPlayOutput {
+    stream: airplay::Stream,
     playout_delay: Duration,
     receiver: String,
     health: Arc<PlayoutHealth>,
@@ -55,20 +55,47 @@ impl AirPlayOutput {
         ring: Arc<Ring>,
         volume: Arc<AtomicU32>,
     ) -> Self {
+        let playout_delay = finish_delay(&playout);
+        let health = playout.health();
+        let meter = Arc::new(FlowMeter::new());
+        let cycles = Arc::new(Cycles::new());
+        let mut renderer = Renderer {
+            ring,
+            playout,
+            fader: Fader::new(
+                f32::from_bits(volume.load(Ordering::Relaxed)),
+                f64::from(airplay::SAMPLE_RATE),
+            ),
+            volume,
+            meter: Arc::clone(&meter),
+            cycles: Arc::clone(&cycles),
+        };
+        let frequency = host_time::ticks_per_second();
         let receiver_name = receiver.to_string();
-        Self::open_with(receiver_name, playout, ring, volume, |mut renderer| {
-            let frequency = host_time::ticks_per_second();
-            airplay::Stream::start(browser, receiver, move |mut render| {
-                let before = Instant::now();
-                let now = host_time::now();
-                let after = Instant::now();
-                // Codex: these clocks share the host's monotonic time. The midpoint bounds
-                // sampling error by half the bracket, plus one rounded host tick.
-                let anchor = before + after.duration_since(before) / 2;
-                let output = host_ticks(render.play_at, anchor, now, frequency);
-                renderer.render(&mut render.channels, now, output);
-            })
-        })
+        let stream = airplay::Stream::start(browser, receiver, move |mut render| {
+            let before = Instant::now();
+            let now = host_time::now();
+            let after = Instant::now();
+            // Codex: these clocks share the host's monotonic time. The midpoint bounds
+            // sampling error by half the bracket, plus one rounded host tick.
+            let anchor = before + after.duration_since(before) / 2;
+            let output = host_ticks(render.play_at, anchor, now, frequency);
+            renderer.render(&mut render.channels, now, output);
+        });
+        Self {
+            stream,
+            playout_delay,
+            receiver: receiver_name,
+            health,
+            meter,
+            cycles,
+            reported_glitches: [0; 5],
+            reported_state: None,
+        }
+    }
+
+    pub fn finish(self) -> airplay::Finishing {
+        self.stream.finish(self.playout_delay)
     }
 
     pub fn cycles(&self) -> &Cycles {
@@ -117,59 +144,8 @@ impl AirPlayOutput {
     }
 }
 
-pub(crate) trait FinishStream {
-    type Finishing;
-
-    fn finish(self, playout_delay: Duration) -> Self::Finishing;
-}
-
-impl FinishStream for airplay::Stream {
-    type Finishing = airplay::Finishing;
-
-    fn finish(self, playout_delay: Duration) -> Self::Finishing {
-        self.finish(playout_delay)
-    }
-}
-
-impl<S: FinishStream> AirPlayOutput<S> {
-    fn open_with(
-        receiver: String,
-        playout: Playout,
-        ring: Arc<Ring>,
-        volume: Arc<AtomicU32>,
-        start: impl FnOnce(Renderer) -> S,
-    ) -> Self {
-        let playout_delay = Duration::from_secs_f64(playout.output_latency().max(0.0));
-        let health = playout.health();
-        let meter = Arc::new(FlowMeter::new());
-        let cycles = Arc::new(Cycles::new());
-        let renderer = Renderer {
-            ring,
-            playout,
-            fader: Fader::new(
-                f32::from_bits(volume.load(Ordering::Relaxed)),
-                f64::from(airplay::SAMPLE_RATE),
-            ),
-            volume,
-            meter: Arc::clone(&meter),
-            cycles: Arc::clone(&cycles),
-        };
-        let stream = start(renderer);
-        Self {
-            stream,
-            playout_delay,
-            receiver,
-            health,
-            meter,
-            cycles,
-            reported_glitches: [0; 5],
-            reported_state: None,
-        }
-    }
-
-    pub fn finish(self) -> S::Finishing {
-        self.stream.finish(self.playout_delay)
-    }
+fn finish_delay(playout: &Playout) -> Duration {
+    Duration::from_secs_f64(playout.output_latency().max(0.0))
 }
 
 struct Renderer {
@@ -234,29 +210,15 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn finishing_hands_the_positive_schedule_offset_to_the_stream() {
-        struct Probe;
-        impl FinishStream for Probe {
-            type Finishing = Duration;
-
-            fn finish(self, playout_delay: Duration) -> Duration {
-                playout_delay
-            }
-        }
+    fn finish_delay_is_the_positive_schedule_offset() {
         let timing = SourceTiming {
             sample_rate: 44100.0,
             delivery: Arc::new(DeliverySpan::new(352.0)),
         };
         for (offset, expected_ms) in [(None, 0), (Some(-47), 0), (Some(0), 0), (Some(200), 200)] {
-            let output = AirPlayOutput::open_with(
-                "fake".into(),
-                AirPlayOutput::playout(&timing, 2500, offset).unwrap(),
-                Arc::new(Ring::new(timing.sample_rate)),
-                Arc::new(AtomicU32::new(1.0f32.to_bits())),
-                |_| Probe,
-            );
+            let playout = AirPlayOutput::playout(&timing, 2500, offset).unwrap();
             assert_eq!(
-                output.finish(),
+                finish_delay(&playout),
                 Duration::from_millis(expected_ms),
                 "{offset:?}"
             );
