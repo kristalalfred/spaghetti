@@ -56,13 +56,22 @@ pub(crate) enum Pairing {
     WrongProof,
 }
 
+/// Claude: what the session's SETUP says about the event port.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum EventPort {
+    #[default]
+    Listening,
+    Closed,
+    Missing,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Behavior {
     pub(crate) auth_setup_required: bool,
     pub(crate) audio_latency: Option<u32>,
     pub(crate) rtsp: Rtsp,
     pub(crate) pairing: Pairing,
-    pub(crate) events_closed: bool,
+    pub(crate) event_port: EventPort,
 }
 
 #[derive(Debug, Clone)]
@@ -735,10 +744,10 @@ impl Server {
             *self.state.timing_port.lock().unwrap() = Some(number(&setup, "timingPort") as u16);
             let secret = self.secret.expect("the stream paired first");
             let mut reply = Dictionary::new();
-            reply.insert(
-                "eventPort".into(),
-                u64::from(self.listen_for_events(secret)).into(),
-            );
+            if self.behavior.event_port != EventPort::Missing {
+                let port = self.listen_for_events(secret);
+                reply.insert("eventPort".into(), u64::from(port).into());
+            }
             reply.insert("timingPort".into(), u64::from(self.ports.timing).into());
             reply
         };
@@ -755,7 +764,7 @@ impl Server {
     fn listen_for_events(&self, secret: [u8; srp::PROOF_LEN]) -> u16 {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        if self.behavior.events_closed {
+        if self.behavior.event_port == EventPort::Closed {
             return port;
         }
         listener.set_nonblocking(true).unwrap();

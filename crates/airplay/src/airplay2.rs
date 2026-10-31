@@ -75,38 +75,40 @@ pub(crate) fn negotiate(
     ));
     let session_id = random_u32()?;
     let uri = session::uri(connection.local_addr().ip(), session_id);
-    let reply = setup(&mut connection, &uri, session_setup(offer)?, timeout, abort)?;
-    let event_port = port(&reply, "eventPort")?;
-    let mut events_at = connection.peer_addr();
-    events_at.set_port(event_port);
     let events_keys = hap::keys(
         &secret,
         "Events-Salt",
         "Events-Read-Encryption-Key",
         "Events-Write-Encryption-Key",
     );
-    let events = match EventChannel::connect(events_at, &events_keys, timeout, abort) {
-        Ok(events) => Some(events),
-        Err(reason) if abort() => return Err(Failure::Failed(reason)),
-        Err(reason) => {
-            warn!(%reason, "AirPlay 2 receiver's event connection failed; streaming without it");
-            None
-        }
-    };
     let mut audio_key = [0; KEY_LEN];
     getrandom::fill(&mut audio_key).map_err(|e| Failure::Failed(e.to_string()))?;
-    let stream = stream_setup(offer, &audio_key, session_id);
-    match record(&mut connection, &uri, stream, timeout, abort) {
-        Ok((audio, control, stream_id, record)) => Ok(Session {
-            audio: with_port(connection.peer_addr(), audio),
-            control: with_port(connection.peer_addr(), control),
-            audio_latency: session::audio_latency(&record),
+    let peer = connection.peer_addr();
+    let reply = setup(&mut connection, &uri, session_setup(offer)?, timeout, abort)?;
+    let opened = port(&reply, "eventPort").and_then(|event_port| {
+        let stream = stream_setup(offer, &audio_key, session_id);
+        let events_at = with_port(peer, event_port);
+        open_stream(
+            &mut connection,
+            &uri,
+            events_at,
+            &events_keys,
+            stream,
+            timeout,
+            abort,
+        )
+    });
+    match opened {
+        Ok(stream) => Ok(Session {
             connection,
             uri,
+            audio: with_port(peer, stream.audio_port),
+            control: with_port(peer, stream.control_port),
+            audio_latency: session::audio_latency(&stream.record),
             transport: Transport::AirPlay2 {
                 audio_key: Counted::new(&audio_key),
-                _events: events,
-                stream_id,
+                _events: stream.events,
+                stream_id: stream.stream_id,
             },
         }),
         Err(failure) => {
@@ -122,15 +124,34 @@ pub(crate) fn negotiate(
     }
 }
 
-/// Claude: the stream's SETUP and the RECORD after it: the receiver's audio
-/// and control ports, its stream ID if it gave one, and the RECORD answer.
-fn record(
+/// Claude: what a session's stream has once set up and recording.
+struct OpenStream {
+    events: Option<EventChannel>,
+    audio_port: u16,
+    control_port: u16,
+    stream_id: Option<u64>,
+    record: Response,
+}
+
+/// Claude: opens the receiver's event connection, sets the stream up and
+/// records.
+fn open_stream(
     connection: &mut Connection,
     uri: &str,
+    events_at: SocketAddr,
+    events_keys: &hap::Keys,
     stream: Vec<u8>,
     timeout: Duration,
     abort: &dyn Fn() -> bool,
-) -> Result<(u16, u16, Option<u64>, Response), Failure> {
+) -> Result<OpenStream, Failure> {
+    let events = match EventChannel::connect(events_at, events_keys, timeout, abort) {
+        Ok(events) => Some(events),
+        Err(reason) if abort() => return Err(Failure::Failed(reason)),
+        Err(reason) => {
+            warn!(%reason, "AirPlay 2 receiver's event connection failed; streaming without it");
+            None
+        }
+    };
     let reply = setup(connection, uri, stream, timeout, abort)?;
     let stream = reply
         .get("streams")
@@ -138,9 +159,9 @@ fn record(
         .and_then(|streams| streams.first())
         .and_then(Value::as_dictionary)
         .ok_or_else(|| Failure::Failed("its stream SETUP answer has no stream".into()))?;
-    let (audio, control) = (port(stream, "dataPort")?, port(stream, "controlPort")?);
+    let (audio_port, control_port) = (port(stream, "dataPort")?, port(stream, "controlPort")?);
     let stream_id = stream.get("streamID").and_then(Value::as_unsigned_integer);
-    let response = exchange(
+    let record = exchange(
         connection,
         &Request {
             method: "RECORD",
@@ -151,7 +172,13 @@ fn record(
         timeout,
         abort,
     )?;
-    Ok((audio, control, stream_id, response))
+    Ok(OpenStream {
+        events,
+        audio_port,
+        control_port,
+        stream_id,
+        record,
+    })
 }
 
 fn setup(

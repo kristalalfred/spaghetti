@@ -236,7 +236,7 @@ fn the_receivers_event_requests_are_answered_on_their_own_connection() {
 #[test]
 fn a_stream_without_its_event_connection_still_plays() {
     let fake = Fake::start(Behavior {
-        events_closed: true,
+        event_port: EventPort::Closed,
         ..Behavior::default()
     });
     let browser = browser(&fake, false);
@@ -487,6 +487,33 @@ fn a_stream_setup_left_unanswered_tears_down_within_its_bound_and_is_unreachable
     assert!(
         !fake.methods().contains(&"OPTIONS".to_owned()),
         "a receiver that stopped answering was tried again over AirPlay 1"
+    );
+}
+
+#[test]
+fn a_session_setup_answer_without_an_event_port_tears_the_session_down() {
+    let fake = Fake::start(Behavior {
+        event_port: EventPort::Missing,
+        ..Behavior::default()
+    });
+    let browser = browser(&fake, true);
+    let stream = Stream::start_with(
+        &browser,
+        fake.id(),
+        Ok(automatic()),
+        Renders::default().renderer(None),
+    );
+    assert!(wait_until(HANDSHAKE, || stream.status() != Status::Connecting));
+    assert_eq!(
+        stream.status(),
+        Status::Unreachable("fake: its SETUP answer has no eventPort".into())
+    );
+    let methods: Vec<String> = fake.methods();
+    assert_eq!(methods[methods.len() - 2..], ["SETUP", "TEARDOWN"]);
+    assert!(
+        fake.requests()
+            .iter()
+            .all(|(_, connection, _)| *connection == 0)
     );
 }
 
