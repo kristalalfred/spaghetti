@@ -163,9 +163,20 @@ impl Fake {
     }
 
     pub(crate) fn advertise(&self, browser: &Browser, record: &str) {
+        self.advertise_as(browser, Kind::Raop, INSTANCE, record);
+    }
+
+    /// Claude: advertises only the AirPlay 2 service, as a receiver does whose
+    /// `_airplay._tcp` record resolves before its `_raop._tcp` one.
+    pub(crate) fn advertise_airplay(&self, browser: &Browser) {
+        let record = format!("deviceid={ID} model=Fake flags=0x4");
+        self.advertise_as(browser, Kind::AirPlay, "fake", &record);
+    }
+
+    fn advertise_as(&self, browser: &Browser, kind: Kind, name: &str, record: &str) {
         let key = InstanceKey {
-            kind: Kind::Raop,
-            name: INSTANCE.into(),
+            kind,
+            name: name.into(),
             interface: 1,
         };
         browser.shared().apply([
@@ -1026,6 +1037,46 @@ mod tests {
             "{reason}"
         );
         assert!(waited >= settings().lookup_window && waited < settings().lookup_window + PROMPT);
+    }
+
+    #[test]
+    fn a_receiver_waits_for_its_raop_service_within_the_lookup_window() {
+        let fake = Fake::start(Behavior::default());
+        let browser = Browser::offline();
+        fake.advertise_airplay(&browser);
+        let stream = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(settings()),
+            Renders::default().renderer(None),
+        );
+        thread::sleep(Duration::from_millis(100));
+        fake.advertise(&browser, SHAIRPORT_SYNC_RAOP);
+        assert!(
+            wait_until(Duration::from_secs(2), || streaming(&stream)),
+            "{:?}",
+            stream.status()
+        );
+
+        let browser = Browser::offline();
+        fake.advertise_airplay(&browser);
+        let stream = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(settings()),
+            Renders::default().renderer(None),
+        );
+        thread::sleep(settings().lookup_window / 2);
+        assert_eq!(stream.status(), Status::Connecting);
+        assert!(wait_until(Duration::from_secs(1), || stream.status()
+            != Status::Connecting));
+        let Status::Unreachable(reason) = stream.status() else {
+            panic!("{:?}", stream.status())
+        };
+        assert!(
+            reason.starts_with("fake: it offers only AirPlay 2"),
+            "{reason}"
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ use crate::packet::{self, AUDIO_PACKET_LEN, AudioHeader, RETRANSMISSION_LEN, Syn
 use crate::raop::{self, Offer, Session};
 use crate::rtsp::{Connection, ReadError, Request};
 use crate::turns::Turn;
-use crate::{Browser, Counters, FRAMES_PER_PACKET, LATENCY, ReceiverId, Render, Status};
+use crate::{Browser, Counters, FRAMES_PER_PACKET, LATENCY, Receiver, ReceiverId, Render, Status};
 
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const SYNC_INTERVAL: Duration = Duration::from_secs(1);
@@ -230,8 +230,9 @@ fn connect<'a, R>(
     render: R,
 ) -> Result<Streamer<'a, R>, String> {
     let abort = || shared.command() != Command::Play;
+    let supported = |found: &Receiver| found.support().is_ok();
     let found = browser
-        .find(receiver, settings.lookup_window, &abort)?
+        .find(receiver, settings.lookup_window, supported, &abort)?
         .ok_or_else(|| {
             format!(
                 "no AirPlay receiver {receiver} was found within {:?}",
