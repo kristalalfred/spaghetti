@@ -60,9 +60,22 @@ impl Receiver {
     }
 
     /// Claude: the protocol a stream speaks to it unless one is forced, or why
-    /// no stream can play to it.
+    /// no stream can play to it: AirPlay 2 when it pairs transiently and takes
+    /// AirPlay audio, since an AirPlay 2 receiver plays at the stream's
+    /// timeline itself, and AirPlay 1 otherwise.
     pub fn protocol(&self) -> Result<Protocol, String> {
-        self.service(Protocol::AirPlay1).map(|_| Protocol::AirPlay1)
+        let airplay2 = self.service(Protocol::AirPlay2);
+        let airplay1 = self.service(Protocol::AirPlay1);
+        match (airplay2, airplay1) {
+            (Ok(_), _) => Ok(Protocol::AirPlay2),
+            (_, Ok(_)) => Ok(Protocol::AirPlay1),
+            (Err(two), Err(one)) => Err(match (self.airplay.is_some(), self.raop.is_some()) {
+                (true, false) => two,
+                (false, true) => one,
+                _ if two == one => one,
+                _ => format!("{two}, and {one}"),
+            }),
+        }
     }
 
     /// Claude: the service a stream speaking `protocol` connects to, or why it
@@ -97,7 +110,7 @@ impl Receiver {
 
     fn raop_service(&self) -> Result<&Service, String> {
         let Some(raop) = &self.raop else {
-            return Err("it offers only AirPlay 2, and streams speak AirPlay 1 (RAOP)".into());
+            return Err("it does not offer AirPlay 1 (RAOP)".into());
         };
         let txt = &raop.txt;
         if !txt.list("tp").any(|t| t.eq_ignore_ascii_case("UDP")) {
@@ -365,11 +378,56 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_receiver_eligible_for_airplay_2_gets_it_and_any_other_airplay_1() {
+        let protocol = |raop, airplay| receiver(raop, airplay).protocol();
+        assert_eq!(
+            protocol(Some(MOVE_2_RAOP), Some(MOVE_2_AIRPLAY)),
+            Ok(Protocol::AirPlay2)
+        );
+        assert_eq!(
+            protocol(None, Some(CITATION_AIRPLAY)),
+            Ok(Protocol::AirPlay2)
+        );
+        assert_eq!(
+            protocol(Some(SHAIRPORT_SYNC_RAOP), None),
+            Ok(Protocol::AirPlay1)
+        );
+        let without_transient_pairing =
+            "deviceid=C4:30:18:6E:41:2D features=0x445F8A00,0x0 flags=0x4";
+        assert_eq!(
+            protocol(Some(MOVE_2_RAOP), Some(without_transient_pairing)),
+            Ok(Protocol::AirPlay1)
+        );
+        assert!(
+            protocol(
+                None,
+                Some(&CITATION_AIRPLAY.replace("flags=0x4", "flags=0x80"))
+            )
+            .unwrap_err()
+            .contains("password")
+        );
+    }
+
+    #[test]
     fn unsupported_receivers_say_why() {
         let reason = |raop: Option<&str>, airplay: Option<&str>| {
             receiver(raop, airplay).support().unwrap_err()
         };
-        assert!(reason(None, Some(MOVE_2_AIRPLAY)).contains("only AirPlay 2"));
+        assert!(
+            reason(
+                None,
+                Some("deviceid=C4:30:18:6E:41:2D features=0x200 flags=0x4")
+            )
+            .contains("does not pair transiently")
+        );
+        assert_eq!(
+            reason(
+                Some("cn=0,1 et=0 tp=TCP"),
+                Some("deviceid=C4:30:18:6E:41:2D features=0x200 flags=0x4")
+            ),
+            "it does not pair transiently over AirPlay 2 (features=0x200), and it does not take \
+             RAOP audio over UDP (tp=TCP)"
+        );
         assert!(reason(Some("cn=0,1 et=0 tp=TCP"), None).contains("UDP"));
         assert!(reason(Some("cn=0,1 et=1,3 tp=UDP"), None).contains("encrypted"));
         assert!(reason(Some("cn=0,1 tp=UDP"), None).contains("encrypted"));
