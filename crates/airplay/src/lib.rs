@@ -14,7 +14,7 @@ mod turns;
 use std::time::{Duration, Instant};
 
 pub use browse::Browser;
-pub use receiver::{Receiver, ReceiverId};
+pub use receiver::{Protocol, Receiver, ReceiverId};
 pub use stream::{Finishing, Stream};
 
 pub const SAMPLE_RATE: u32 = 44_100;

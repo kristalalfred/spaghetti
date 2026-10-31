@@ -56,10 +56,46 @@ pub struct Receiver {
 impl Receiver {
     /// Claude: whether a stream can play to it, or why not.
     pub fn support(&self) -> Result<(), String> {
-        self.stream_service().map(|_| ())
+        self.protocol().map(|_| ())
     }
 
-    pub(crate) fn stream_service(&self) -> Result<&Service, String> {
+    /// Claude: the protocol a stream speaks to it unless one is forced, or why
+    /// no stream can play to it.
+    pub fn protocol(&self) -> Result<Protocol, String> {
+        self.service(Protocol::AirPlay1).map(|_| Protocol::AirPlay1)
+    }
+
+    /// Claude: the service a stream speaking `protocol` connects to, or why it
+    /// cannot.
+    pub(crate) fn service(&self, protocol: Protocol) -> Result<&Service, String> {
+        self.access()?;
+        match protocol {
+            Protocol::AirPlay1 => self.raop_service(),
+            Protocol::AirPlay2 => self.airplay2_service(),
+        }
+    }
+
+    fn access(&self) -> Result<(), String> {
+        let raop = self.raop.as_ref().map(|s| &s.txt);
+        let flags = raop.map_or(0, |txt| txt.flags("sf"))
+            | self.airplay.as_ref().map_or(0, |s| s.txt.flags("flags"));
+        if matches!(raop.and_then(|txt| txt.get("pw")), Some("true" | "1"))
+            || flags & PASSWORD_REQUIRED != 0
+        {
+            return Err(
+                "it requires a password; turn the password off in its AirPlay settings".into(),
+            );
+        }
+        if flags & (PIN_REQUIRED | PAIRING_REQUIRED) != 0 {
+            return Err(
+                "it requires pairing with a PIN; allow AirPlay without a PIN in its settings"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn raop_service(&self) -> Result<&Service, String> {
         let Some(raop) = &self.raop else {
             return Err("it offers only AirPlay 2, and streams speak AirPlay 1 (RAOP)".into());
         };
@@ -82,22 +118,62 @@ impl Receiver {
                 txt.get("cn").unwrap_or("")
             ));
         }
-        let flags = txt.flags("sf") | self.airplay.as_ref().map_or(0, |s| s.txt.flags("flags"));
-        if matches!(txt.get("pw"), Some("true" | "1")) || flags & PASSWORD_REQUIRED != 0 {
-            return Err(
-                "it requires a password; turn the password off in its AirPlay settings".into(),
-            );
-        }
-        if flags & (PIN_REQUIRED | PAIRING_REQUIRED) != 0 {
-            return Err(
-                "it requires pairing with a PIN; allow AirPlay without a PIN in its settings"
-                    .into(),
-            );
-        }
         Ok(raop)
+    }
+
+    /// Claude: AirPlay 2 needs a receiver that takes AirPlay audio and pairs
+    /// transiently, as pyatv decides from the same feature bits, and whose
+    /// access control lets any sender pair.
+    fn airplay2_service(&self) -> Result<&Service, String> {
+        let Some(airplay) = &self.airplay else {
+            return Err("it does not offer AirPlay 2".into());
+        };
+        let txt = &airplay.txt;
+        let features = txt.features();
+        let advertised = || txt.get("features").unwrap_or("");
+        if features & AUDIO == 0 {
+            return Err(format!(
+                "it does not take AirPlay 2 audio (features={})",
+                advertised()
+            ));
+        }
+        if features & (CORE_UTILS_PAIRING | SYSTEM_PAIRING) == 0 {
+            return Err(format!(
+                "it does not pair transiently over AirPlay 2 (features={})",
+                advertised()
+            ));
+        }
+        if txt.get("acl").is_some_and(|acl| acl != "0") {
+            return Err(format!(
+                "it lets only some senders pair over AirPlay 2 (acl={})",
+                txt.get("acl").unwrap_or("")
+            ));
+        }
+        Ok(airplay)
     }
 }
 
+/// Claude: the protocol a stream speaks to its receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Protocol {
+    /// Claude: RAOP, unencrypted and unauthenticated.
+    AirPlay1,
+    /// Claude: realtime audio, encrypted after transient pairing.
+    AirPlay2,
+}
+
+impl std::fmt::Display for Protocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Protocol::AirPlay1 => "AirPlay 1",
+            Protocol::AirPlay2 => "AirPlay 2",
+        })
+    }
+}
+
+const AUDIO: u64 = 1 << 9;
+const SYSTEM_PAIRING: u64 = 1 << 43;
+const CORE_UTILS_PAIRING: u64 = 1 << 48;
 const PIN_REQUIRED: u64 = 0x8;
 const PASSWORD_REQUIRED: u64 = 0x80;
 const PAIRING_REQUIRED: u64 = 0x200;
@@ -151,6 +227,17 @@ impl Txt {
             .filter_map(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
             .fold(0, |acc, v| acc | v)
     }
+
+    /// Claude: the `features` bit field, written as its lower 32 bits and,
+    /// after a comma, its upper 32.
+    fn features(&self) -> u64 {
+        let mut halves = self.list("features").map(|v| {
+            u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap_or(0) & 0xFFFF_FFFF
+        });
+        let low = halves.next().unwrap_or(0);
+        let high = halves.next().unwrap_or(0);
+        high << 32 | low
+    }
 }
 
 #[cfg(test)]
@@ -173,6 +260,7 @@ pub(crate) mod tests {
 
     pub(crate) const MOVE_2_RAOP: &str = "cn=0,1 da=true et=0,4 ft=0x445F8A00,0x801C340 fv=p20.97.2-81220 md=0,1,2 am=Move 2 sf=0x4 tp=UDP vn=65537 vs=366.0 pk=027d3f0dd349d365f2c31728df281b728473713ac5973c289cc0d3449d6cdd74";
     pub(crate) const MOVE_2_AIRPLAY: &str = "acl=0 deviceid=C4:38:75:04:5E:80 features=0x445F8A00,0x801C340 fex=AIpfREDDAQgQIQ rsf=0x0 fv=p20.97.2-81220 flags=0x4 model=Move 2 manufacturer=Sonos serialNumber=C4-38-75-04-5E-80:3 protovers=1.1 srcvers=366.0 pi=74ac565e-7c7f-4b41-b257-47630cb249e3 gid=74ac565e-7c7f-4b41-b257-47630cb249e3 gcgl=0 pk=027d3f0dd349d365f2c31728df281b728473713ac5973c289cc0d3449d6cdd74 bat=BC100";
+    pub(crate) const CITATION_AIRPLAY: &str = "acl=0 deviceid=C4:30:18:6E:41:2D features=0x445F8A00,0x1C340 flags=0x4 model=HK Citation MultiBeam 1100 protovers=1.1 srcvers=366.0";
     pub(crate) const SHAIRPORT_SYNC_RAOP: &str = "sf=0x4 fv=5.6.2 am=ShairportSync vs=105.1 tp=TCP,UDP vn=65537 md=0,1,2 ss=16 sr=44100 da=true sv=false et=0,1 ek=1 cn=0,1 ch=2 txtvers=1 pw=false";
 
     fn receiver(raop: Option<&str>, airplay: Option<&str>) -> Receiver {
@@ -227,6 +315,53 @@ pub(crate) mod tests {
             Ok(())
         );
         assert_eq!(receiver(Some(SHAIRPORT_SYNC_RAOP), None).support(), Ok(()));
+    }
+
+    #[test]
+    fn the_citation_and_move_2_are_eligible_for_airplay_2_by_their_feature_bits() {
+        for airplay in [MOVE_2_AIRPLAY, CITATION_AIRPLAY] {
+            let receiver = receiver(None, Some(airplay));
+            assert!(receiver.service(Protocol::AirPlay2).is_ok(), "{airplay}");
+        }
+        let reason = |airplay: &str| {
+            receiver(Some(MOVE_2_RAOP), Some(airplay))
+                .service(Protocol::AirPlay2)
+                .unwrap_err()
+        };
+        let without = |bit: u32| {
+            let features = 0x0001_C340_445F_8A00u64 & !(1 << bit);
+            format!(
+                "deviceid=C4:30:18:6E:41:2D features={:#X},{:#X} flags=0x4",
+                features & 0xFFFF_FFFF,
+                features >> 32
+            )
+        };
+        assert!(reason(&without(9)).contains("audio"));
+        assert!(reason(&without(48)).contains("transiently"));
+        let system_pairing = "deviceid=C4:30:18:6E:41:2D features=0x200,0x800 flags=0x4";
+        assert!(
+            receiver(None, Some(system_pairing))
+                .service(Protocol::AirPlay2)
+                .is_ok()
+        );
+        assert!(reason(&CITATION_AIRPLAY.replace("acl=0", "acl=1")).contains("acl=1"));
+        assert!(reason(&CITATION_AIRPLAY.replace("flags=0x4", "flags=0x8")).contains("PIN"));
+        assert!(
+            receiver(Some(SHAIRPORT_SYNC_RAOP), None)
+                .service(Protocol::AirPlay2)
+                .unwrap_err()
+                .contains("does not offer AirPlay 2")
+        );
+    }
+
+    #[test]
+    fn features_read_their_lower_half_then_their_upper_half() {
+        assert_eq!(
+            txt("features=0x445F8A00,0x1C340").features(),
+            0x0001_C340_445F_8A00
+        );
+        assert_eq!(txt("features=0x5A7FFFF7").features(), 0x5A7F_FFF7);
+        assert_eq!(txt("x=1").features(), 0);
     }
 
     #[test]

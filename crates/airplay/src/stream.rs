@@ -17,7 +17,9 @@ use crate::packet::{self, AUDIO_PACKET_LEN, AudioHeader, RETRANSMISSION_LEN, Syn
 use crate::raop::{self, Offer, Session};
 use crate::rtsp::{Connection, OpenError, ReadError, Request};
 use crate::turns::Turn;
-use crate::{Browser, Counters, FRAMES_PER_PACKET, LATENCY, Receiver, ReceiverId, Render, Status};
+use crate::{
+    Browser, Counters, FRAMES_PER_PACKET, LATENCY, Protocol, Receiver, ReceiverId, Render, Status,
+};
 
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const SYNC_INTERVAL: Duration = Duration::from_secs(1);
@@ -298,7 +300,7 @@ fn connect<'a, R>(
         })?;
     let name = &found.name;
     let service = found
-        .stream_service()
+        .service(Protocol::AirPlay1)
         .map_err(|reason| format!("{name}: {reason}"))?;
     if !turn.wait(&abort) {
         return Err("stopped".into());
@@ -433,7 +435,7 @@ fn open(
             return Err("stopped".into());
         }
         if let Some(found) = browser.receiver(receiver)
-            && let Ok(service) = found.stream_service()
+            && let Ok(service) = found.service(Protocol::AirPlay1)
         {
             addresses = service.addresses.clone();
         }
