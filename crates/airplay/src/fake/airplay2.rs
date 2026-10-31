@@ -51,9 +51,11 @@ fn a_stream_pairs_sets_up_records_and_plays_audio_the_receiver_opens() {
     stream.finish().wait();
 
     let requests: Vec<FakeRequest> = fake.requests().into_iter().map(|(_, _, r)| r).collect();
+    assert_eq!(uris(&fake)[0], "GET /info");
+    let requests = &requests[1..];
     let session_uri = &requests[2].uri;
     assert_eq!(
-        uris(&fake)[..5],
+        uris(&fake)[1..6],
         [
             "POST /pair-setup".to_owned(),
             "POST /pair-setup".to_owned(),
@@ -439,6 +441,42 @@ fn finishing_or_dropping_at_each_handshake_step_is_prompt() {
 }
 
 #[test]
+fn a_stream_setup_left_unanswered_tears_down_within_its_bound_and_is_unreachable() {
+    let fake = Fake::start(Behavior {
+        rtsp: Rtsp::HangAt(Step::StreamSetup),
+        ..Behavior::default()
+    });
+    let browser = browser(&fake, true);
+    let settings = settings();
+    let bound = settings.answer_timeout + settings.teardown_timeout;
+    let stream = Stream::start_with(
+        &browser,
+        fake.id(),
+        Ok(settings),
+        Renders::default().renderer(None),
+    );
+    assert!(wait_until(HANDSHAKE, || fake
+        .requests()
+        .iter()
+        .any(|(_, _, r)| step_of(r) == Some(Step::StreamSetup))));
+    let hung_at = Instant::now();
+    assert!(wait_until(bound + Duration::from_secs(1), || stream
+        .status()
+        != Status::Connecting));
+    let waited = hung_at.elapsed();
+    let Status::Unreachable(reason) = stream.status() else {
+        panic!("{:?}", stream.status())
+    };
+    assert!(reason.contains("no answer to SETUP"), "{reason}");
+    assert!(waited < bound + PROMPT, "unreachable after {waited:?}");
+    assert_eq!(fake.methods().last().map(String::as_str), Some("TEARDOWN"));
+    assert!(
+        !fake.methods().contains(&"OPTIONS".to_owned()),
+        "a receiver that stopped answering was tried again over AirPlay 1"
+    );
+}
+
+#[test]
 fn a_wrong_pairing_proof_is_never_trusted_or_fallen_back_from() {
     let fake = Fake::start(Behavior {
         pairing: Pairing::WrongProof,
@@ -456,7 +494,10 @@ fn a_wrong_pairing_proof_is_never_trusted_or_fallen_back_from() {
         panic!("{:?}", stream.status())
     };
     assert!(reason.contains("pairing proof is wrong"), "{reason}");
-    assert_eq!(uris(&fake), ["POST /pair-setup", "POST /pair-setup"]);
+    assert_eq!(
+        uris(&fake),
+        ["GET /info", "POST /pair-setup", "POST /pair-setup"]
+    );
     assert!(wait_until(Duration::from_secs(1), || fake
         .closed(0)
         .is_some()));
@@ -497,9 +538,15 @@ fn a_refused_pairing_falls_back_to_airplay_1_unless_airplay_2_was_asked_for() {
                 )
             })
             .collect();
-        assert_eq!(methods[0], (0, "POST pair-setup".to_owned()));
-        assert_eq!(methods[1].0, 1, "AirPlay 1 runs on a new connection");
-        assert!(methods[1].1.starts_with("OPTIONS"));
+        assert_eq!(
+            methods[..2],
+            [
+                (0, "GET info".to_owned()),
+                (0, "POST pair-setup".to_owned())
+            ]
+        );
+        assert_eq!(methods[2].0, 1, "AirPlay 1 runs on a new connection");
+        assert!(methods[2].1.starts_with("OPTIONS"));
         assert!(fake.closed(0).is_some());
         drop(stream);
 
@@ -516,7 +563,11 @@ fn a_refused_pairing_falls_back_to_airplay_1_unless_airplay_2_was_asked_for() {
             panic!("{:?}", stream.status())
         };
         assert!(reason.starts_with("fake: it "), "{reason}");
-        assert!(uris(&forced).iter().all(|r| r == "POST /pair-setup"));
+        assert!(
+            uris(&forced)
+                .iter()
+                .all(|r| r == "GET /info" || r == "POST /pair-setup")
+        );
     }
 }
 
@@ -570,6 +621,7 @@ fn a_refused_stream_setup_tears_the_session_down_before_falling_back() {
         .map(|(_, c, r)| (c, r.method))
         .collect();
     let expected = [
+        (0, "GET"),
         (0, "POST"),
         (0, "POST"),
         (0, "SETUP"),
@@ -580,10 +632,10 @@ fn a_refused_stream_setup_tears_the_session_down_before_falling_back() {
         (1, "SETUP"),
         (1, "RECORD"),
     ];
-    assert_eq!(requests[..9], expected.map(|(c, m)| (c, m.to_owned())));
-    let teardown = fake.requests()[4].2.plist();
+    assert_eq!(requests[..10], expected.map(|(c, m)| (c, m.to_owned())));
+    let teardown = fake.requests()[5].2.plist();
     assert!(teardown.is_empty(), "the TEARDOWN ends the whole session");
-    assert!(fake.requests()[4].0 < fake.requests()[5].0);
+    assert!(fake.requests()[5].0 < fake.requests()[6].0);
     assert!(
         fake.audio().iter().all(|(_, p)| p.counted),
         "the audio is AirPlay 1's"

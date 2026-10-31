@@ -514,7 +514,13 @@ impl Connector<'_> {
                 raop::negotiate(connection, &service.txt, &offer, timeout, self.abort)
                     .map_err(failed)?
             }
-            Protocol::AirPlay2 => airplay2::negotiate(connection, &offer, timeout, self.abort)?,
+            Protocol::AirPlay2 => airplay2::negotiate(
+                connection,
+                &offer,
+                timeout,
+                self.settings.teardown_timeout,
+                self.abort,
+            )?,
         };
         Ok(Link {
             session,

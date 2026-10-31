@@ -42,6 +42,7 @@ pub(crate) enum Step {
 pub(crate) enum Rtsp {
     #[default]
     Answer,
+    /// Claude: answers nothing from this step on.
     HangAt(Step),
     RefuseAt(Step, u16),
     SilentAfterRecord,
@@ -566,9 +567,11 @@ impl Server {
                 continue;
             }
             let step = step_of(&request);
-            match (self.behavior.rtsp, step) {
-                (Rtsp::HangAt(hang), Some(step)) if hang == step => continue,
-                _ => {}
+            if let (Rtsp::HangAt(hang), Some(step)) = (self.behavior.rtsp, step)
+                && hang == step
+            {
+                silent = true;
+                continue;
             }
             let answer = match (self.behavior.rtsp, step) {
                 (Rtsp::RefuseAt(refused, status), Some(step)) if refused == step => {
@@ -587,6 +590,14 @@ impl Server {
                         Answer::ok().with_body("application/octet-stream", vec![0x42; 32])
                     }
                     "POST" if request.uri == "/pair-setup" => self.pair(&request),
+                    "GET" if request.uri == "/info" => {
+                        let mut info = Dictionary::new();
+                        info.insert("features".into(), 0x0001_C340_445F_8A00u64.into());
+                        info.insert("pk".into(), Value::Data(vec![0x27; 32]));
+                        let mut body = Vec::new();
+                        Value::Dictionary(info).to_writer_binary(&mut body).unwrap();
+                        Answer::ok().with_body(PLIST, body)
+                    }
                     "ANNOUNCE" if self.behavior.auth_setup_required && !auth_setup => {
                         Answer::status("403 Forbidden")
                     }

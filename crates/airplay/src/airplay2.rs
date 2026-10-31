@@ -41,16 +41,30 @@ impl Failure {
     }
 }
 
-/// Claude: pairs transiently, encrypts the connection, then sets up the
-/// session with NTP timing, opens the receiver's event connection, sets up
-/// one realtime ALAC stream with a fresh key, and records. A handshake that
-/// fails after the session's SETUP tears the session down first.
+/// Claude: asks for the receiver's `/info`, as OwnTone and pyatv do first,
+/// pairs transiently, encrypts the connection, then sets up the session with
+/// NTP timing, opens the receiver's event connection, sets up one realtime
+/// ALAC stream with a fresh key, and records. A handshake that fails after
+/// the session's SETUP tears the session down within `teardown_timeout`.
 pub(crate) fn negotiate(
     mut connection: Connection,
     offer: &Offer,
     timeout: Duration,
+    teardown_timeout: Duration,
     abort: &dyn Fn() -> bool,
 ) -> Result<Session, Failure> {
+    let info = Request {
+        method: "GET",
+        uri: "/info",
+        headers: vec![],
+        body: None,
+    };
+    let answer = connection
+        .exchange(&info, timeout, abort)
+        .map_err(Failure::Failed)?;
+    if answer.status != 200 {
+        debug!(status = answer.status, "the receiver gave no /info");
+    }
     let secret = pairing::pair_transiently(&mut connection, timeout, abort)?;
     connection.encrypt(&hap::keys(
         &secret,
@@ -97,7 +111,7 @@ pub(crate) fn negotiate(
         Err(failure) => {
             if !abort() {
                 let body = session_teardown();
-                match connection.exchange(&teardown(&uri, &body), timeout, abort) {
+                match connection.exchange(&teardown(&uri, &body), teardown_timeout, abort) {
                     Ok(response) => debug!(status = response.status, "TEARDOWN answered"),
                     Err(reason) => debug!(%reason, "TEARDOWN unanswered"),
                 }
