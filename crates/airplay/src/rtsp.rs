@@ -1,5 +1,5 @@
-use std::fmt::Write as _;
-use std::io::{ErrorKind, Read, Write};
+use std::fmt::{self, Write as _};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -136,8 +136,9 @@ impl Connection {
         timeout: Duration,
         common: Vec<(&'static str, String)>,
         abort: &dyn Fn() -> bool,
-    ) -> Result<Connection, String> {
+    ) -> Result<Connection, OpenError> {
         let mut failures = Vec::new();
+        let mut transient = false;
         for address in addresses {
             match connect(*address, timeout, abort).and_then(|stream| {
                 stream.set_nodelay(true)?;
@@ -154,14 +155,22 @@ impl Connection {
                         common,
                     });
                 }
-                Err(e) if e.kind() == ErrorKind::Interrupted => return Err("stopped".into()),
-                Err(e) => failures.push(format!("{address} ({e})")),
+                Err(e) if e.kind() == ErrorKind::Interrupted => return Err(OpenError::Stopped),
+                Err(e) => {
+                    transient |= is_transient(&e);
+                    failures.push(format!("{address} ({e})"));
+                }
             }
         }
         if failures.is_empty() {
-            return Err("it has no address".into());
+            return Err(OpenError::Failed("it has no address".into()));
         }
-        Err(format!("could not connect to {}", failures.join(", ")))
+        let reason = format!("could not connect to {}", failures.join(", "));
+        Err(if transient {
+            OpenError::Transient(reason)
+        } else {
+            OpenError::Failed(reason)
+        })
     }
 
     pub(crate) fn local_addr(&self) -> SocketAddr {
@@ -203,6 +212,9 @@ impl Connection {
         timeout: Duration,
         abort: &dyn Fn() -> bool,
     ) -> Result<Response, String> {
+        if abort() {
+            return Err("stopped".into());
+        }
         self.stream
             .set_write_timeout(Some(timeout))
             .map_err(|e| e.to_string())?;
@@ -290,6 +302,34 @@ fn connect(
     }
 }
 
+pub(crate) enum OpenError {
+    Stopped,
+    /// Claude: an address failed as a receiver's does while it wakes from
+    /// standby or starts its RTSP server.
+    Transient(String),
+    Failed(String),
+}
+
+impl fmt::Display for OpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OpenError::Stopped => f.write_str("stopped"),
+            OpenError::Transient(reason) | OpenError::Failed(reason) => f.write_str(reason),
+        }
+    }
+}
+
+fn is_transient(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionRefused
+            | ErrorKind::HostUnreachable
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::NetworkDown
+            | ErrorKind::TimedOut
+    ) || error.raw_os_error() == Some(libc::EHOSTDOWN)
+}
+
 pub(crate) enum ReadError {
     TimedOut,
     Failed(String),
@@ -367,6 +407,25 @@ mod tests {
         );
         assert!(decode_response(b"garbage\r\n\r\n").is_err());
         assert!(decode_response(b"RTSP/1.0 200 OK\r\nContent-Length: x\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn connections_failing_as_a_waking_receiver_does_are_transient() {
+        let os = io::Error::from_raw_os_error;
+        for error in [
+            os(libc::ECONNREFUSED),
+            os(libc::EHOSTUNREACH),
+            os(libc::EHOSTDOWN),
+            os(libc::ENETUNREACH),
+            os(libc::ENETDOWN),
+            os(libc::ETIMEDOUT),
+            io::Error::new(ErrorKind::TimedOut, "connection timed out"),
+        ] {
+            assert!(is_transient(&error), "{error}");
+        }
+        for error in [os(libc::EADDRNOTAVAIL), os(libc::EACCES), os(libc::EINVAL)] {
+            assert!(!is_transient(&error), "{error}");
+        }
     }
 
     #[test]
