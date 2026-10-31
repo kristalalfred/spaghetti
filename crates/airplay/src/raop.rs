@@ -1,5 +1,5 @@
 use std::net::IpAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info};
 
@@ -29,8 +29,9 @@ pub(crate) fn negotiate(
         Ok(session) => Ok(session),
         Err(Failure::AnnounceRefused(response)) if retry_with_auth_setup(response.status, txt) => {
             info!(%peer, status = response.status, "receiver refused ANNOUNCE; retrying with auth-setup");
-            let connection = Connection::open(&[peer], timeout, common, abort)
-                .map_err(|error| error.to_string())?;
+            let connection =
+                Connection::open(&[peer], timeout, Instant::now() + timeout, common, abort)
+                    .map_err(|error| error.to_string())?;
             attempt(connection, offer, timeout, abort, true).map_err(|failure| match failure {
                 Failure::AnnounceRefused(response) => refusal("ANNOUNCE", &response),
                 Failure::Other(reason) => reason,

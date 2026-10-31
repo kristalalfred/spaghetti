@@ -537,10 +537,10 @@ impl Connector<'_> {
         })
     }
 
-    /// Claude: connects to the receiver, trying again for `wake_window` while
-    /// it fails as one waking from standby does. Each try goes to the
-    /// addresses browsing knows by then, since a waking receiver may come back
-    /// on others.
+    /// Claude: connects to the receiver, trying again while it fails as one
+    /// waking from standby does, until `wake_window` ends: no attempt runs past
+    /// it. Each try goes to the addresses browsing knows by then, since a
+    /// waking receiver may come back on others.
     fn open(
         &self,
         protocol: Protocol,
@@ -555,13 +555,18 @@ impl Connector<'_> {
                 return Err("stopped".into());
             }
             let tried_at = Instant::now();
-            let reason =
-                match Connection::open(&addresses, settings.connect_timeout, common.clone(), abort)
-                {
-                    Ok(connection) => return Ok(connection),
-                    Err(OpenError::Transient(reason)) if Instant::now() < deadline => reason,
-                    Err(error) => return Err(error.to_string()),
-                };
+            let opened = Connection::open(
+                &addresses,
+                settings.connect_timeout,
+                deadline,
+                common.clone(),
+                abort,
+            );
+            let reason = match opened {
+                Ok(connection) => return Ok(connection),
+                Err(OpenError::Transient(reason)) if Instant::now() < deadline => reason,
+                Err(error) => return Err(error.to_string()),
+            };
             tries += 1;
             if tries == 1 {
                 info!(%receiver, %reason, "AirPlay receiver not answering; trying again while it wakes");
@@ -570,6 +575,9 @@ impl Connector<'_> {
             }
             if !pause_until((tried_at + WAKE_RETRY).min(deadline), abort) {
                 return Err("stopped".into());
+            }
+            if Instant::now() >= deadline {
+                return Err(reason);
             }
             if let Some(found) = self.browser.receiver(receiver)
                 && let Ok(service) = found.service(protocol)

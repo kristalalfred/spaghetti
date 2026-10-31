@@ -194,16 +194,24 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
+    /// Claude: connects to the first of `addresses` that answers, giving each
+    /// `timeout` but none past `deadline`.
     pub(crate) fn open(
         addresses: &[SocketAddr],
         timeout: Duration,
+        deadline: Instant,
         common: Vec<(&'static str, String)>,
         abort: &dyn Fn() -> bool,
     ) -> Result<Connection, OpenError> {
         let mut failures = Vec::new();
         let mut transient = false;
         for address in addresses {
-            match connect(*address, timeout, abort).and_then(|stream| {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                failures.push(format!("{address} (not tried in time)"));
+                continue;
+            }
+            match connect(*address, timeout.min(left), abort).and_then(|stream| {
                 stream.set_nodelay(true)?;
                 Ok((stream.local_addr()?, stream))
             }) {
@@ -628,10 +636,15 @@ mod tests {
             (wire, String::from_utf8(plaintext).unwrap())
         });
 
-        let mut connection =
-            Connection::open(&[address], Duration::from_secs(1), vec![], &|| false)
-                .map_err(|e| e.to_string())
-                .unwrap();
+        let mut connection = Connection::open(
+            &[address],
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(1),
+            vec![],
+            &|| false,
+        )
+        .map_err(|e| e.to_string())
+        .unwrap();
         connection.encrypt(&keys);
         let request = |method| Request {
             method,
