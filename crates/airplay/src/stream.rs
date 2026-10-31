@@ -379,7 +379,6 @@ fn connect<'a, R>(
         packet: Box::new([0; AUDIO_PACKET_LEN]),
         retransmission: Box::new([0; RETRANSMISSION_LEN]),
         next: 0,
-        last_sent: None,
         next_sync: now,
         synced: false,
         failing_since: None,
@@ -408,7 +407,6 @@ struct Streamer<'a, R> {
     packet: Box<[u8; AUDIO_PACKET_LEN]>,
     retransmission: Box<[u8; RETRANSMISSION_LEN]>,
     next: u64,
-    last_sent: Option<u64>,
     next_sync: Instant,
     synced: bool,
     failing_since: Option<Instant>,
@@ -435,7 +433,7 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
             let step = match self.shared.command() {
                 Command::Stop => return End::Stopped,
                 Command::Finish => {
-                    let Some(last) = self.last_sent else {
+                    let Some(last) = self.backlog.latest() else {
                         return End::Finished;
                     };
                     let end = self.timeline.play_at(last + 1);
@@ -506,7 +504,7 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
             seq,
             timestamp: self.timeline.rtp(packet as i64 * FRAMES_PER_PACKET as i64),
             ssrc: self.ssrc,
-            marker: self.last_sent.is_none(),
+            marker: self.backlog.latest().is_none(),
         };
         packet::write_audio_packet(&mut self.packet, &header, &self.left, &self.right);
         let sent = self.send_audio();
@@ -516,7 +514,6 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
                 self.failing_since = None;
                 self.counters.packets_sent += 1;
                 self.counters.bytes_sent += sent as u64;
-                self.last_sent = Some(packet);
                 self.shared.set_status(Status::Streaming(self.counters));
                 Ok(())
             }

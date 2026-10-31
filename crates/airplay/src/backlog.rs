@@ -34,6 +34,12 @@ impl Backlog {
         self.latest = Some((packet, seq));
     }
 
+    /// Claude: the last packet pushed, which retransmission can still deliver
+    /// however its first send went.
+    pub(crate) fn latest(&self) -> Option<u64> {
+        self.latest.map(|(packet, _)| packet)
+    }
+
     pub(crate) fn get(&self, seq: u16) -> Option<&[u8; AUDIO_PACKET_LEN]> {
         let (latest, latest_seq) = self.latest?;
         let behind = u64::from(latest_seq.wrapping_sub(seq));
@@ -78,6 +84,8 @@ mod tests {
         assert_eq!(backlog.get(seq(6)), None);
         assert_eq!(backlog.get(seq(15)), None);
         assert_eq!(backlog.get(seq(20)), None);
+        assert_eq!(backlog.latest(), Some(19));
         assert_eq!(Backlog::new(4).get(0), None);
+        assert_eq!(Backlog::new(4).latest(), None);
     }
 }

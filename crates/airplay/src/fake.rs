@@ -836,7 +836,14 @@ mod tests {
             !calls.contains(&20),
             "the stalled packet was sent after its play time"
         );
-        assert!(calls.contains(&19) && calls.contains(&21) && calls.contains(&60));
+        assert!(
+            calls.iter().any(|&c| c < 20),
+            "packets before the stall were sent"
+        );
+        assert!(
+            calls.iter().filter(|&&c| c > 20).count() > 30,
+            "the stream resumed after the stall"
+        );
         for (arrived, packet) in &audio {
             assert!(
                 *arrived < renders.play_at(call_of(packet)),
@@ -863,15 +870,16 @@ mod tests {
             after_stall > 1,
             "packets due during the stall were skipped, not rendered late"
         );
-        let seq_of = |call| {
-            audio
-                .iter()
-                .find(|(_, p)| call_of(p) == call)
-                .unwrap()
-                .1
-                .seq
-        };
-        assert_eq!(seq_of(21), seq_of(19).wrapping_add(1 + after_stall));
+        let (_, first_sent) = &audio[0];
+        let first_packet = packets(renders.play_at(call_of(first_sent))).round() as u16;
+        for (_, packet) in &audio {
+            let packet_index = packets(renders.play_at(call_of(packet))).round() as u16;
+            assert_eq!(
+                packet.seq.wrapping_sub(first_sent.seq),
+                packet_index - first_packet,
+                "a sequence number off its packet's place on the timeline"
+            );
+        }
     }
 
     #[test]
@@ -919,6 +927,67 @@ mod tests {
             waited <= LATENCY + settings().teardown_timeout,
             "finishing took {waited:?}"
         );
+    }
+
+    #[test]
+    fn finishing_plays_out_a_tail_recovered_by_retransmission() {
+        let fake = Fake::start(Behavior::default());
+        let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+        let renders = Renders::default();
+        let failing = Arc::new(AtomicBool::new(false));
+        let tail_from = 30;
+        let settings = Settings {
+            first_seq: 0u16.wrapping_sub(tail_from as u16 + 3),
+            failing_sends: failing.clone(),
+            ..settings()
+        };
+        let mut render = renders.renderer(None);
+        let mut calls = 0;
+        let fail_tail = failing.clone();
+        let stream = Stream::start_with(&browser, fake.id(), Ok(settings), move |r: Render<'_>| {
+            fail_tail.store(calls >= tail_from, Ordering::Release);
+            calls += 1;
+            render(r);
+        });
+        assert!(wait_until(Duration::from_secs(2), || failing.load(Ordering::Acquire)));
+        thread::sleep(Duration::from_millis(100));
+        let finishing = stream.finish();
+        thread::sleep(Duration::from_millis(20));
+        failing.store(false, Ordering::Release);
+        let received = fake.audio();
+        assert!(received.iter().all(|(_, p)| call_of(p) < tail_from));
+        let last_received = received.last().unwrap().1.seq;
+        let older = received[5].1.seq;
+        fake.request_retransmission(last_received.wrapping_add(1), 30);
+        fake.request_retransmission(older, 1);
+        finishing.wait();
+
+        let recovered: Vec<AudioPacket> = fake
+            .control()
+            .iter()
+            .filter(|b| b[1] == 0xD6)
+            .map(|b| decode_audio(&b[4..]))
+            .collect();
+        assert!(recovered.iter().any(|p| p.seq == older));
+        let tail: Vec<&AudioPacket> = recovered.iter().filter(|p| p.seq != older).collect();
+        assert!(tail.len() >= 5, "recovered {} tail packets", tail.len());
+        assert_eq!(call_of(tail[0]), tail_from);
+        for pair in tail.windows(2) {
+            assert_eq!(pair[1].seq, pair[0].seq.wrapping_add(1));
+        }
+        assert!(tail.iter().any(|p| p.seq == 0), "the tail crosses the wrap");
+        let played_out = renders.play_at(call_of(tail[tail.len() - 1])) + PACKET_DURATION;
+        let (teardown_at, _, _) = fake
+            .requests()
+            .into_iter()
+            .find(|(_, _, r)| r.method == "TEARDOWN")
+            .unwrap();
+        assert!(
+            teardown_at >= played_out,
+            "TEARDOWN came {:?} before the recovered tail played out",
+            played_out - teardown_at
+        );
+        assert!(teardown_at - played_out < PROMPT);
     }
 
     #[test]
