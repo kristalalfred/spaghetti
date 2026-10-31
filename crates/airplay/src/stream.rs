@@ -166,6 +166,9 @@ pub(crate) struct Settings {
     pub(crate) teardown_timeout: Duration,
     pub(crate) timing_silence: Duration,
     pub(crate) keepalive: Duration,
+    pub(crate) send_failure_limit: Duration,
+    #[cfg(test)]
+    pub(crate) failing_sends: Arc<AtomicBool>,
 }
 
 impl Settings {
@@ -181,6 +184,9 @@ impl Settings {
             teardown_timeout: Duration::from_secs(1),
             timing_silence: Duration::from_secs(15),
             keepalive: Duration::from_secs(25),
+            send_failure_limit: Duration::from_secs(1),
+            #[cfg(test)]
+            failing_sends: Arc::default(),
         })
     }
 }
@@ -331,6 +337,7 @@ fn connect<'a, R>(
         last_sent: None,
         next_sync: now,
         synced: false,
+        failing_since: None,
         counters: Counters::default(),
         late_packets: 0,
     })
@@ -359,6 +366,7 @@ struct Streamer<'a, R> {
     last_sent: Option<u64>,
     next_sync: Instant,
     synced: bool,
+    failing_since: Option<Instant>,
     keepalive: Keepalive,
     counters: Counters,
     late_packets: u64,
@@ -394,9 +402,11 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
                 }
                 Command::Play => {
                     let due = self.timeline.play_at(self.next) - self.settings.latency;
-                    self.wait_until(due).map(|()| {
+                    self.wait_until(due).and_then(|()| {
                         if self.shared.command() == Command::Play && Instant::now() >= due {
-                            self.play_next();
+                            self.play_next()
+                        } else {
+                            Ok(())
                         }
                     })
                 }
@@ -407,7 +417,7 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
         }
     }
 
-    fn play_next(&mut self) {
+    fn play_next(&mut self) -> Result<(), String> {
         let cutoff = Instant::now() + MIN_LEAD;
         let mut late = 0;
         while self.timeline.play_at(self.next) <= cutoff {
@@ -425,7 +435,7 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
         });
         if Instant::now() + MIN_LEAD < play_at {
             self.sync_if_due();
-            self.send(packet);
+            self.send(packet)?;
         } else {
             late += 1;
         }
@@ -440,9 +450,12 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
             }
             self.late_packets += late;
         }
+        Ok(())
     }
 
-    fn send(&mut self, packet: u64) {
+    /// Claude: sends a packet, keeping it for retransmission even when sending
+    /// fails, and gives up once every send has failed for the limit.
+    fn send(&mut self, packet: u64) -> Result<(), String> {
         let seq = self.timeline.seq(packet);
         let header = AudioHeader {
             seq,
@@ -451,16 +464,35 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
             marker: self.last_sent.is_none(),
         };
         packet::write_audio_packet(&mut self.packet, &header, &self.left, &self.right);
-        match self.audio.send_to(&self.packet[..], self.session.audio) {
+        let sent = self.send_audio();
+        self.backlog.push(packet, seq, &self.packet);
+        match sent {
             Ok(sent) => {
+                self.failing_since = None;
                 self.counters.packets_sent += 1;
                 self.counters.bytes_sent += sent as u64;
+                self.last_sent = Some(packet);
+                self.shared.set_status(Status::Streaming(self.counters));
+                Ok(())
             }
-            Err(e) => debug!(seq, error = %e, "could not send an audio packet"),
+            Err(e) => {
+                let now = Instant::now();
+                let failing_for = now - *self.failing_since.get_or_insert(now);
+                debug!(seq, error = %e, "could not send an audio packet");
+                if failing_for >= self.settings.send_failure_limit {
+                    return Err(format!("could not send audio for {failing_for:?} ({e})"));
+                }
+                Ok(())
+            }
         }
-        self.backlog.push(packet, seq, &self.packet);
-        self.last_sent = Some(packet);
-        self.shared.set_status(Status::Streaming(self.counters));
+    }
+
+    fn send_audio(&self) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if self.settings.failing_sends.load(Ordering::Acquire) {
+            return Err(std::io::Error::other("injected failure"));
+        }
+        self.audio.send_to(&self.packet[..], self.session.audio)
     }
 
     fn sync_if_due(&mut self) {

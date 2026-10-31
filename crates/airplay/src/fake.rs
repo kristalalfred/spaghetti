@@ -948,6 +948,52 @@ mod tests {
     }
 
     #[test]
+    fn audio_that_keeps_failing_to_send_loses_the_stream() {
+        let fake = Fake::start(Behavior::default());
+        let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+        let failing = Arc::new(AtomicBool::new(false));
+        let settings = Settings {
+            send_failure_limit: Duration::from_millis(500),
+            failing_sends: failing.clone(),
+            ..settings()
+        };
+        let limit = settings.send_failure_limit;
+        let stream = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(settings),
+            Renders::default().renderer(None),
+        );
+        assert!(wait_until(Duration::from_secs(2), || fake.audio().len() >= 20));
+
+        failing.store(true, Ordering::Release);
+        thread::sleep(limit / 2);
+        failing.store(false, Ordering::Release);
+        let sent = fake.audio().len();
+        assert!(wait_until(Duration::from_secs(1), || fake.audio().len() > sent + 10));
+        assert!(streaming(&stream), "{:?}", stream.status());
+
+        failing.store(true, Ordering::Release);
+        let failing_since = Instant::now();
+        assert!(wait_until(limit + Duration::from_secs(1), || !streaming(
+            &stream
+        )));
+        let lost_after = failing_since.elapsed();
+        let Status::Lost(reason) = stream.status() else {
+            panic!("{:?}", stream.status())
+        };
+        assert!(reason.contains("injected failure"), "{reason}");
+        assert!(
+            lost_after >= limit && lost_after < limit + PROMPT,
+            "lost after {lost_after:?}"
+        );
+        assert!(wait_until(Duration::from_secs(1), || fake
+            .closed(0)
+            .is_some()));
+        assert!(fake.methods().contains(&"TEARDOWN".to_owned()));
+    }
+
+    #[test]
     fn dropping_a_stream_tears_down_at_once() {
         let fake = Fake::start(Behavior::default());
         let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
