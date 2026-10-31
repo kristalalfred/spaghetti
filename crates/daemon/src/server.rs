@@ -195,15 +195,7 @@ async fn handle_client(mut stream: UnixStream, shared: Arc<Shared>) {
 async fn dispatch(request: Request, shared: &Shared) -> Response {
     let state = &shared.state;
     match request {
-        Request::Status => {
-            let st = lock_state(state);
-            Response::Status(DaemonStatus {
-                running: true,
-                ipc_version: IPC_VERSION,
-                source_count: st.router.source_count(),
-                route_count: st.router.route_count(),
-            })
-        }
+        Request::Status => daemon_status(state),
         Request::ListApps => {
             let apps = spaghetti_engine::list_audio_apps();
             Response::Apps(apps)
@@ -296,15 +288,36 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
         Request::ListDevices => Response::Devices(shared.devices.list_devices()),
         Request::GetActivity => Response::Activity(read_activity(&shared.activity)),
         Request::ListSystemDevices => Response::SystemDevices(spaghetti_engine::list_all_devices()),
-        Request::ListAirPlayReceivers => match lock_state(state).router.list_airplay_receivers() {
-            Ok(receivers) => Response::AirPlayReceivers(receivers),
-            Err(message) => Response::Error { message },
-        },
+        Request::ListAirPlayReceivers => {
+            receiver_listing(spaghetti_engine::list_airplay_receivers).await
+        }
         Request::Shutdown => {
             tracing::info!("shutdown requested by client");
             shared.cancel.cancel();
             Response::Ok
         }
+    }
+}
+
+fn daemon_status(state: &Mutex<DaemonState>) -> Response {
+    let st = lock_state(state);
+    Response::Status(DaemonStatus {
+        running: true,
+        ipc_version: IPC_VERSION,
+        source_count: st.router.source_count(),
+        route_count: st.router.route_count(),
+    })
+}
+
+async fn receiver_listing(
+    list: impl FnOnce() -> Result<Vec<AirPlayReceiverInfo>, String> + Send + 'static,
+) -> Response {
+    match tokio::task::spawn_blocking(list).await {
+        Ok(Ok(receivers)) => Response::AirPlayReceivers(receivers),
+        Ok(Err(message)) => Response::Error { message },
+        Err(error) => Response::Error {
+            message: format!("AirPlay receiver listing failed: {error}"),
+        },
     }
 }
 
@@ -401,6 +414,51 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
+
+    #[tokio::test]
+    async fn status_completes_while_a_receiver_listing_waits() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let waiting = Arc::new(AtomicBool::new(false));
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let listing = tokio::spawn({
+            let waiting = Arc::clone(&waiting);
+            async move {
+                receiver_listing(move || {
+                    waiting.store(true, Ordering::Release);
+                    started.send(()).unwrap();
+                    let _ = released.recv_timeout(Duration::from_secs(1));
+                    waiting.store(false, Ordering::Release);
+                    Ok(vec![])
+                })
+                .await
+            }
+        });
+        ready.await.unwrap();
+        let status = daemon_status(&state);
+        let still_waiting = waiting.load(Ordering::Acquire);
+        let _ = release.send(());
+        let listed = listing.await.unwrap();
+        assert!(matches!(
+            status,
+            Response::Status(DaemonStatus {
+                source_count: 0,
+                route_count: 0,
+                ..
+            })
+        ));
+        assert!(
+            still_waiting,
+            "status waited for receiver listing to finish"
+        );
+        assert!(matches!(listed, Response::AirPlayReceivers(receivers) if receivers.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn receiver_listing_preserves_discovery_errors() {
+        let response = receiver_listing(|| Err("discovery failed".into())).await;
+        assert!(matches!(response, Response::Error { message } if message == "discovery failed"));
+    }
 
     #[tokio::test]
     async fn client_draining_allows_an_in_flight_response_to_finish() {

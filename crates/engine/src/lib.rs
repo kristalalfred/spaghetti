@@ -37,5 +37,5 @@ mod webrtc_tests;
 pub use activity::{ActivityReader, FpsTracker};
 pub use audio::{find_device_by_uid, list_all_devices};
 pub use device_manager::DeviceManager;
-pub use router::Router;
+pub use router::{Router, list_airplay_receivers};
 pub use tap::list_audio_apps;

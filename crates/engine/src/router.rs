@@ -321,27 +321,6 @@ impl Router {
         link.set_remote_description(generation, sdp)
     }
 
-    pub fn list_airplay_receivers(&self) -> Result<Vec<AirPlayReceiverInfo>, String> {
-        let mut receivers: Vec<_> = airplay_browser()
-            .receivers()?
-            .into_iter()
-            .map(|receiver| {
-                let support = match receiver.support() {
-                    Ok(()) => AirPlaySupport::Supported,
-                    Err(reason) => AirPlaySupport::Unsupported { reason },
-                };
-                AirPlayReceiverInfo {
-                    id: receiver.id.to_string(),
-                    name: receiver.name,
-                    model: receiver.model,
-                    support,
-                }
-            })
-            .collect();
-        receivers.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
-        Ok(receivers)
-    }
-
     pub fn source_count(&self) -> u32 {
         self.sources.len() as u32
     }
@@ -597,6 +576,27 @@ impl Router {
             .map(|(&id, _)| id)
             .collect()
     }
+}
+
+pub fn list_airplay_receivers() -> Result<Vec<AirPlayReceiverInfo>, String> {
+    let mut receivers: Vec<_> = airplay_browser()
+        .receivers()?
+        .into_iter()
+        .map(|receiver| {
+            let support = match receiver.support() {
+                Ok(()) => AirPlaySupport::Supported,
+                Err(reason) => AirPlaySupport::Unsupported { reason },
+            };
+            AirPlayReceiverInfo {
+                id: receiver.id.to_string(),
+                name: receiver.name,
+                model: receiver.model,
+                support,
+            }
+        })
+        .collect();
+    receivers.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+    Ok(receivers)
 }
 
 fn airplay_browser() -> &'static airplay::Browser {
