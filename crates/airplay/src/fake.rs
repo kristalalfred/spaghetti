@@ -1331,7 +1331,7 @@ mod tests {
         let stream = Stream::start_with(
             &browser,
             ID.parse().unwrap(),
-            Ok(looking_up),
+            Ok(looking_up.clone()),
             Renders::default().renderer(None),
         );
         thread::sleep(Duration::from_millis(50));
@@ -1341,6 +1341,23 @@ mod tests {
             started.elapsed() < PROMPT,
             "lookup cancelled after {:?}",
             started.elapsed()
+        );
+
+        let fake = Fake::start(Behavior::default());
+        let browser = Browser::offline();
+        let stream = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(looking_up),
+            Renders::default().renderer(None),
+        );
+        thread::sleep(Duration::from_millis(50));
+        drop(stream);
+        fake.advertise(&browser, SHAIRPORT_SYNC_RAOP);
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            fake.seen().is_empty(),
+            "a stream dropped while looking up its receiver connected to it"
         );
 
         let fake = Fake::start(Behavior {

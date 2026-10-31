@@ -203,6 +203,9 @@ impl Connection {
         timeout: Duration,
         abort: &dyn Fn() -> bool,
     ) -> Result<Response, String> {
+        if abort() {
+            return Err("stopped".into());
+        }
         self.stream
             .set_write_timeout(Some(timeout))
             .map_err(|e| e.to_string())?;

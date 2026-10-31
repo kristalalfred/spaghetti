@@ -308,6 +308,9 @@ fn connect<'a, R>(
             getrandom::u32().map_err(|e| e.to_string())?.to_string(),
         ),
     ];
+    if abort() {
+        return Err("stopped".into());
+    }
     let connection = Connection::open(&service.addresses, settings.connect_timeout, common, &abort)
         .map_err(|reason| format!("{name}: {reason}"))?;
     let bind = || {
