@@ -778,7 +778,7 @@ mod tests {
                 a.timestamp.wrapping_add(FRAMES_PER_PACKET as u32)
             );
         }
-        let receiver_latency = audio_latency.unwrap_or(0);
+        let receiver_latency = audio_latency.unwrap_or(11_025);
         for sync in &syncs {
             for (_, packet) in &audio {
                 let expected = renders.play_at(call_of(packet));
@@ -798,13 +798,13 @@ mod tests {
     }
 
     #[test]
-    fn sync_packets_place_each_packet_at_its_play_time() {
-        check_sync_mapping(None, 1000, 5_000_000);
+    fn sync_packets_account_for_the_audio_latency_a_receiver_reports() {
+        check_sync_mapping(Some(4_410), 1000, 5_000_000);
     }
 
     #[test]
-    fn sync_packets_account_for_the_receivers_audio_latency() {
-        check_sync_mapping(Some(11_025), 1000, 5_000_000);
+    fn a_receiver_reporting_no_audio_latency_is_taken_to_add_a_quarter_second() {
+        check_sync_mapping(None, 1000, 5_000_000);
     }
 
     #[test]

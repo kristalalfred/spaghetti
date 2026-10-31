@@ -263,7 +263,7 @@ fn run<R: FnMut(Render<'_>)>(
     info!(
         %receiver,
         address = %streamer.session.connection.peer_addr(),
-        audio_latency = streamer.audio_latency,
+        audio_latency = ?streamer.session.audio_latency,
         "AirPlay stream started"
     );
     shared.set_status(Status::Streaming(Counters::default()));
@@ -354,7 +354,7 @@ fn connect<'a, R>(
     .map_err(|reason| format!("{name}: {reason}"))?;
 
     let latency_frames = clock::frames(settings.latency);
-    let audio_latency = session.audio_latency;
+    let audio_latency = session.audio_latency.frames();
     if audio_latency >= latency_frames {
         teardown(&mut session, settings.teardown_timeout);
         return Err(format!(
