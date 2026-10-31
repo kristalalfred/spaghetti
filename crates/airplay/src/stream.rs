@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,8 @@ pub struct Stream {
 }
 
 impl Stream {
+    /// Claude: `render` runs on the stream's thread and must not block: a
+    /// renderer that blocks holds up the stream and keeps the receiver taken.
     pub fn start<R>(browser: &Browser, receiver: ReceiverId, render: R) -> Self
     where
         R: FnMut(Render<'_>) + Send + 'static,
@@ -58,6 +60,11 @@ impl Stream {
             status: Mutex::new(Status::Connecting),
             command: AtomicU8::new(Command::Play as u8),
             clock: Clock::start(),
+            finish_bound: settings
+                .as_ref()
+                .map_or(Duration::ZERO, |s| s.latency + s.teardown_timeout),
+            ended: Mutex::new(false),
+            ending: Condvar::new(),
         });
         let browser = browser.shared().clone();
         let turn = browser.turns.take(receiver.clone());
@@ -65,7 +72,10 @@ impl Stream {
             let shared = shared.clone();
             thread::Builder::new()
                 .name("airplay-stream".into())
-                .spawn(move || run(&shared, &browser, &receiver, turn, settings, render))
+                .spawn(move || {
+                    let _ended = Ended(&shared);
+                    run(&shared, &browser, &receiver, turn, settings, render);
+                })
                 .map_err(|e| format!("could not start the stream's thread ({e})"))
         });
         let thread = thread
@@ -90,6 +100,8 @@ impl Stream {
             .command
             .store(Command::Finish as u8, Ordering::Release);
         Finishing {
+            deadline: Instant::now() + self.shared.finish_bound,
+            shared: self.shared.clone(),
             thread: self.thread.take(),
         }
     }
@@ -113,7 +125,9 @@ impl Drop for Stream {
 /// Claude: a stream playing out its last packets. The receiver is still taken
 /// until it is finished.
 pub struct Finishing {
+    shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+    deadline: Instant,
 }
 
 impl Finishing {
@@ -122,9 +136,21 @@ impl Finishing {
     }
 
     /// Claude: blocks until the session has torn down, at most `LATENCY` plus
-    /// the teardown timeout.
+    /// the teardown timeout from `finish`. A session still running then, held
+    /// up by its renderer, keeps the receiver taken until it ends.
     pub fn wait(mut self) {
-        if let Some(thread) = self.thread.take() {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        let ended = self.shared.lock_ended();
+        let timeout = self.deadline.saturating_duration_since(Instant::now());
+        let (ended, _) = self
+            .shared
+            .ending
+            .wait_timeout_while(ended, timeout, |ended| !*ended)
+            .unwrap_or_else(PoisonError::into_inner);
+        if *ended {
+            drop(ended);
             let _ = thread.join();
         }
     }
@@ -134,6 +160,20 @@ struct Shared {
     status: Mutex<Status>,
     command: AtomicU8,
     clock: Clock,
+    finish_bound: Duration,
+    ended: Mutex<bool>,
+    ending: Condvar,
+}
+
+/// Claude: tells a waiting `Finishing` that the session's thread is done, after
+/// it has released everything, however it ends.
+struct Ended<'a>(&'a Shared);
+
+impl Drop for Ended<'_> {
+    fn drop(&mut self) {
+        *self.0.lock_ended() = true;
+        self.0.ending.notify_all();
+    }
 }
 
 impl Shared {
@@ -147,6 +187,10 @@ impl Shared {
 
     fn set_status(&self, status: Status) {
         *self.status.lock().unwrap_or_else(PoisonError::into_inner) = status;
+    }
+
+    fn lock_ended(&self) -> MutexGuard<'_, bool> {
+        self.ended.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

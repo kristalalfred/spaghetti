@@ -556,6 +556,7 @@ mod tests {
     use crate::receiver::tests::{MOVE_2_RAOP, SHAIRPORT_SYNC_RAOP};
     use crate::stream::Settings;
     use crate::{FRAMES_PER_PACKET, Render, Status, Stream};
+    use std::sync::mpsc;
 
     const LATENCY: Duration = Duration::from_millis(300);
     /// Claude: how soon a cancelled stream lets go, well short of the play-out,
@@ -1024,6 +1025,49 @@ mod tests {
             .any(
                 |(_, connection, r)| *connection == 0 && r.method == "TEARDOWN"
             )));
+        assert!(wait_until(Duration::from_secs(2), || streaming(&next)));
+    }
+
+    #[test]
+    fn finishing_is_bounded_while_the_renderer_blocks_but_the_receiver_stays_taken() {
+        let fake = Fake::start(Behavior::default());
+        let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+        let (release, held) = mpsc::channel::<()>();
+        let (blocked, blocking) = mpsc::channel::<()>();
+        let mut calls = 0;
+        let stream =
+            Stream::start_with(&browser, fake.id(), Ok(settings()), move |_: Render<'_>| {
+                calls += 1;
+                if calls == 20 {
+                    let _ = blocked.send(());
+                    let _ = held.recv();
+                }
+            });
+        blocking.recv_timeout(Duration::from_secs(2)).unwrap();
+        let next = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(settings()),
+            Renders::default().renderer(None),
+        );
+
+        let bound = LATENCY + settings().teardown_timeout;
+        let (waited, wait_returned) = mpsc::channel();
+        let finishing = thread::spawn(move || {
+            let started = Instant::now();
+            stream.finish().wait();
+            let _ = waited.send(started.elapsed());
+        });
+        let elapsed = wait_returned.recv_timeout(bound + PROMPT);
+        let taken = next.status() == Status::Connecting;
+        drop(release);
+        finishing.join().unwrap();
+        let elapsed = elapsed.expect("finishing waited past its bound");
+        assert!(
+            elapsed >= bound && elapsed < bound + PROMPT,
+            "waited {elapsed:?}"
+        );
+        assert!(taken, "the receiver was freed while the session still ran");
         assert!(wait_until(Duration::from_secs(2), || streaming(&next)));
     }
 
