@@ -1236,7 +1236,7 @@ mod tests {
             .find(|(_, _, r)| r.method == "TEARDOWN")
             .unwrap();
         assert!(
-            teardown_at - dropped_at < LATENCY / 2,
+            teardown_at - dropped_at < PROMPT,
             "TEARDOWN after {:?}",
             teardown_at - dropped_at
         );
