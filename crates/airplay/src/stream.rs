@@ -337,7 +337,8 @@ fn connect<'a, R>(
     let (found, protocol) = match browser.receiver(receiver) {
         Some(now) => match choose(&now) {
             Ok(protocol) => (now, protocol),
-            Err(_) => (found, protocol),
+            Err(_) if now.missing(protocol) => (found, protocol),
+            Err(reason) => return Err(format!("{}: {reason}", now.name)),
         },
         None => (found, protocol),
     };
@@ -540,7 +541,8 @@ impl Connector<'_> {
     /// Claude: connects to the receiver, trying again while it fails as one
     /// waking from standby does, until `wake_window` ends: no attempt runs past
     /// it. Each try goes to the addresses browsing knows by then, since a
-    /// waking receiver may come back on others.
+    /// waking receiver may come back on others, and none follows once the
+    /// receiver turns the stream away.
     fn open(
         &self,
         protocol: Protocol,
@@ -579,10 +581,12 @@ impl Connector<'_> {
             if Instant::now() >= deadline {
                 return Err(reason);
             }
-            if let Some(found) = self.browser.receiver(receiver)
-                && let Ok(service) = found.service(protocol)
-            {
-                addresses = service.addresses.clone();
+            if let Some(now) = self.browser.receiver(receiver) {
+                match now.service(protocol) {
+                    Ok(service) => addresses = service.addresses.clone(),
+                    Err(_) if now.missing(protocol) => {}
+                    Err(reason) => return Err(reason),
+                }
             }
         }
     }
