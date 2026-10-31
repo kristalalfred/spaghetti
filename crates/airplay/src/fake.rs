@@ -1072,6 +1072,40 @@ mod tests {
     }
 
     #[test]
+    fn an_audio_latency_not_below_the_streams_is_refused_after_teardown() {
+        let latency_frames = crate::clock::frames(LATENCY);
+        for audio_latency in [latency_frames - 1, latency_frames, latency_frames + 1] {
+            let fake = Fake::start(Behavior {
+                audio_latency: Some(audio_latency),
+                ..Behavior::default()
+            });
+            let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+            let stream = Stream::start_with(
+                &browser,
+                fake.id(),
+                Ok(settings()),
+                Renders::default().renderer(None),
+            );
+            assert!(wait_until(Duration::from_secs(2), || stream.status()
+                != Status::Connecting));
+            if audio_latency < latency_frames {
+                assert!(streaming(&stream), "{:?}", stream.status());
+                continue;
+            }
+            let Status::Unreachable(reason) = stream.status() else {
+                panic!("{audio_latency} frames: {:?}", stream.status())
+            };
+            assert!(reason.starts_with("fake: "), "{reason}");
+            assert!(
+                reason.contains(&format!("{audio_latency} frames")),
+                "{reason}"
+            );
+            assert_eq!(fake.methods().last().map(String::as_str), Some("TEARDOWN"));
+            assert!(fake.audio().is_empty());
+        }
+    }
+
+    #[test]
     fn dropping_a_stream_tears_down_at_once() {
         let fake = Fake::start(Behavior::default());
         let browser = fake.browser(SHAIRPORT_SYNC_RAOP);

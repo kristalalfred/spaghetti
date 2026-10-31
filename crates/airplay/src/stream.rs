@@ -332,7 +332,7 @@ fn connect<'a, R>(
         first_rtp: settings.first_rtp,
     };
     let timing = TimingResponder::start(timing, shared.clock)?;
-    let session = raop::negotiate(
+    let mut session = raop::negotiate(
         connection,
         &service.txt,
         &offer,
@@ -342,15 +342,14 @@ fn connect<'a, R>(
     .map_err(|reason| format!("{name}: {reason}"))?;
 
     let latency_frames = clock::frames(settings.latency);
-    let audio_latency = if session.audio_latency < latency_frames {
-        session.audio_latency
-    } else {
-        warn!(
-            frames = session.audio_latency,
-            "ignoring an Audio-Latency beyond the stream's latency"
-        );
-        0
-    };
+    let audio_latency = session.audio_latency;
+    if audio_latency >= latency_frames {
+        teardown(&mut session, settings.teardown_timeout);
+        return Err(format!(
+            "{name}: it delays audio by {audio_latency} frames, not less than the stream's \
+             latency of {latency_frames} frames"
+        ));
+    }
     let backlog_packets =
         (settings.latency + Duration::from_secs(1)).as_nanos() / PACKET_DURATION.as_nanos() + 1;
     let now = Instant::now();
@@ -666,20 +665,20 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
     }
 
     fn teardown(&mut self) {
-        let teardown = Request {
-            method: "TEARDOWN",
-            uri: &self.session.uri,
-            headers: vec![],
-            body: None,
-        };
-        match self
-            .session
-            .connection
-            .exchange(&teardown, self.settings.teardown_timeout, &|| false)
-        {
-            Ok(response) => debug!(status = response.status, "TEARDOWN answered"),
-            Err(reason) => debug!(%reason, "TEARDOWN unanswered"),
-        }
+        teardown(&mut self.session, self.settings.teardown_timeout);
+    }
+}
+
+fn teardown(session: &mut Session, timeout: Duration) {
+    let teardown = Request {
+        method: "TEARDOWN",
+        uri: &session.uri,
+        headers: vec![],
+        body: None,
+    };
+    match session.connection.exchange(&teardown, timeout, &|| false) {
+        Ok(response) => debug!(status = response.status, "TEARDOWN answered"),
+        Err(reason) => debug!(%reason, "TEARDOWN unanswered"),
     }
 }
 
