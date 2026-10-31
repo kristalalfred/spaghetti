@@ -5,6 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use airplay::{Browser, FRAMES_PER_PACKET, ReceiverId, Render, SAMPLE_RATE, Status, Stream};
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "usage: play
@@ -175,6 +176,21 @@ fn read_wav(path: &str) -> Result<Vec<[f32; 2]>, String> {
     Err(invalid("no audio data"))
 }
 
+/// Claude: an `Instant` as nanoseconds of `mach_absolute_time`, the clock
+/// receivers on this Mac such as shairport-sync log in.
+fn mach_time(at: Instant) -> u64 {
+    let now = Instant::now();
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut time) };
+    let mach_now = time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64;
+    let ahead = at.saturating_duration_since(now).as_nanos() as u64;
+    let behind = now.saturating_duration_since(at).as_nanos() as u64;
+    mach_now + ahead - behind
+}
+
 fn play(browser: &Browser, id: ReceiverId, options: Options) -> Result<(), String> {
     let total = options.frames();
     let rendered_all = Arc::new(AtomicBool::new(false));
@@ -182,7 +198,13 @@ fn play(browser: &Browser, id: ReceiverId, options: Options) -> Result<(), Strin
     let render = {
         let rendered_all = rendered_all.clone();
         move |render: Render<'_>| {
-            let first = *first_play_at.get_or_insert(render.play_at);
+            let first = *first_play_at.get_or_insert_with(|| {
+                info!(
+                    mach_ns = mach_time(render.play_at),
+                    "first frame's play time"
+                );
+                render.play_at
+            });
             let since_first = render.play_at - first;
             let start =
                 (since_first.as_nanos() * u128::from(SAMPLE_RATE)).div_ceil(1_000_000_000) as u64;
