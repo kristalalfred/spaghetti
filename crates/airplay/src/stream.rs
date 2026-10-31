@@ -1,6 +1,8 @@
+use std::any::Any;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -429,10 +431,10 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
         let play_at = self.timeline.play_at(packet);
         self.left.fill(0.0);
         self.right.fill(0.0);
-        (self.render)(Render {
-            channels: [&mut self.left[..], &mut self.right[..]],
-            play_at,
-        });
+        let render = &mut self.render;
+        let channels = [&mut self.left[..], &mut self.right[..]];
+        panic::catch_unwind(AssertUnwindSafe(|| render(Render { channels, play_at })))
+            .map_err(|payload| format!("the renderer panicked: {}", panic_message(&*payload)))?;
         if Instant::now() + MIN_LEAD < play_at {
             self.sync_if_due();
             self.send(packet)?;
@@ -635,6 +637,14 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
             Err(reason) => debug!(%reason, "TEARDOWN unanswered"),
         }
     }
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
 }
 
 fn readable<const N: usize>(fds: [RawFd; N], timeout: Duration) -> [bool; N] {

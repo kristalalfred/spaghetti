@@ -994,6 +994,40 @@ mod tests {
     }
 
     #[test]
+    fn a_panicking_renderer_loses_the_stream_and_frees_the_receiver() {
+        let fake = Fake::start(Behavior::default());
+        let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+        let mut calls = 0;
+        let stream =
+            Stream::start_with(&browser, fake.id(), Ok(settings()), move |_: Render<'_>| {
+                calls += 1;
+                assert!(calls < 20, "renderer failed on purpose");
+            });
+        let next = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(settings()),
+            Renders::default().renderer(None),
+        );
+        assert!(wait_until(Duration::from_secs(2), || matches!(
+            stream.status(),
+            Status::Lost(_)
+        )));
+        let Status::Lost(reason) = stream.status() else {
+            unreachable!()
+        };
+        assert!(reason.starts_with("the renderer panicked"), "{reason}");
+        assert!(reason.contains("renderer failed on purpose"), "{reason}");
+        assert!(wait_until(Duration::from_secs(1), || fake
+            .requests()
+            .iter()
+            .any(
+                |(_, connection, r)| *connection == 0 && r.method == "TEARDOWN"
+            )));
+        assert!(wait_until(Duration::from_secs(2), || streaming(&next)));
+    }
+
+    #[test]
     fn dropping_a_stream_tears_down_at_once() {
         let fake = Fake::start(Behavior::default());
         let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
