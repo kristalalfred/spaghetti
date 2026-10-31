@@ -1,6 +1,6 @@
 # Spaghetti
 
-Route macOS app audio to physical or virtual output devices, or to other machines over SRT, from the CLI. [weave-adapter-spaghetti](https://github.com/kristalalfred/weave-adapter-spaghetti) adds WebRTC links signaled by open-weave.
+Route macOS app audio to physical or virtual output devices, to AirPlay receivers, or to other machines over SRT, from the CLI. [weave-adapter-spaghetti](https://github.com/kristalalfred/weave-adapter-spaghetti) adds WebRTC links signaled by open-weave.
 
 Requires macOS, Rust, and Xcode Command Line Tools.
 
@@ -35,6 +35,16 @@ Play a source in step on several outputs by giving each route the same delay in 
 spaghetti route 1 BuiltInSpeakerDevice --delay 300
 spaghetti route 1 '<device-uid>' --delay 300
 ```
+
+Play a source on an AirPlay receiver. An AirPlay route always plays on a delay of at least about 2.1 s; the error for a shorter delay gives the minimum for the source. Give a local route the same delay to play in step:
+
+```sh
+spaghetti airplay
+spaghetti route 1 'airplay://Living Room' --delay 2500
+spaghetti route 1 BuiltInSpeakerDevice --delay 2500
+```
+
+`airplay` lists the receivers on the local network and whether spaghetti can play to each. Spaghetti sends uncompressed ALAC over AirPlay 1 (RAOP). A receiver that requires a password or pairing, or offers only AirPlay 2, is listed with the reason it is unsupported. `airplay://` takes a receiver's name or its ID. A receiver takes one route at a time. The route's volume scales the audio; the receiver's own volume is left as it is. SRT sources cannot play to AirPlay receivers.
 
 Send a source to another machine over SRT, and play what it receives. `srt://:PORT` listens, `srt://HOST:PORT` calls; one side of a link listens and the other calls:
 
