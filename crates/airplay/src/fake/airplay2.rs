@@ -440,7 +440,11 @@ fn finishing_or_dropping_at_each_handshake_step_is_prompt() {
         assert!(wait_until(Duration::from_secs(1), || fake
             .closed(1)
             .is_some()));
-        assert!(fake.closed(1).unwrap() - dropped_at < PROMPT, "{step:?}");
+        let closed_after = fake.closed(1).unwrap() - dropped_at;
+        assert!(
+            closed_after < PROMPT,
+            "{step:?}: closed {closed_after:?} after the drop"
+        );
         assert!(
             !uris(&fake)
                 .iter()
