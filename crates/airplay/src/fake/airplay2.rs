@@ -5,6 +5,7 @@ use crate::packet::AIRPLAY2_PACKET_LEN;
 use crate::receiver::tests::SHAIRPORT_SYNC_RAOP;
 use crate::stream::Settings;
 use crate::{Protocol, Status, Stream};
+use std::io::Write;
 
 /// Claude: how long a test waits for a handshake, whose SRP takes a debug
 /// build a few hundred milliseconds of CPU, while other suites load the
@@ -659,4 +660,81 @@ fn a_closed_connection_loses_an_airplay_2_stream() {
         stream.status(),
         Status::Lost("the receiver closed the RTSP connection".into())
     );
+}
+
+/// Claude: collects what the log writes, for the test below.
+#[derive(Clone)]
+struct Log(Arc<Mutex<Vec<u8>>>);
+
+impl Write for Log {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn the_debug_log_of_a_whole_session_holds_no_key_or_pairing_value() {
+    let log = Log(Arc::default());
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer({
+            let log = log.clone();
+            move || log.clone()
+        })
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+
+    let fake = Fake::start(Behavior::default());
+    let browser = browser(&fake, false);
+    let stream = Stream::start_with(
+        &browser,
+        fake.id(),
+        Ok(airplay_2()),
+        Renders::default().renderer(None),
+    );
+    assert!(wait_until(HANDSHAKE, || fake.audio().len() >= 10));
+    fake.send_event();
+    assert!(wait_until(HANDSHAKE, || fake.event_answers().len() >= 3));
+    stream.finish().wait();
+
+    let text = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
+    assert!(text.contains("SETUP"), "the session was logged");
+    assert!(
+        text.contains("shk: <32 bytes>"),
+        "the key was logged as its length"
+    );
+    let requests = fake.requests();
+    let m3 = requests
+        .iter()
+        .find(|(_, _, r)| r.uri == "/pair-setup" && r.tlv().get(tlv8::PROOF).is_some())
+        .unwrap()
+        .2
+        .tlv();
+    let server = transient_server();
+    let audio_key = fake.state.audio_key.lock().unwrap().unwrap();
+    let sealed = fake.audio_bytes()[0].clone();
+    let secrets: [(&str, &[u8]); 6] = [
+        ("shk", &audio_key),
+        ("A", m3.get(tlv8::PUBLIC_KEY).unwrap()),
+        ("M1", m3.get(tlv8::PROOF).unwrap()),
+        ("B", &server.public),
+        ("salt", &server.salt),
+        ("sealed audio", &sealed[12..40]),
+    ];
+    for (name, secret) in secrets {
+        let lower: String = secret[..8].iter().map(|b| format!("{b:02x}")).collect();
+        let listed = format!("{:?}", &secret[..4])
+            .trim_end_matches(']')
+            .to_owned();
+        assert!(
+            !text.to_ascii_lowercase().contains(&lower) && !text.contains(&listed),
+            "the log shows {name}"
+        );
+    }
 }
