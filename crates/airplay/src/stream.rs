@@ -1,8 +1,10 @@
+use std::any::Any;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -15,7 +17,7 @@ use crate::packet::{self, AUDIO_PACKET_LEN, AudioHeader, RETRANSMISSION_LEN, Syn
 use crate::raop::{self, Offer, Session};
 use crate::rtsp::{Connection, ReadError, Request};
 use crate::turns::Turn;
-use crate::{Browser, Counters, FRAMES_PER_PACKET, LATENCY, ReceiverId, Render, Status};
+use crate::{Browser, Counters, FRAMES_PER_PACKET, LATENCY, Receiver, ReceiverId, Render, Status};
 
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const SYNC_INTERVAL: Duration = Duration::from_secs(1);
@@ -36,6 +38,8 @@ pub struct Stream {
 }
 
 impl Stream {
+    /// Claude: `render` runs on the stream's thread and must not block: a
+    /// renderer that blocks holds up the stream and keeps the receiver taken.
     pub fn start<R>(browser: &Browser, receiver: ReceiverId, render: R) -> Self
     where
         R: FnMut(Render<'_>) + Send + 'static,
@@ -56,6 +60,11 @@ impl Stream {
             status: Mutex::new(Status::Connecting),
             command: AtomicU8::new(Command::Play as u8),
             clock: Clock::start(),
+            finish_bound: settings
+                .as_ref()
+                .map_or(Duration::ZERO, |s| s.latency + s.teardown_timeout),
+            ended: Mutex::new(false),
+            ending: Condvar::new(),
         });
         let browser = browser.shared().clone();
         let turn = browser.turns.take(receiver.clone());
@@ -63,7 +72,10 @@ impl Stream {
             let shared = shared.clone();
             thread::Builder::new()
                 .name("airplay-stream".into())
-                .spawn(move || run(&shared, &browser, &receiver, turn, settings, render))
+                .spawn(move || {
+                    let _ended = Ended(&shared);
+                    run(&shared, &browser, &receiver, turn, settings, render);
+                })
                 .map_err(|e| format!("could not start the stream's thread ({e})"))
         });
         let thread = thread
@@ -88,6 +100,8 @@ impl Stream {
             .command
             .store(Command::Finish as u8, Ordering::Release);
         Finishing {
+            deadline: Instant::now() + self.shared.finish_bound,
+            shared: self.shared.clone(),
             thread: self.thread.take(),
         }
     }
@@ -111,7 +125,9 @@ impl Drop for Stream {
 /// Claude: a stream playing out its last packets. The receiver is still taken
 /// until it is finished.
 pub struct Finishing {
+    shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+    deadline: Instant,
 }
 
 impl Finishing {
@@ -120,9 +136,21 @@ impl Finishing {
     }
 
     /// Claude: blocks until the session has torn down, at most `LATENCY` plus
-    /// the teardown timeout.
+    /// the teardown timeout from `finish`. A session still running then, held
+    /// up by its renderer, keeps the receiver taken until it ends.
     pub fn wait(mut self) {
-        if let Some(thread) = self.thread.take() {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        let ended = self.shared.lock_ended();
+        let timeout = self.deadline.saturating_duration_since(Instant::now());
+        let (ended, _) = self
+            .shared
+            .ending
+            .wait_timeout_while(ended, timeout, |ended| !*ended)
+            .unwrap_or_else(PoisonError::into_inner);
+        if *ended {
+            drop(ended);
             let _ = thread.join();
         }
     }
@@ -132,6 +160,20 @@ struct Shared {
     status: Mutex<Status>,
     command: AtomicU8,
     clock: Clock,
+    finish_bound: Duration,
+    ended: Mutex<bool>,
+    ending: Condvar,
+}
+
+/// Claude: tells a waiting `Finishing` that the session's thread is done, after
+/// it has released everything, however it ends.
+struct Ended<'a>(&'a Shared);
+
+impl Drop for Ended<'_> {
+    fn drop(&mut self) {
+        *self.0.lock_ended() = true;
+        self.0.ending.notify_all();
+    }
 }
 
 impl Shared {
@@ -145,6 +187,10 @@ impl Shared {
 
     fn set_status(&self, status: Status) {
         *self.status.lock().unwrap_or_else(PoisonError::into_inner) = status;
+    }
+
+    fn lock_ended(&self) -> MutexGuard<'_, bool> {
+        self.ended.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -166,6 +212,9 @@ pub(crate) struct Settings {
     pub(crate) teardown_timeout: Duration,
     pub(crate) timing_silence: Duration,
     pub(crate) keepalive: Duration,
+    pub(crate) send_failure_limit: Duration,
+    #[cfg(test)]
+    pub(crate) failing_sends: Arc<AtomicBool>,
 }
 
 impl Settings {
@@ -181,6 +230,9 @@ impl Settings {
             teardown_timeout: Duration::from_secs(1),
             timing_silence: Duration::from_secs(15),
             keepalive: Duration::from_secs(25),
+            send_failure_limit: Duration::from_secs(1),
+            #[cfg(test)]
+            failing_sends: Arc::default(),
         })
     }
 }
@@ -230,8 +282,9 @@ fn connect<'a, R>(
     render: R,
 ) -> Result<Streamer<'a, R>, String> {
     let abort = || shared.command() != Command::Play;
+    let supported = |found: &Receiver| found.support().is_ok();
     let found = browser
-        .find(receiver, settings.lookup_window, &abort)?
+        .find(receiver, settings.lookup_window, supported, &abort)?
         .ok_or_else(|| {
             format!(
                 "no AirPlay receiver {receiver} was found within {:?}",
@@ -279,7 +332,7 @@ fn connect<'a, R>(
         first_rtp: settings.first_rtp,
     };
     let timing = TimingResponder::start(timing, shared.clock)?;
-    let session = raop::negotiate(
+    let mut session = raop::negotiate(
         connection,
         &service.txt,
         &offer,
@@ -289,15 +342,14 @@ fn connect<'a, R>(
     .map_err(|reason| format!("{name}: {reason}"))?;
 
     let latency_frames = clock::frames(settings.latency);
-    let audio_latency = if session.audio_latency < latency_frames {
-        session.audio_latency
-    } else {
-        warn!(
-            frames = session.audio_latency,
-            "ignoring an Audio-Latency beyond the stream's latency"
-        );
-        0
-    };
+    let audio_latency = session.audio_latency;
+    if audio_latency >= latency_frames {
+        teardown(&mut session, settings.teardown_timeout);
+        return Err(format!(
+            "{name}: it delays audio by {audio_latency} frames, not less than the stream's \
+             latency of {latency_frames} frames"
+        ));
+    }
     let backlog_packets =
         (settings.latency + Duration::from_secs(1)).as_nanos() / PACKET_DURATION.as_nanos() + 1;
     let now = Instant::now();
@@ -330,6 +382,7 @@ fn connect<'a, R>(
         last_sent: None,
         next_sync: now,
         synced: false,
+        failing_since: None,
         counters: Counters::default(),
         late_packets: 0,
     })
@@ -358,6 +411,7 @@ struct Streamer<'a, R> {
     last_sent: Option<u64>,
     next_sync: Instant,
     synced: bool,
+    failing_since: Option<Instant>,
     keepalive: Keepalive,
     counters: Counters,
     late_packets: u64,
@@ -393,9 +447,11 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
                 }
                 Command::Play => {
                     let due = self.timeline.play_at(self.next) - self.settings.latency;
-                    self.wait_until(due).map(|()| {
+                    self.wait_until(due).and_then(|()| {
                         if self.shared.command() == Command::Play && Instant::now() >= due {
-                            self.play_next();
+                            self.play_next()
+                        } else {
+                            Ok(())
                         }
                     })
                 }
@@ -406,7 +462,7 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
         }
     }
 
-    fn play_next(&mut self) {
+    fn play_next(&mut self) -> Result<(), String> {
         let cutoff = Instant::now() + MIN_LEAD;
         let mut late = 0;
         while self.timeline.play_at(self.next) <= cutoff {
@@ -418,13 +474,13 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
         let play_at = self.timeline.play_at(packet);
         self.left.fill(0.0);
         self.right.fill(0.0);
-        (self.render)(Render {
-            channels: [&mut self.left[..], &mut self.right[..]],
-            play_at,
-        });
+        let render = &mut self.render;
+        let channels = [&mut self.left[..], &mut self.right[..]];
+        panic::catch_unwind(AssertUnwindSafe(|| render(Render { channels, play_at })))
+            .map_err(|payload| format!("the renderer panicked: {}", panic_message(&*payload)))?;
         if Instant::now() + MIN_LEAD < play_at {
             self.sync_if_due();
-            self.send(packet);
+            self.send(packet)?;
         } else {
             late += 1;
         }
@@ -439,9 +495,12 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
             }
             self.late_packets += late;
         }
+        Ok(())
     }
 
-    fn send(&mut self, packet: u64) {
+    /// Claude: sends a packet, keeping it for retransmission even when sending
+    /// fails, and gives up once every send has failed for the limit.
+    fn send(&mut self, packet: u64) -> Result<(), String> {
         let seq = self.timeline.seq(packet);
         let header = AudioHeader {
             seq,
@@ -450,16 +509,35 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
             marker: self.last_sent.is_none(),
         };
         packet::write_audio_packet(&mut self.packet, &header, &self.left, &self.right);
-        match self.audio.send_to(&self.packet[..], self.session.audio) {
+        let sent = self.send_audio();
+        self.backlog.push(packet, seq, &self.packet);
+        match sent {
             Ok(sent) => {
+                self.failing_since = None;
                 self.counters.packets_sent += 1;
                 self.counters.bytes_sent += sent as u64;
+                self.last_sent = Some(packet);
+                self.shared.set_status(Status::Streaming(self.counters));
+                Ok(())
             }
-            Err(e) => debug!(seq, error = %e, "could not send an audio packet"),
+            Err(e) => {
+                let now = Instant::now();
+                let failing_for = now - *self.failing_since.get_or_insert(now);
+                debug!(seq, error = %e, "could not send an audio packet");
+                if failing_for >= self.settings.send_failure_limit {
+                    return Err(format!("could not send audio for {failing_for:?} ({e})"));
+                }
+                Ok(())
+            }
         }
-        self.backlog.push(packet, seq, &self.packet);
-        self.last_sent = Some(packet);
-        self.shared.set_status(Status::Streaming(self.counters));
+    }
+
+    fn send_audio(&self) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if self.settings.failing_sends.load(Ordering::Acquire) {
+            return Err(std::io::Error::other("injected failure"));
+        }
+        self.audio.send_to(&self.packet[..], self.session.audio)
     }
 
     fn sync_if_due(&mut self) {
@@ -587,21 +665,29 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
     }
 
     fn teardown(&mut self) {
-        let teardown = Request {
-            method: "TEARDOWN",
-            uri: &self.session.uri,
-            headers: vec![],
-            body: None,
-        };
-        match self
-            .session
-            .connection
-            .exchange(&teardown, self.settings.teardown_timeout, &|| false)
-        {
-            Ok(response) => debug!(status = response.status, "TEARDOWN answered"),
-            Err(reason) => debug!(%reason, "TEARDOWN unanswered"),
-        }
+        teardown(&mut self.session, self.settings.teardown_timeout);
     }
+}
+
+fn teardown(session: &mut Session, timeout: Duration) {
+    let teardown = Request {
+        method: "TEARDOWN",
+        uri: &session.uri,
+        headers: vec![],
+        body: None,
+    };
+    match session.connection.exchange(&teardown, timeout, &|| false) {
+        Ok(response) => debug!(status = response.status, "TEARDOWN answered"),
+        Err(reason) => debug!(%reason, "TEARDOWN unanswered"),
+    }
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
 }
 
 fn readable<const N: usize>(fds: [RawFd; N], timeout: Duration) -> [bool; N] {

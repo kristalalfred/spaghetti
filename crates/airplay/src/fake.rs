@@ -163,9 +163,20 @@ impl Fake {
     }
 
     pub(crate) fn advertise(&self, browser: &Browser, record: &str) {
+        self.advertise_as(browser, Kind::Raop, INSTANCE, record);
+    }
+
+    /// Claude: advertises only the AirPlay 2 service, as a receiver does whose
+    /// `_airplay._tcp` record resolves before its `_raop._tcp` one.
+    pub(crate) fn advertise_airplay(&self, browser: &Browser) {
+        let record = format!("deviceid={ID} model=Fake flags=0x4");
+        self.advertise_as(browser, Kind::AirPlay, "fake", &record);
+    }
+
+    fn advertise_as(&self, browser: &Browser, kind: Kind, name: &str, record: &str) {
         let key = InstanceKey {
-            kind: Kind::Raop,
-            name: INSTANCE.into(),
+            kind,
+            name: name.into(),
             interface: 1,
         };
         browser.shared().apply([
@@ -545,6 +556,7 @@ mod tests {
     use crate::receiver::tests::{MOVE_2_RAOP, SHAIRPORT_SYNC_RAOP};
     use crate::stream::Settings;
     use crate::{FRAMES_PER_PACKET, Render, Status, Stream};
+    use std::sync::mpsc;
 
     const LATENCY: Duration = Duration::from_millis(300);
     /// Claude: how soon a cancelled stream lets go, well short of the play-out,
@@ -899,7 +911,7 @@ mod tests {
             played_out - teardown_at
         );
         assert!(
-            teardown_at - played_out < Duration::from_millis(100),
+            teardown_at - played_out < PROMPT,
             "TEARDOWN came {:?} late",
             teardown_at - played_out
         );
@@ -934,6 +946,163 @@ mod tests {
         assert!(wait_until(Duration::from_secs(1), || fake
             .closed(0)
             .is_some()));
+    }
+
+    #[test]
+    fn audio_that_keeps_failing_to_send_loses_the_stream() {
+        let fake = Fake::start(Behavior::default());
+        let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+        let failing = Arc::new(AtomicBool::new(false));
+        let settings = Settings {
+            send_failure_limit: Duration::from_millis(500),
+            failing_sends: failing.clone(),
+            ..settings()
+        };
+        let limit = settings.send_failure_limit;
+        let stream = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(settings),
+            Renders::default().renderer(None),
+        );
+        assert!(wait_until(Duration::from_secs(2), || fake.audio().len() >= 20));
+
+        failing.store(true, Ordering::Release);
+        thread::sleep(limit / 2);
+        failing.store(false, Ordering::Release);
+        let sent = fake.audio().len();
+        assert!(wait_until(Duration::from_secs(1), || fake.audio().len() > sent + 10));
+        assert!(streaming(&stream), "{:?}", stream.status());
+
+        failing.store(true, Ordering::Release);
+        let failing_since = Instant::now();
+        assert!(wait_until(limit + Duration::from_secs(1), || !streaming(
+            &stream
+        )));
+        let lost_after = failing_since.elapsed();
+        let Status::Lost(reason) = stream.status() else {
+            panic!("{:?}", stream.status())
+        };
+        assert!(reason.contains("injected failure"), "{reason}");
+        assert!(
+            lost_after >= limit && lost_after < limit + PROMPT,
+            "lost after {lost_after:?}"
+        );
+        assert!(wait_until(Duration::from_secs(1), || fake
+            .closed(0)
+            .is_some()));
+        assert!(fake.methods().contains(&"TEARDOWN".to_owned()));
+    }
+
+    #[test]
+    fn a_panicking_renderer_loses_the_stream_and_frees_the_receiver() {
+        let fake = Fake::start(Behavior::default());
+        let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+        let mut calls = 0;
+        let stream =
+            Stream::start_with(&browser, fake.id(), Ok(settings()), move |_: Render<'_>| {
+                calls += 1;
+                assert!(calls < 20, "renderer failed on purpose");
+            });
+        let next = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(settings()),
+            Renders::default().renderer(None),
+        );
+        assert!(wait_until(Duration::from_secs(2), || matches!(
+            stream.status(),
+            Status::Lost(_)
+        )));
+        let Status::Lost(reason) = stream.status() else {
+            unreachable!()
+        };
+        assert!(reason.starts_with("the renderer panicked"), "{reason}");
+        assert!(reason.contains("renderer failed on purpose"), "{reason}");
+        assert!(wait_until(Duration::from_secs(1), || fake
+            .requests()
+            .iter()
+            .any(
+                |(_, connection, r)| *connection == 0 && r.method == "TEARDOWN"
+            )));
+        assert!(wait_until(Duration::from_secs(2), || streaming(&next)));
+    }
+
+    #[test]
+    fn finishing_is_bounded_while_the_renderer_blocks_but_the_receiver_stays_taken() {
+        let fake = Fake::start(Behavior::default());
+        let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+        let (release, held) = mpsc::channel::<()>();
+        let (blocked, blocking) = mpsc::channel::<()>();
+        let mut calls = 0;
+        let stream =
+            Stream::start_with(&browser, fake.id(), Ok(settings()), move |_: Render<'_>| {
+                calls += 1;
+                if calls == 20 {
+                    let _ = blocked.send(());
+                    let _ = held.recv();
+                }
+            });
+        blocking.recv_timeout(Duration::from_secs(2)).unwrap();
+        let next = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(settings()),
+            Renders::default().renderer(None),
+        );
+
+        let bound = LATENCY + settings().teardown_timeout;
+        let (waited, wait_returned) = mpsc::channel();
+        let finishing = thread::spawn(move || {
+            let started = Instant::now();
+            stream.finish().wait();
+            let _ = waited.send(started.elapsed());
+        });
+        let elapsed = wait_returned.recv_timeout(bound + PROMPT);
+        let taken = next.status() == Status::Connecting;
+        drop(release);
+        finishing.join().unwrap();
+        let elapsed = elapsed.expect("finishing waited past its bound");
+        assert!(
+            elapsed >= bound && elapsed < bound + PROMPT,
+            "waited {elapsed:?}"
+        );
+        assert!(taken, "the receiver was freed while the session still ran");
+        assert!(wait_until(Duration::from_secs(2), || streaming(&next)));
+    }
+
+    #[test]
+    fn an_audio_latency_not_below_the_streams_is_refused_after_teardown() {
+        let latency_frames = crate::clock::frames(LATENCY);
+        for audio_latency in [latency_frames - 1, latency_frames, latency_frames + 1] {
+            let fake = Fake::start(Behavior {
+                audio_latency: Some(audio_latency),
+                ..Behavior::default()
+            });
+            let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+            let stream = Stream::start_with(
+                &browser,
+                fake.id(),
+                Ok(settings()),
+                Renders::default().renderer(None),
+            );
+            assert!(wait_until(Duration::from_secs(2), || stream.status()
+                != Status::Connecting));
+            if audio_latency < latency_frames {
+                assert!(streaming(&stream), "{:?}", stream.status());
+                continue;
+            }
+            let Status::Unreachable(reason) = stream.status() else {
+                panic!("{audio_latency} frames: {:?}", stream.status())
+            };
+            assert!(reason.starts_with("fake: "), "{reason}");
+            assert!(
+                reason.contains(&format!("{audio_latency} frames")),
+                "{reason}"
+            );
+            assert_eq!(fake.methods().last().map(String::as_str), Some("TEARDOWN"));
+            assert!(fake.audio().is_empty());
+        }
     }
 
     #[test]
@@ -1026,6 +1195,46 @@ mod tests {
             "{reason}"
         );
         assert!(waited >= settings().lookup_window && waited < settings().lookup_window + PROMPT);
+    }
+
+    #[test]
+    fn a_receiver_waits_for_its_raop_service_within_the_lookup_window() {
+        let fake = Fake::start(Behavior::default());
+        let browser = Browser::offline();
+        fake.advertise_airplay(&browser);
+        let stream = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(settings()),
+            Renders::default().renderer(None),
+        );
+        thread::sleep(Duration::from_millis(100));
+        fake.advertise(&browser, SHAIRPORT_SYNC_RAOP);
+        assert!(
+            wait_until(Duration::from_secs(2), || streaming(&stream)),
+            "{:?}",
+            stream.status()
+        );
+
+        let browser = Browser::offline();
+        fake.advertise_airplay(&browser);
+        let stream = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(settings()),
+            Renders::default().renderer(None),
+        );
+        thread::sleep(settings().lookup_window / 2);
+        assert_eq!(stream.status(), Status::Connecting);
+        assert!(wait_until(Duration::from_secs(1), || stream.status()
+            != Status::Connecting));
+        let Status::Unreachable(reason) = stream.status() else {
+            panic!("{:?}", stream.status())
+        };
+        assert!(
+            reason.starts_with("fake: it offers only AirPlay 2"),
+            "{reason}"
+        );
     }
 
     #[test]

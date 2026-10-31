@@ -126,17 +126,23 @@ impl Shared {
         self.changed.notify_all();
     }
 
-    /// Claude: waits up to `window` for the receiver to be found and resolved;
-    /// `Ok(None)` means it was not found in time, or `abort` turned true.
+    /// Claude: waits up to `window` for the receiver to be found and resolved
+    /// as `usable`, since its services resolve one at a time. When the window
+    /// ends it returns the receiver as it stands, if found at all.
     pub(crate) fn find(
         &self,
         id: &ReceiverId,
         window: Duration,
+        usable: impl Fn(&Receiver) -> bool,
         abort: &dyn Fn() -> bool,
     ) -> Result<Option<Receiver>, String> {
         let deadline = Instant::now() + window;
-        let found = |state: &State, _| state.registry.receivers().into_iter().find(|r| r.id == *id);
-        self.wait_for(found, |_| deadline, abort)
+        let receiver = |state: &State| state.registry.receivers().into_iter().find(|r| r.id == *id);
+        let ready = |state: &State, _| receiver(state).filter(&usable);
+        match self.wait_for(ready, |_| deadline, abort)? {
+            Some(found) => Ok(Some(found)),
+            None => Ok(receiver(&self.lock())),
+        }
     }
 
     /// Claude: waits until `found` finds something, browsing fails, the deadline
@@ -466,8 +472,8 @@ mod tests {
 
     #[test]
     fn the_browser_reports_receivers_found_after_its_warm_up() {
-        let browser = Browser::offline();
         let started = Instant::now();
+        let browser = Browser::offline();
         assert_eq!(browser.receivers(), Ok(vec![]));
         assert!(started.elapsed() >= WARM_UP);
 
@@ -482,7 +488,7 @@ mod tests {
         });
         let found = browser
             .shared()
-            .find(&id, Duration::from_secs(2), &|| false)
+            .find(&id, Duration::from_secs(2), |_| true, &|| false)
             .unwrap();
         assert_eq!(found.map(|r| r.id), Some(id.clone()));
         late.join().unwrap();
@@ -492,7 +498,7 @@ mod tests {
         assert_eq!(
             browser
                 .shared()
-                .find(&other, Duration::from_millis(50), &|| false),
+                .find(&other, Duration::from_millis(50), |_| true, &|| false),
             Ok(None)
         );
 
@@ -506,7 +512,7 @@ mod tests {
         assert!(
             browser
                 .shared()
-                .find(&id, Duration::from_millis(50), &|| false)
+                .find(&id, Duration::from_millis(50), |_| true, &|| false)
                 .is_err()
         );
         browser.shared().restart();
