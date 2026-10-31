@@ -44,7 +44,7 @@ spaghetti route 1 'airplay://Living Room' --delay 2500
 spaghetti route 1 BuiltInSpeakerDevice --delay 2500
 ```
 
-`airplay` lists the receivers on the local network and whether spaghetti can play to each. Spaghetti sends uncompressed ALAC over AirPlay 1 (RAOP). A receiver that requires a password or pairing, or offers only AirPlay 2, is listed with the reason it is unsupported. `airplay://` takes a receiver's name or its ID. A receiver takes one route at a time. The route's volume scales the audio; the receiver's own volume is left as it is. SRT sources cannot play to AirPlay receivers.
+`airplay` lists the receivers on the local network and whether spaghetti can play to each. Spaghetti sends uncompressed ALAC over AirPlay 2 to receivers that pair without a PIN, and over AirPlay 1 (RAOP) to the rest. A receiver that requires a password or a PIN is listed with the reason it is unsupported. `airplay://` takes a receiver's name or its ID. A receiver takes one route at a time. The route's volume scales the audio; the receiver's own volume is left as it is. SRT sources cannot play to AirPlay receivers.
 
 Send a source to another machine over SRT, and play what it receives. `srt://:PORT` listens, `srt://HOST:PORT` calls; one side of a link listens and the other calls:
 

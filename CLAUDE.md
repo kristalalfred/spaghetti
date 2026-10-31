@@ -6,7 +6,7 @@ macOS audio routing tool. Routes a source (a tapped app, or a stream received ov
 
 - **`crates/asp-driver/`** — user-space Core Audio HAL plugin. Registers a virtual output device (`SpaghettiDevice_UID`) the system can target. Info.plist configures the bundle.
 - **`crates/engine/`** (`spaghetti-engine`) — the audio engine as a library: the routing graph (`Router`), app and device listing, the virtual device registry (`DeviceManager`) and the driver's activity reader. A program can embed it instead of talking to the daemon, and bring its own audio I/O as program inputs and outputs. It builds for macOS and iOS; on iOS there is no Core Audio HAL, so taps, device buses and device outputs are refused.
-- **`crates/airplay/`** (`airplay`) — AirPlay sender as a library with no dependency on the other crates. `Browser` finds receivers through mDNSResponder; `Stream` plays to one over AirPlay 1 (RAOP) and asks its renderer for each packet `LATENCY`, 2 s, before the packet plays.
+- **`crates/airplay/`** (`airplay`) — AirPlay sender as a library with no dependency on the other crates. `Browser` finds receivers through mDNSResponder; `Stream` plays to one over AirPlay 2 (transient pairing, an encrypted session, sealed realtime audio, NTP timing) when the receiver pairs transiently, otherwise over AirPlay 1 (RAOP), and asks its renderer for each packet `LATENCY`, 2 s, before the packet plays.
 - **`crates/daemon/`** (`spaghettid`) — long-running process. Owns an engine, source and route lifecycles, and an IPC control socket. Managed as a macOS LaunchAgent (`com.spaghetti.daemon`).
 - **`crates/cli/`** (`spaghetti`) — user-facing CLI. `spaghetti tap <app>`, `spaghetti receive srt://...`, `spaghetti route <source_id> <device_uid|airplay://...|srt://...>`, `spaghetti airplay`, `spaghetti daemon install/restart/logs`, etc. WebRTC peers come only from a signaling controller over IPC, such as `weave-adapter-spaghetti`; the CLI lists them but cannot create them.
 - **`crates/common/`** — IPC protocol definitions (`ipc_protocol.rs`) and shared types.
@@ -79,7 +79,8 @@ WebRTC destination: the route's ring → encoder thread (every 5 ms, 960-frame c
 
 AirPlay destination: the route's ring → Playout on a schedule at 44.1 kHz, rendered on the
   stream's pacing thread for each 352-frame packet LATENCY (2 s) before its play time
-  → uncompressed ALAC in RTP over UDP. Sync packets map RTP time to the stream's NTP clock,
+  → uncompressed ALAC in RTP over UDP, sealed with ChaCha20-Poly1305 over AirPlay 2. Sync packets
+  map RTP time to the stream's NTP clock,
   the host's monotonic clock, so each packet plays at the time its render was given; timing
   replies run on their own thread; lost packets are resent from a backlog. Removing the route
   fades it, then `finish` lets the receiver play out what it holds before TEARDOWN
@@ -126,8 +127,9 @@ Key files:
 - `crates/engine/src/sinks.rs` + `rt_slots.rs` — `Sinks`, the rings a source feeds, held in `RtSlots`, the lock-free handoff that lets routes join and leave a running capture.
 - `crates/engine/bridge/tap_bridge.m` + `.h` — ObjC bridge for `AudioHardwareCreateProcessTap`, retargeting taps, and aggregate device creation. Compiled by `build.rs`.
 - `crates/engine/src/airplay_sender.rs` — `AirPlayOutput`: a route's `airplay::Stream` and the renderer that plays the route's ring through `Playout` into each packet.
-- `crates/airplay/src/stream.rs` — `Stream` and `Finishing`: the RAOP session thread (pacing, sync packets, resends, keep-alive, play-out and TEARDOWN) and the timing responder. `raop.rs` holds the handshake, `rtsp.rs` the RTSP client, `packet.rs` the RTP, ALAC and control packet layouts, `clock.rs` the NTP clock and packet timeline.
-- `crates/airplay/src/browse.rs` + `dns_sd.rs` + `receiver.rs` — `Browser`, the dns_sd FFI that browses `_raop._tcp` and `_airplay._tcp`, and `Receiver`, `ReceiverId` and the rules for which receivers a stream supports. `turns.rs` makes streams to one receiver take turns.
+- `crates/airplay/src/stream.rs` — `Stream` and `Finishing`: the session thread (connecting with a fallback from AirPlay 2 to AirPlay 1, pacing, sync packets, resends, keep-alive, play-out and TEARDOWN) and the timing responder. `session.rs` holds what both protocols share, `raop.rs` the AirPlay 1 handshake, `airplay2.rs` the AirPlay 2 handshake, `pairing.rs` + `srp.rs` + `tlv8.rs` + `hap.rs` transient pairing and the encrypted channel, `events.rs` the event connection, `rtsp.rs` the RTSP client, `packet.rs` the RTP, ALAC and control packet layouts, `clock.rs` the NTP clock and packet timeline.
+- `crates/airplay/src/fake.rs` + `fake/` — a fake receiver speaking both protocols, for the crate's session tests.
+- `crates/airplay/src/browse.rs` + `dns_sd.rs` + `receiver.rs` — `Browser`, the dns_sd FFI that browses `_raop._tcp` and `_airplay._tcp`, and `Receiver`, `ReceiverId` and the rule for which protocol a stream speaks to each receiver (`Receiver::protocol`). `turns.rs` makes streams to one receiver take turns.
 - `crates/engine/src/srt.rs` — `SrtLink`, one SRT connection that reconnects when it drops, with its `FlowStatus`.
 - `crates/engine/src/srt_receiver.rs` + `srt_sender.rs` — `SrtSource` (decode thread) and `SrtOutput` (encode thread).
 - `crates/engine/src/webrtc.rs` — `PeerLink`, one str0m peer connection run by a tokio task on UDP sockets of its own, one per IPv4 interface that is up and each a host candidate, the default route's first (another interface's when there is none): STUN and TURN allocation on that first socket before the SDP (one 2 s bound), the offer or answer exchanged whole through `SetRemoteDescription` and `local_description`, transmits from a relayed address sent through TURN, its status (including whether recent datagrams came through a relay), and close on drop.
@@ -195,7 +197,7 @@ Real-time paths emit first-fire diagnostics that are invaluable for debugging fo
 - `render callback first fire` — output ABL layout and the ring fill at the first render.
 - `route playout health` (debug, every 10 s) — each route's smoothed ring fill against its target, its source's delivery span (`delivery_ms`), the controller's ratio correction in ppm, and glitch counters.
 - `route playout glitched since the last report` (info) — underruns, re-primes to a grown span, resyncs, ring overflows and ring discontinuities since the previous report, and the span and target at the latest of them (`glitch_delivery_ms`, `glitch_target_ms`).
-- `AirPlay stream started` (info) — a receiver accepted a stream, with its Audio-Latency. `AirPlay stream lost` / `AirPlay receiver unreachable` (warn) — why a stream ended or never started. `RTSP request` / `RTSP response` (debug, `RUST_LOG=airplay=debug`) — the full RTSP exchange.
+- `AirPlay stream started` (info) — a receiver accepted a stream, with the protocol, the timing protocol and its Audio-Latency, reported or assumed. `AirPlay stream lost` / `AirPlay receiver unreachable` (warn) — why a stream ended or never started. `RTSP request` / `RTSP response` (debug, `RUST_LOG=airplay=debug`) — the full RTSP exchange.
 - `route AirPlay health` (debug, every 10 s) — an AirPlay route's packets sent and resent.
 - `SRT connected` / `SRT sender disconnected` / `SRT receiver disconnected` (info) — each SRT link's peer coming and going.
 - `SRT stream format` (info) — the AAC rate and channels of a received stream, logged when they change.
