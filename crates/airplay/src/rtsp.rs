@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use tracing::debug;
 
+use crate::hap;
+
 const MAX_HEAD: usize = 64 * 1024;
 const MAX_BODY: usize = 1024 * 1024;
 const ABORT_CHECK: Duration = Duration::from_millis(50);
@@ -128,6 +130,7 @@ pub(crate) struct Connection {
     received: Vec<u8>,
     cseq: u32,
     common: Vec<(&'static str, String)>,
+    channel: Option<hap::Channel>,
 }
 
 impl Connection {
@@ -153,6 +156,7 @@ impl Connection {
                         received: Vec::new(),
                         cseq: 0,
                         common,
+                        channel: None,
                     });
                 }
                 Err(e) if e.kind() == ErrorKind::Interrupted => return Err(OpenError::Stopped),
@@ -193,11 +197,20 @@ impl Connection {
         self.stream.as_raw_fd()
     }
 
+    /// Claude: from now on, every request is sealed and every response opened
+    /// with `keys`, as an AirPlay 2 receiver expects once paired.
+    pub(crate) fn encrypt(&mut self, keys: &hap::Keys) {
+        self.channel = Some(hap::Channel::new(keys));
+    }
+
     /// Claude: sends a request and returns its CSeq.
     pub(crate) fn send(&mut self, request: &Request) -> Result<u32, String> {
         self.cseq += 1;
-        let bytes = encode_request(request, self.cseq, &self.common);
-        debug!(peer = %self.peer, request = %printable(&bytes), "RTSP request");
+        let mut bytes = encode_request(request, self.cseq, &self.common);
+        debug!(peer = %self.peer, request = %described(&bytes), "RTSP request");
+        if let Some(channel) = &mut self.channel {
+            bytes = channel.seal(&bytes);
+        }
         self.stream
             .write_all(&bytes)
             .map_err(|e| format!("could not send {} ({e})", request.method))?;
@@ -255,10 +268,15 @@ impl Connection {
             Ok(0) => Err(ReadError::Failed(
                 "the receiver closed the RTSP connection".into(),
             )),
-            Ok(n) => {
-                self.received.extend_from_slice(&chunk[..n]);
-                Ok(())
-            }
+            Ok(n) => match &mut self.channel {
+                Some(channel) => channel
+                    .open(&chunk[..n], &mut self.received)
+                    .map_err(|e| ReadError::Failed(format!("the RTSP connection failed ({e})"))),
+                None => {
+                    self.received.extend_from_slice(&chunk[..n]);
+                    Ok(())
+                }
+            },
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 Err(ReadError::TimedOut)
             }
@@ -273,7 +291,7 @@ impl Connection {
         let Some((response, len)) = decode_response(&self.received)? else {
             return Ok(None);
         };
-        debug!(peer = %self.peer, response = %printable(&self.received[..len]), "RTSP response");
+        debug!(peer = %self.peer, response = %described(&self.received[..len]), "RTSP response");
         self.received.drain(..len);
         Ok(Some(response))
     }
@@ -335,20 +353,81 @@ pub(crate) enum ReadError {
     Failed(String),
 }
 
-fn printable(message: &[u8]) -> String {
+pub(crate) const PLIST: &str = "application/x-apple-binary-plist";
+
+/// Claude: a message as the debug log shows it: its head, and its body only as
+/// far as it holds no secret. Text bodies print whole, binary plists print with
+/// every data value as its length, since they carry keys such as `shk`, and
+/// any other body, such as pairing's SRP values and proofs, prints as its
+/// length.
+pub(crate) fn described(message: &[u8]) -> String {
     let head_len = message
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map_or(message.len(), |p| p + 4);
     let (head, body) = message.split_at(head_len);
     let mut text = String::from_utf8_lossy(head).into_owned();
-    match std::str::from_utf8(body) {
-        Ok(body) => text.push_str(body),
-        Err(_) => body.iter().for_each(|b| {
-            let _ = write!(text, "{b:02x}");
-        }),
+    if body.is_empty() {
+        return text;
+    }
+    let content_type = text
+        .split("\r\n")
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("Content-Type"))
+        .map(|(_, value)| value.trim().to_ascii_lowercase());
+    match content_type.as_deref() {
+        Some(t) if t.starts_with("text/") || t == "application/sdp" => {
+            text.push_str(&String::from_utf8_lossy(body));
+        }
+        Some(PLIST) => match plist::Value::from_reader(io::Cursor::new(body)) {
+            Ok(value) => redacted(&value, &mut text),
+            Err(_) => {
+                let _ = write!(text, "<{} bytes that are not a plist>", body.len());
+            }
+        },
+        _ => {
+            let _ = write!(text, "<{} bytes>", body.len());
+        }
     }
     text
+}
+
+fn redacted(value: &plist::Value, out: &mut String) {
+    use plist::Value;
+    match value {
+        Value::Dictionary(entries) => {
+            out.push('{');
+            for (i, (key, value)) in entries.iter().enumerate() {
+                let _ = write!(out, "{}{key}: ", if i == 0 { "" } else { ", " });
+                redacted(value, out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (i, value) in items.iter().enumerate() {
+                out.push_str(if i == 0 { "" } else { ", " });
+                redacted(value, out);
+            }
+            out.push(']');
+        }
+        Value::Data(data) => {
+            let _ = write!(out, "<{} bytes>", data.len());
+        }
+        Value::String(string) => {
+            let _ = write!(out, "{string:?}");
+        }
+        Value::Integer(integer) => {
+            let _ = write!(out, "{integer}");
+        }
+        Value::Real(real) => {
+            let _ = write!(out, "{real}");
+        }
+        Value::Boolean(boolean) => {
+            let _ = write!(out, "{boolean}");
+        }
+        _ => out.push_str("<other>"),
+    }
 }
 
 #[cfg(test)]
@@ -429,10 +508,109 @@ mod tests {
     }
 
     #[test]
-    fn binary_bodies_print_as_hex() {
+    fn an_encrypted_connection_seals_requests_and_opens_split_and_coalesced_responses() {
+        use crate::hap::tests::{reversed, test_keys};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let keys = test_keys();
+        let server_keys = reversed(&keys);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut channel = hap::Channel::new(&server_keys);
+            let (mut wire, mut plaintext) = (Vec::new(), Vec::new());
+            let mut requests = 0;
+            while requests < 2 {
+                let mut chunk = [0u8; 4096];
+                let n = stream.read(&mut chunk).unwrap();
+                wire.extend_from_slice(&chunk[..n]);
+                channel.open(&chunk[..n], &mut plaintext).unwrap();
+                requests = plaintext.windows(4).filter(|w| w == b"\r\n\r\n").count();
+            }
+            let first = channel.seal(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n");
+            for byte in &first {
+                stream.write_all(&[*byte]).unwrap();
+                stream.flush().unwrap();
+            }
+            let body = vec![b'x'; 1500];
+            let mut second = format!(
+                "RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            second.extend_from_slice(&body);
+            let unrelated = b"RTSP/1.0 200 OK\r\nCSeq: 9\r\nContent-Length: 0\r\n\r\n";
+            let coalesced = [channel.seal(unrelated), channel.seal(&second)].concat();
+            stream.write_all(&coalesced).unwrap();
+            (wire, String::from_utf8(plaintext).unwrap())
+        });
+
+        let mut connection =
+            Connection::open(&[address], Duration::from_secs(1), vec![], &|| false)
+                .map_err(|e| e.to_string())
+                .unwrap();
+        connection.encrypt(&keys);
+        let request = |method| Request {
+            method,
+            uri: "*",
+            headers: vec![("X-Apple-HKP", "4".into())],
+            body: Some(("application/octet-stream", &[7u8; 1100][..])),
+        };
+        connection.send(&request("OPTIONS")).unwrap();
+        let response = connection
+            .exchange(&request("POST"), Duration::from_secs(2), &|| false)
+            .unwrap();
+        assert_eq!((response.cseq(), response.body.len()), (Some(2), 1500));
+        let (wire, plaintext) = server.join().unwrap();
+        assert!(plaintext.starts_with("OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nX-Apple-HKP: 4\r\n"));
+        assert!(plaintext.contains("POST * RTSP/1.0\r\nCSeq: 2\r\n"));
+        assert!(!wire.windows(4).any(|w| w == b"RTSP" || w == b"CSeq"));
+        assert_eq!(wire.len(), plaintext.len() + 18 * 4);
+    }
+
+    #[test]
+    fn the_log_shows_no_secret_bodies() {
         assert_eq!(
-            printable(b"POST /a RTSP/1.0\r\n\r\n\x01\xff"),
-            "POST /a RTSP/1.0\r\n\r\n01ff"
+            described(b"POST /pair-setup RTSP/1.0\r\nContent-Type: application/octet-stream\r\n\r\n\x06\x01\x03\x03\x02\xab\xcd"),
+            "POST /pair-setup RTSP/1.0\r\nContent-Type: application/octet-stream\r\n\r\n<7 bytes>"
+        );
+        assert_eq!(
+            described(b"RTSP/1.0 200 OK\r\n\r\n\x01\xff"),
+            "RTSP/1.0 200 OK\r\n\r\n<2 bytes>"
+        );
+        let shk = [0x5A; 32];
+        let mut stream = plist::Dictionary::new();
+        stream.insert("shk".into(), plist::Value::Data(shk.to_vec()));
+        stream.insert("type".into(), 96.into());
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "streams".into(),
+            vec![plist::Value::Dictionary(stream)].into(),
+        );
+        setup.insert("timingProtocol".into(), "NTP".into());
+        setup.insert("isMedia".into(), true.into());
+        let mut body = Vec::new();
+        plist::Value::Dictionary(setup)
+            .to_writer_binary(&mut body)
+            .unwrap();
+        let message = [
+            format!("SETUP rtsp://a/1 RTSP/1.0\r\nContent-Type: {PLIST}\r\n\r\n").as_bytes(),
+            &body,
+        ]
+        .concat();
+        let text = described(&message);
+        assert!(
+            text.ends_with(
+                "{streams: [{shk: <32 bytes>, type: 96}], timingProtocol: \"NTP\", isMedia: true}"
+            ),
+            "{text}"
+        );
+        let hex: String = shk.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(!text.to_ascii_lowercase().contains(&hex) && !text.contains('Z'));
+        assert!(
+            described(b"ANNOUNCE x RTSP/1.0\r\nContent-Type: application/sdp\r\n\r\nv=0\r\n")
+                .ends_with("v=0\r\n")
         );
     }
 }
