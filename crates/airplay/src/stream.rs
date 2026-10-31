@@ -15,7 +15,7 @@ use crate::browse;
 use crate::clock::{self, Clock, PACKET_DURATION, Timeline};
 use crate::packet::{self, AUDIO_PACKET_LEN, AudioHeader, RETRANSMISSION_LEN, Sync};
 use crate::raop::{self, Offer, Session};
-use crate::rtsp::{Connection, ReadError, Request};
+use crate::rtsp::{Connection, OpenError, ReadError, Request};
 use crate::turns::Turn;
 use crate::{Browser, Counters, FRAMES_PER_PACKET, LATENCY, Receiver, ReceiverId, Render, Status};
 
@@ -25,11 +25,14 @@ const POLL_SLICE: Duration = Duration::from_millis(20);
 /// Claude: a packet is sent only if it can reach the receiver this long before
 /// it plays.
 const MIN_LEAD: Duration = Duration::from_millis(5);
+const WAKE_RETRY: Duration = Duration::from_millis(500);
 
 /// Claude: a session playing to one receiver. It connects in the background:
 /// it waits a bounded time for the browser to find the receiver, then for any
 /// earlier stream through the same browser to that receiver to finish, then
-/// calls `render` for each packet `LATENCY` before the packet's play time.
+/// connects, retrying for a bounded time while the receiver wakes from
+/// standby, then calls `render` for each packet `LATENCY` before the packet's
+/// play time.
 /// Dropping it tears the session down at once; `finish` lets the receiver play
 /// what it holds first.
 pub struct Stream {
@@ -208,6 +211,7 @@ pub(crate) struct Settings {
     pub(crate) first_seq: u16,
     pub(crate) first_rtp: u32,
     pub(crate) connect_timeout: Duration,
+    pub(crate) wake_window: Duration,
     pub(crate) answer_timeout: Duration,
     pub(crate) teardown_timeout: Duration,
     pub(crate) timing_silence: Duration,
@@ -226,6 +230,7 @@ impl Settings {
             first_seq: getrandom::u32().map_err(random)? as u16,
             first_rtp: getrandom::u32().map_err(random)?,
             connect_timeout: Duration::from_secs(2),
+            wake_window: Duration::from_secs(15),
             answer_timeout: Duration::from_secs(4),
             teardown_timeout: Duration::from_secs(1),
             timing_silence: Duration::from_secs(15),
@@ -308,11 +313,15 @@ fn connect<'a, R>(
             getrandom::u32().map_err(|e| e.to_string())?.to_string(),
         ),
     ];
-    if abort() {
-        return Err("stopped".into());
-    }
-    let connection = Connection::open(&service.addresses, settings.connect_timeout, common, &abort)
-        .map_err(|reason| format!("{name}: {reason}"))?;
+    let connection = open(
+        browser,
+        receiver,
+        service.addresses.clone(),
+        &settings,
+        common,
+        &abort,
+    )
+    .map_err(|reason| format!("{name}: {reason}"))?;
     let bind = || {
         let any = match connection.local_addr() {
             SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
@@ -388,6 +397,61 @@ fn connect<'a, R>(
         counters: Counters::default(),
         late_packets: 0,
     })
+}
+
+/// Claude: connects to the receiver, trying again for `wake_window` while it
+/// fails as one waking from standby does. Each try goes to the addresses
+/// browsing knows by then, since a waking receiver may come back on others.
+fn open(
+    browser: &browse::Shared,
+    receiver: &ReceiverId,
+    mut addresses: Vec<SocketAddr>,
+    settings: &Settings,
+    common: Vec<(&'static str, String)>,
+    abort: &dyn Fn() -> bool,
+) -> Result<Connection, String> {
+    let deadline = Instant::now() + settings.wake_window;
+    let mut tries = 0u32;
+    loop {
+        if abort() {
+            return Err("stopped".into());
+        }
+        let tried_at = Instant::now();
+        let reason =
+            match Connection::open(&addresses, settings.connect_timeout, common.clone(), abort) {
+                Ok(connection) => return Ok(connection),
+                Err(OpenError::Transient(reason)) if Instant::now() < deadline => reason,
+                Err(error) => return Err(error.to_string()),
+            };
+        tries += 1;
+        if tries == 1 {
+            info!(%receiver, %reason, "AirPlay receiver not answering; trying again while it wakes");
+        } else {
+            debug!(%receiver, %reason, tries, "AirPlay receiver still not answering");
+        }
+        if !pause_until((tried_at + WAKE_RETRY).min(deadline), abort) {
+            return Err("stopped".into());
+        }
+        if let Some(found) = browser.receiver(receiver)
+            && let Ok(service) = found.stream_service()
+        {
+            addresses = service.addresses.clone();
+        }
+    }
+}
+
+/// Claude: false when `abort` turned true first.
+fn pause_until(until: Instant, abort: &dyn Fn() -> bool) -> bool {
+    loop {
+        if abort() {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= until {
+            return true;
+        }
+        thread::sleep((until - now).min(POLL_SLICE));
+    }
 }
 
 /// Claude: a session from its RECORD on: it renders and sends each packet on

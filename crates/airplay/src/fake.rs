@@ -1,5 +1,6 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -70,6 +71,7 @@ impl FakeRequest {
 /// a stream sends it and answers as `Behavior` says.
 pub(crate) struct Fake {
     address: SocketAddr,
+    listener: TcpListener,
     seen: Arc<Mutex<Vec<Seen>>>,
     client: Arc<Mutex<Option<(u16, u16)>>>,
     control: UdpSocket,
@@ -80,8 +82,16 @@ pub(crate) struct Fake {
 
 impl Fake {
     pub(crate) fn start(behavior: Behavior) -> Fake {
+        let fake = Fake::asleep(behavior);
+        fake.wake();
+        fake
+    }
+
+    /// Claude: a receiver whose RTSP port answers no connection until `wake`,
+    /// as a speaker's does in standby.
+    pub(crate) fn asleep(behavior: Behavior) -> Fake {
         let localhost = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-        let listener = TcpListener::bind(localhost).unwrap();
+        let listener = bound_without_listening();
         listener.set_nonblocking(true).unwrap();
         let audio = UdpSocket::bind(localhost).unwrap();
         let control = UdpSocket::bind(localhost).unwrap();
@@ -98,6 +108,7 @@ impl Fake {
         );
         let fake = Fake {
             address: listener.local_addr().unwrap(),
+            listener: listener.try_clone().unwrap(),
             seen: Arc::default(),
             client: Arc::default(),
             control: control.try_clone().unwrap(),
@@ -149,6 +160,10 @@ impl Fake {
             }
         });
         fake
+    }
+
+    pub(crate) fn wake(&self) {
+        assert_eq!(unsafe { libc::listen(self.listener.as_raw_fd(), 16) }, 0);
     }
 
     pub(crate) fn id(&self) -> ReceiverId {
@@ -315,6 +330,29 @@ impl Drop for Fake {
         self.stop.store(true, Ordering::Release);
         self.close_connections();
     }
+}
+
+/// Claude: a TCP socket bound to a localhost port but not listening on it.
+/// macOS answers no connection to the port, and no other socket can take it.
+fn bound_without_listening() -> TcpListener {
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    assert!(fd >= 0);
+    let socket = unsafe { TcpListener::from_raw_fd(fd) };
+    let address = libc::sockaddr_in {
+        sin_len: size_of::<libc::sockaddr_in>() as u8,
+        sin_family: libc::AF_INET as u8,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from(Ipv4Addr::LOCALHOST).to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    let len = size_of_val(&address) as libc::socklen_t;
+    assert_eq!(
+        unsafe { libc::bind(fd, (&raw const address).cast(), len) },
+        0
+    );
+    socket
 }
 
 fn serve(
@@ -568,6 +606,7 @@ mod tests {
             latency: LATENCY,
             lookup_window: Duration::from_millis(500),
             connect_timeout: Duration::from_secs(1),
+            wake_window: Duration::from_secs(1),
             answer_timeout: Duration::from_secs(1),
             teardown_timeout: Duration::from_millis(300),
             ..Settings::new().unwrap()
@@ -1442,6 +1481,46 @@ mod tests {
                 .all(|(_, connection, _)| *connection == 0),
             "a cancelled stream connected"
         );
+
+        let asleep = Fake::asleep(Behavior::default());
+        let browser = asleep.browser(SHAIRPORT_SYNC_RAOP);
+        let waking = |connect_timeout| Settings {
+            connect_timeout,
+            wake_window: Duration::from_secs(10),
+            ..settings()
+        };
+        let between_attempts = waking(Duration::from_millis(100));
+        let stream = Stream::start_with(
+            &browser,
+            asleep.id(),
+            Ok(between_attempts),
+            Renders::default().renderer(None),
+        );
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(stream.status(), Status::Connecting);
+        let started = Instant::now();
+        stream.finish().wait();
+        assert!(
+            started.elapsed() < PROMPT,
+            "retries cancelled after {:?}",
+            started.elapsed()
+        );
+        let during_an_attempt = waking(Duration::from_secs(1));
+        let stream = Stream::start_with(
+            &browser,
+            asleep.id(),
+            Ok(during_an_attempt),
+            Renders::default().renderer(None),
+        );
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(stream.status(), Status::Connecting);
+        drop(stream);
+        asleep.wake();
+        thread::sleep(Duration::from_millis(700));
+        assert!(
+            asleep.requests().is_empty(),
+            "a dropped stream kept retrying"
+        );
     }
 
     #[test]
@@ -1517,7 +1596,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_or_unreachable_receivers_say_why() {
+    fn unsupported_receivers_say_why_without_being_contacted() {
         let fake = Fake::start(Behavior::default());
         let browser = fake.browser("cn=0,1 et=1 tp=UDP");
         let stream = Stream::start_with(
@@ -1533,48 +1612,112 @@ mod tests {
             Status::Unreachable("fake: it accepts only encrypted audio (et=1)".into())
         );
         assert!(fake.requests().is_empty());
+    }
 
-        let closed_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let browser = Browser::offline();
-        let key = InstanceKey {
-            kind: Kind::Raop,
-            name: INSTANCE.into(),
-            interface: 1,
+    #[test]
+    fn a_receiver_waking_from_standby_is_reached_once_it_answers() {
+        let fake = Fake::asleep(Behavior::default());
+        let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+        let waking = Settings {
+            connect_timeout: Duration::from_millis(100),
+            wake_window: Duration::from_secs(3),
+            ..settings()
         };
-        browser.shared().apply([
-            Event::Resolved {
-                key: key.clone(),
-                host: "gone.local.".into(),
-                port: closed_port,
-                txt: txt(SHAIRPORT_SYNC_RAOP),
-            },
-            Event::AddressAdded {
-                key,
-                address: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                scope: 0,
-            },
-        ]);
         let stream = Stream::start_with(
             &browser,
-            ID.parse().unwrap(),
-            Ok(settings()),
+            fake.id(),
+            Ok(waking),
             Renders::default().renderer(None),
         );
-        assert!(wait_until(Duration::from_secs(2), || stream.status()
+        thread::sleep(Duration::from_millis(700));
+        assert_eq!(stream.status(), Status::Connecting);
+        let woke_at = Instant::now();
+        fake.wake();
+        assert!(
+            wait_until(Duration::from_secs(2), || streaming(&stream)),
+            "{:?}",
+            stream.status()
+        );
+        let (connected_at, _, _) = fake.requests()[0].clone();
+        assert!(connected_at - woke_at < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_receiver_that_stays_asleep_is_unreachable_after_the_wake_window_with_its_last_error() {
+        let first = Fake::asleep(Behavior::default());
+        let browser = first.browser(SHAIRPORT_SYNC_RAOP);
+        let started = Instant::now();
+        let asleep = Settings {
+            connect_timeout: Duration::from_millis(100),
+            ..settings()
+        };
+        let (window, connect_timeout) = (asleep.wake_window, asleep.connect_timeout);
+        let stream = Stream::start_with(
+            &browser,
+            first.id(),
+            Ok(asleep),
+            Renders::default().renderer(None),
+        );
+        thread::sleep(Duration::from_millis(300));
+        let moved = Fake::asleep(Behavior::default());
+        moved.advertise(&browser, SHAIRPORT_SYNC_RAOP);
+        assert!(wait_until(window + Duration::from_secs(1), || stream
+            .status()
             != Status::Connecting));
+        let waited = started.elapsed();
         let Status::Unreachable(reason) = stream.status() else {
             panic!("{:?}", stream.status())
         };
         assert!(
-            reason.starts_with(&format!(
-                "fake: could not connect to 127.0.0.1:{closed_port}"
-            )),
+            reason
+                == format!(
+                    "fake: could not connect to {} (connection timed out)",
+                    moved.address
+                ),
             "{reason}"
         );
+        assert!(
+            waited >= window && waited < window + connect_timeout + PROMPT,
+            "unreachable after {waited:?}"
+        );
+
+        let refusing = Fake::start(Behavior {
+            auth_setup_required: true,
+            ..Behavior::default()
+        });
+        let browser = refusing.browser(SHAIRPORT_SYNC_RAOP);
+        let started = Instant::now();
+        let stream = Stream::start_with(
+            &browser,
+            refusing.id(),
+            Ok(Settings {
+                wake_window: Duration::from_secs(10),
+                ..settings()
+            }),
+            Renders::default().renderer(None),
+        );
+        assert!(wait_until(Duration::from_secs(2), || stream.status()
+            != Status::Connecting));
+        assert!(
+            started.elapsed() < PROMPT,
+            "a refused handshake took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            stream.status(),
+            Status::Unreachable("fake: it refused ANNOUNCE with 403 Forbidden".into())
+        );
+        thread::sleep(Duration::from_millis(600));
+        assert!(
+            fake_connections(&refusing) == [0],
+            "a refused handshake was retried"
+        );
+    }
+
+    fn fake_connections(fake: &Fake) -> Vec<usize> {
+        let mut connections: Vec<usize> = fake.requests().iter().map(|(_, c, _)| *c).collect();
+        connections.dedup();
+        connections
     }
 
     #[test]

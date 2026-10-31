@@ -137,12 +137,16 @@ impl Shared {
         abort: &dyn Fn() -> bool,
     ) -> Result<Option<Receiver>, String> {
         let deadline = Instant::now() + window;
-        let receiver = |state: &State| state.registry.receivers().into_iter().find(|r| r.id == *id);
-        let ready = |state: &State, _| receiver(state).filter(&usable);
+        let ready = |state: &State, _| state.registry.receiver(id).filter(&usable);
         match self.wait_for(ready, |_| deadline, abort)? {
             Some(found) => Ok(Some(found)),
-            None => Ok(receiver(&self.lock())),
+            None => Ok(self.receiver(id)),
         }
+    }
+
+    /// Claude: the receiver as browsing knows it now, if it does.
+    pub(crate) fn receiver(&self, id: &ReceiverId) -> Option<Receiver> {
+        self.lock().registry.receiver(id)
     }
 
     /// Claude: waits until `found` finds something, browsing fails, the deadline
@@ -280,6 +284,10 @@ impl Registry {
                 self.instances.remove(&key);
             }
         }
+    }
+
+    fn receiver(&self, id: &ReceiverId) -> Option<Receiver> {
+        self.receivers().into_iter().find(|r| r.id == *id)
     }
 
     pub(crate) fn receivers(&self) -> Vec<Receiver> {
