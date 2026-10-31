@@ -14,9 +14,10 @@ use crate::{FRAMES_PER_PACKET, SAMPLE_RATE};
 
 /// Claude: how often iOS, and so pyatv, posts `/feedback` to keep a session.
 pub(crate) const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
-/// Claude: the User-Agent OwnTone sends, whose AirPlay 2 sessions are this one:
-/// transient pairing, NTP timing, realtime ALAC.
-pub(crate) const USER_AGENT: &str = "AirPlay/381.13";
+/// Claude: HomePod OS 27 refuses `/info` to a sender whose User-Agent is not
+/// AirPlay's own; OwnTone sends this one since, and its users found it works
+/// with HomePods, an Apple TV and other receivers (owntone-server issue 2042).
+pub(crate) const USER_AGENT: &str = "AirPlay/999.0.0";
 pub(crate) const REALTIME: u64 = 96;
 /// Claude: ALAC, 44.1 kHz, 16-bit stereo, in AirPlay 2's audio format bits.
 const ALAC_44100_16_2: u64 = 0x40000;

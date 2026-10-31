@@ -61,8 +61,7 @@ impl Receiver {
 
     /// Claude: the protocol a stream speaks to it unless one is forced, or why
     /// no stream can play to it: AirPlay 2 when it pairs transiently and takes
-    /// AirPlay audio, since an AirPlay 2 receiver plays at the stream's
-    /// timeline itself, and AirPlay 1 otherwise.
+    /// AirPlay audio, and AirPlay 1 otherwise.
     pub fn protocol(&self) -> Result<Protocol, String> {
         let airplay2 = self.service(Protocol::AirPlay2);
         let airplay1 = self.service(Protocol::AirPlay1);
