@@ -142,7 +142,7 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
         }
         Request::CreateSource { source, tag } => {
             let mut st = lock_state(state);
-            match st.router.create_source(source, tag) {
+            match st.router.create_source(source.into(), tag) {
                 Ok(source_id) => Response::SourceCreated { source_id },
                 Err(message) => Response::Error { message },
             }
@@ -163,7 +163,13 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
         }
         Request::ListSources => {
             let st = lock_state(state);
-            Response::Sources(st.router.list_sources())
+            Response::Sources(
+                st.router
+                    .list_sources()
+                    .into_iter()
+                    .filter_map(|source| source.try_into().ok())
+                    .collect(),
+            )
         }
         Request::CreateRoute {
             source_id,
@@ -171,7 +177,10 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
             volume,
         } => {
             let mut st = lock_state(state);
-            match st.router.create_route(source_id, destination, volume) {
+            match st
+                .router
+                .create_route(source_id, destination.into(), volume)
+            {
                 Ok(route_id) => Response::RouteCreated { route_id },
                 Err(message) => Response::Error { message },
             }
@@ -185,7 +194,13 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
         }
         Request::ListRoutes => {
             let st = lock_state(state);
-            Response::Routes(st.router.list_routes())
+            Response::Routes(
+                st.router
+                    .list_routes()
+                    .into_iter()
+                    .filter_map(|route| route.try_into().ok())
+                    .collect(),
+            )
         }
         Request::SetVolume { route_id, volume } => {
             let mut st = lock_state(state);

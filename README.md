@@ -55,3 +55,48 @@ spaghetti unsource 1
 ```
 
 CLI help: `spaghetti --help`. [MIT license](LICENSE).
+
+## Embedding the engine
+
+The `spaghetti-engine` crate runs the routing graph in a program's own process, without the daemon. Besides taps, devices, SRT and WebRTC, a program can register its own audio I/O: named inputs it captures and outputs it plays from its own real-time callbacks. Sources and routes then name them like any other endpoint, and come and go while the callbacks keep running.
+
+```rust
+use std::time::Duration;
+
+use spaghetti_engine::{Destination, Frames, HostTime, Router, SourceSpec};
+
+fn example(captured: &[f32], left: &mut [f32], right: &mut [f32]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut router = Router::new();
+    let mut microphone = router.add_program_input("microphone", 48_000.0)?;
+    let mut speaker = router.add_program_output("speaker", 48_000.0, Duration::from_millis(10))?;
+
+    let source = router.create_source(SourceSpec::Program { input: "microphone".into() }, None)?;
+    let speaker_route = Destination::Program { output: "speaker".into(), delay_ms: Some(300) };
+    router.create_route(source, speaker_route, 1.0)?;
+
+    // In the capture callback, dated by when the buffer's first frame was captured:
+    microphone.push(Frames::mono(captured)?, HostTime::now());
+    // In the playback callback, dated by when its first frame will be heard:
+    speaker.render([left, right], HostTime::now() + Duration::from_millis(10))?;
+    Ok(())
+}
+```
+
+| Item | Contract |
+| --- | --- |
+| Clock | `HostTime` is `mach_absolute_time`, the clock of `AudioTimeStamp::mHostTime`. |
+| `ProgramInput::push` | Real-time safe. 32-bit float frames, mono (played on both channels at its own level), interleaved stereo or planar stereo, at the input's rate. `captured` is the host time the first frame was captured. Pushes of unbroken audio are dated their length apart. |
+| `ProgramOutput::render` | Real-time safe. Fills two planes at the output's rate with every route to the output, mixed and clamped to [-1, 1]. `heard` is the host time the first frame is heard, output latency included. |
+| Buffer size | At most `MAX_CALLBACK_FRAMES` (4096) frames per push or render. `Frames` refuses longer buffers, half-filled interleaved frames and planes of unequal length with a `BufferError`. `render` refuses unequal or longer planes and fills them with silence. |
+| Rates | Each input and output has its own rate. Every route resamples from its source's rate to its output's rate. |
+| Delay | With `delay_ms`, a route plays each frame that long after it was captured, as on a device. A delay is refused when the route would have to hold more audio than its 131072-frame buffer: the delay less the output's declared latency, at the source's rate. SRT sources do not date their frames and cannot play on a delay. |
+| Discontinuities | A push dated more than 1 ms off where the previous one ended, a push a route had no room for, and a push after `ProgramInput::discontinuity` each start a new run. A route drops what it still holds from before the new run and primes again. |
+| Several routes | One output mixes up to `MAX_PROGRAM_ROUTES` (8) routes. One input feeds up to 8 routes. |
+| Removal | `remove_program_input` destroys the sources made from the input. `remove_program_output` fades out and destroys the routes to the output. The real-time ends keep working: an input feeds nothing, an output renders silence. Drop them outside the real-time thread. |
+| State | `Router::list_routes` reports each device or program route's `Playback`: `Playing` when the output's latest render played the route's source at any volume, `Silent` while the route waits for audio or for its schedule or after a refused render, and `Stopped` when the output has not rendered for 100 ms plus 4096 frames at its rate. `list_sources` reports a program source as `Idle` without routes, then `Connected`, `Flowing` while the input pushes, and `Stalled` 3 s after it stops. |
+
+The engine also builds for iOS (`aarch64-apple-ios`, `aarch64-apple-ios-sim`). Those targets have no Core Audio HAL: process taps, device outputs and the virtual-device functions are unavailable, and a `SourceSpec::Tap` or `Destination::Device` is refused when it is created. Program I/O, SRT and WebRTC work as on macOS.
+
+```sh
+just check-ios
+```

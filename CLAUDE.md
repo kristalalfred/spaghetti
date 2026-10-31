@@ -5,7 +5,7 @@ macOS audio routing tool. Routes a source (a tapped app, or a stream received ov
 ## Crates
 
 - **`crates/asp-driver/`** — user-space Core Audio HAL plugin. Registers a virtual output device (`SpaghettiDevice_UID`) the system can target. Info.plist configures the bundle.
-- **`crates/engine/`** (`spaghetti-engine`) — the audio engine as a library: the routing graph (`Router`), app and device listing, the virtual device registry (`DeviceManager`) and the driver's activity reader. A program can embed it instead of talking to the daemon.
+- **`crates/engine/`** (`spaghetti-engine`) — the audio engine as a library: the routing graph (`Router`), app and device listing, the virtual device registry (`DeviceManager`) and the driver's activity reader. A program can embed it instead of talking to the daemon, and bring its own audio I/O as program inputs and outputs. It builds for macOS and iOS; on iOS there is no Core Audio HAL, so taps, device buses and device outputs are refused.
 - **`crates/daemon/`** (`spaghettid`) — long-running process. Owns an engine, source and route lifecycles, and an IPC control socket. Managed as a macOS LaunchAgent (`com.spaghetti.daemon`).
 - **`crates/cli/`** (`spaghetti`) — user-facing CLI. `spaghetti tap <app>`, `spaghetti receive srt://...`, `spaghetti route <source_id> <device_uid|srt://...>`, `spaghetti daemon install/restart/logs`, etc. WebRTC peers come only from a signaling controller over IPC, such as `weave-adapter-spaghetti`; the CLI lists them but cannot create them.
 - **`crates/common/`** — IPC protocol definitions (`ipc_protocol.rs`) and shared types.
@@ -76,6 +76,15 @@ WebRTC destination: the route's ring → encoder thread (every 5 ms, 960-frame c
   → AudioToolbox Opus 48 kHz stereo, 20 ms packets, RTP time +960 each, wallclock = capture time
   → one str0m Writer::write per packet, dropped until connected
 
+Program input: a program embedding the engine registers it by name (`Router::add_program_input`)
+  and keeps its real-time end in its own capture callback → `ProgramInput::push`, dated by
+  capture time → every route's ring, as a tap's IOProc pushes
+
+Program output: registered by name with its rate and least latency (`Router::add_program_output`)
+  → the program's playback callback calls `ProgramOutput::render` with when its first frame is
+  heard → each route's `Playout` and `Fader` through `RtSlots`, summed and clamped. Routes join
+  and leave while the callback runs; a route on a delay schedules against the heard time
+
 WebRTC clock: the offerer adds an unordered, unretransmitted "clock" data channel. The
   receiving end probes every 100 ms, then every second after ten round trips; the sending end
   replies with its host clock and the RTP and capture time of its latest packet. `SenderClock`
@@ -83,9 +92,11 @@ WebRTC clock: the offerer adds an unordered, unretransmitted "clock" data channe
   as captured on this host's clock, net of Opus's 312-frame pre-skip
 ```
 
+A device or program route reports its `Playback` in `Router::list_routes`: `Playing` when its output's latest render played the route's source, at any volume, `Silent` while it waits for audio or for its schedule or after a refused render, and `Stopped` once the output has not rendered for `IDLE` plus 4096 frames at its rate. A delayed route is refused when its delay less its output's latency cannot be held in its ring beside the resampler's input (`Playout::max_held_seconds`).
+
 Routes start and stop without clicks. Every volume change ramps over `RAMP`, 50 ms, across as many buffers as that takes, since a ramp shorter than a bass wave clicks however small the buffer; a playout ramps up from silence over the same 50 ms whenever it primes, from its first real frame. Destroying a route playing on a device drops its volume, waits out the ramp and three more cycles of the render callback or bus IOProc (counted by `Cycles`) so the device plays it out, then tears it down, its tap muting the app meanwhile; `Router::fade_volume` sets a volume and waits the same way. A bus slot starts at the route's volume, so a tap taking over from an app playing on its own does so seamlessly; a caller wanting a fade-in creates the route at 0 and raises it. While the tapped processes play, a new bus slot or tap capture returns only once its IOProc has run, so a tap replacing another never leaves the app unmuted. Opening a process tap can glitch what the app's other taps hear for about 10 ms, so a caller replacing a playing route with one that opens a tap fades the old one out first.
 
-Ring pushes carry the host time their first frame was captured, when the source knows it: a tap's IOProc input time, or a WebRTC source's date from its sender's clock. A device route with a delay plays on a schedule rather than on its fill: unprimed, `Playout` drops frames already too late and starts the earliest mid-render behind silence; primed, the PI controller trims the ratio against how far the tail frame runs from sounding `delay` after its capture, counting the device's own and its stream's latency. Routes with one delay play their source in step, within a frame or two on one host and within the clock estimate across hosts. SRT sources do not date their frames.
+Ring pushes carry the host time their first frame was captured, when the source knows it: measured, as a tap's IOProc input time or a program input's capture time, or estimated, as a WebRTC source's date from its sender's clock. A ring's frames come in runs. The first push starts one, and a push the ring has no room for, a measured push dated more than 1 ms off where the previous one ended, or a `discontinuity` the producer marks (a WebRTC or SRT source after a gap it does not conceal, a program input on request) starts a new run. Each push keeps a record of its own (its first frame's position, capture time and arrival) in a bounded queue beside the frames, so every frame is dated by the push it came in; a push with no free record is refused like one with no room. The producer publishes each push, its record and its run together once its frames are written, behind a sequence count, all counts in 64 bits. A consumer reads only a run it took (`Ring::take_discontinuity`, which the first push already requires): taking drops what is left of the earlier runs and returns when the new run's first frame was captured. A playout primes again on the new run; the WebRTC and SRT senders advance RTP time or PTS by the gap (`StreamClock`), so the receiver conceals it rather than splicing the runs. A device route with a delay plays on a schedule rather than on its fill: unprimed, `Playout` drops frames already too late and starts the earliest mid-render behind silence; primed, the PI controller trims the ratio against how far the tail frame runs from sounding `delay` after its capture, counting the device's own and its stream's latency. Routes with one delay play their source in step, within a frame or two on one host and within the clock estimate across hosts. SRT sources do not date their frames.
 
 A source reports its `SourceTiming`: its rate, and its `DeliverySpan`, how far behind their capture its frames may land. A tap publishes its IOProc buffer; SRT and WebRTC sources measure the span from each push's media time and arrival, growing it at once past a stall it fell short of and shedding it slowly once delivery calms. `Playout` holds the live span on top of what the resampler needs, and re-primes once when the span grows under a playing route rather than resample audibly up to it.
 
@@ -97,7 +108,12 @@ Key files:
 - `crates/engine/src/playout.rs` — `Playout`, a route's output side: the resampler, jitter buffer and clock-drift controller between the ring and the render callback, or on a `Schedule`, the same controller holding each frame to its capture time plus the delay.
 - `crates/engine/src/clock.rs` — `ClockFilter`, a two-state Kalman filter over a remote clock's offset and drift after Sendspin's time filter, the clock channel's `ClockMessage`s, and `SenderClock`, which dates a WebRTC source's frames.
 - `crates/engine/src/mixer.rs` — `Fader`, a route's volume ramped over `RAMP`, and `Cycles`, which an output ticks each cycle so the control side can wait for a change to be played.
-- `crates/engine/src/ring.rs` — the SPSC ring of interleaved stereo frames, with the capture time of its latest push.
+- `crates/engine/src/ring.rs` — the SPSC ring of interleaved stereo frames, its runs, and a record of each push it holds.
+- `crates/engine/src/program_io.rs` — `ProgramInput`, `ProgramOutput` and `Frames`: the real-time ends of program I/O, and the router's `ProgramSource` and `ProgramRoute`.
+- `crates/engine/src/spec.rs` — the engine's `SourceSpec`, `Destination`, `SourceInfo`, `RouteInfo` and `Playback`, and their conversions to and from the IPC types, which have no program variants.
+- `crates/engine/src/host_time.rs` — `HostTime` and the mach clock every engine timestamp is in, which iOS also has.
+- `crates/engine/src/no_hal.rs` — uninhabited stand-ins for the tap, bus and device-output modules on targets without the HAL.
+- `crates/engine/src/stream_clock.rs` — `StreamClock`, how a sender's media time crosses a discontinuity in its ring.
 - `crates/engine/src/delivery.rs` — `DeliverySpan`, the span a source shares with its routes, and `DeliveryMeter`, which measures it for network sources.
 - `crates/engine/src/sinks.rs` + `rt_slots.rs` — `Sinks`, the rings a source feeds, held in `RtSlots`, the lock-free handoff that lets routes join and leave a running capture.
 - `crates/engine/bridge/tap_bridge.m` + `.h` — ObjC bridge for `AudioHardwareCreateProcessTap`, retargeting taps, and aggregate device creation. Compiled by `build.rs`.
@@ -131,7 +147,7 @@ Key files:
 
 ## IPC
 
-Unix domain socket at `spaghetti_common::ipc_protocol::SOCKET_PATH`. Request/response enum in `crates/common/src/ipc_protocol.rs`; bump `IPC_VERSION` when a payload changes shape. Daemon dispatches to the engine in `crates/daemon/src/server.rs`. The CLI client is `crates/cli/src/client.rs`.
+Unix domain socket at `spaghetti_common::ipc_protocol::SOCKET_PATH`. Request/response enum in `crates/common/src/ipc_protocol.rs`; bump `IPC_VERSION` when a payload changes shape. Daemon dispatches to the engine in `crates/daemon/src/server.rs`, converting the wire `SourceSpec` and `Destination` into the engine's and its listings back; program endpoints have no wire form. The CLI client is `crates/cli/src/client.rs`.
 
 ## Virtual devices — the multi-device model
 
@@ -167,7 +183,7 @@ Real-time paths emit first-fire diagnostics that are invaluable for debugging fo
 - `IOProc first call` — the ABL shape the tap actually delivers.
 - `render callback first fire` — output ABL layout and the ring fill at the first render.
 - `route playout health` (debug, every 10 s) — each route's smoothed ring fill against its target, its source's delivery span (`delivery_ms`), the controller's ratio correction in ppm, and glitch counters.
-- `route playout glitched since the last report` (info) — underruns, re-primes to a grown span, resyncs and ring overflows since the previous report, and the span and target at the latest of them (`glitch_delivery_ms`, `glitch_target_ms`).
+- `route playout glitched since the last report` (info) — underruns, re-primes to a grown span, resyncs, ring overflows and ring discontinuities since the previous report, and the span and target at the latest of them (`glitch_delivery_ms`, `glitch_target_ms`).
 - `SRT connected` / `SRT sender disconnected` / `SRT receiver disconnected` (info) — each SRT link's peer coming and going.
 - `SRT stream format` (info) — the AAC rate and channels of a received stream, logged when they change.
 - `route SRT health` (debug, every 10 s) — an SRT route's state, bytes and packet counters.

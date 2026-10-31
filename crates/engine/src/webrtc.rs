@@ -4,7 +4,6 @@ use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
-use coreaudio_sys::AudioGetCurrentHostTime;
 use spaghetti_common::ipc_protocol::{FlowState, FlowStatus, PeerRole, TurnServer, WebRtcPeer};
 use str0m::change::{SdpAnswer, SdpOffer, SdpPendingOffer};
 use str0m::channel::{ChannelConfig, ChannelData, ChannelId, Reliability};
@@ -18,6 +17,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::clock::{Capture, ClockMessage, SenderClock, now_nanos};
 use crate::flow::FlowMeter;
+use crate::host_time;
 use crate::stun;
 use crate::turn::{Received, Relays};
 
@@ -903,7 +903,7 @@ impl Session {
                 };
                 self.shared
                     .meter
-                    .record(data.data.len() as u64, unsafe { AudioGetCurrentHostTime() });
+                    .record(data.data.len() as u64, host_time::now());
                 self.shared.enter(Phase::Receiving { paused: false });
                 let packet = IncomingPacket {
                     rtp_time: data.time.rebase(Frequency::FORTY_EIGHT_KHZ).numer(),
@@ -1081,10 +1081,7 @@ impl Session {
         let len = packet.data.len() as u64;
         let time = MediaTime::new(packet.rtp_time, Frequency::FORTY_EIGHT_KHZ);
         match writer.write(pt, packet.captured, time, packet.data) {
-            Ok(()) => self
-                .shared
-                .meter
-                .record(len, unsafe { AudioGetCurrentHostTime() }),
+            Ok(()) => self.shared.meter.record(len, host_time::now()),
             Err(e) => tracing::debug!(link = self.link, error = %e, "WebRTC write failed"),
         }
     }

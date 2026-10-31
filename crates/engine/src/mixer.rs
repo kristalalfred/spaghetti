@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use coreaudio_sys::{AudioGetCurrentHostTime, AudioGetHostClockFrequency};
+use crate::host_time;
 
 /// Mix multiple audio sources with individual volumes into an output buffer.
 /// All buffers are interleaved f32.
@@ -22,6 +22,7 @@ pub fn mix(inputs: &[&[f32]], volumes: &[f32], output: &mut [f32]) {
 
 /// Claude: how long a new tap waits for its first cycles, and a route for its
 /// fade-out, before going on regardless.
+#[cfg(target_os = "macos")]
 pub const START_LIMIT: Duration = Duration::from_millis(250);
 pub const FADE_LIMIT: Duration = Duration::from_millis(250);
 /// Claude: an output that has not cycled for this long is not playing.
@@ -51,8 +52,8 @@ impl Cycles {
 
     /// Claude: whether a cycle ran within `within`.
     pub fn running(&self, within: Duration) -> bool {
-        let ticks = within.as_secs_f64() * unsafe { AudioGetHostClockFrequency() };
-        let now = unsafe { AudioGetCurrentHostTime() };
+        let ticks = within.as_secs_f64() * host_time::ticks_per_second();
+        let now = host_time::now();
         let at = self.at.load(Ordering::Relaxed);
         at != 0 && (now.saturating_sub(at) as f64) < ticks
     }
@@ -245,7 +246,7 @@ mod tests {
             move || {
                 for _ in 0..3 {
                     std::thread::sleep(Duration::from_millis(5));
-                    cycles.tick(unsafe { AudioGetCurrentHostTime() });
+                    cycles.tick(host_time::now());
                 }
             }
         });

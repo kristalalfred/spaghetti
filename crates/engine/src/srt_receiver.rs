@@ -5,13 +5,13 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use bytes::Bytes;
-use coreaudio_sys::{AudioGetCurrentHostTime, AudioGetHostClockFrequency};
 use spaghetti_common::ipc_protocol::{FlowStatus, SrtSocket};
 
 use crate::adts;
 use crate::codec::{Codec, DECODED_RATE, Decoder, StreamFormat};
 use crate::delivery::{DeliveryMeter, DeliverySpan};
-use crate::ring::Ring;
+use crate::host_time;
+use crate::ring::{Captured, Ring};
 use crate::sinks::{MAX_SINKS, Sinks, SourceTiming};
 use crate::srt::{SrtEndpoint, SrtLink};
 use crate::ts::TsDemuxer;
@@ -95,9 +95,9 @@ impl Drop for SrtSource {
 /// media time is the PTS of the PES it starts, or follows the unit before it,
 /// so units SRT dropped as too late leave a gap in media time. A gap the
 /// routes' span outlasts is filled with silence, so the rings stay in step with
-/// media time.
+/// media time; a longer one, or media time going back, is a discontinuity.
 fn decode(received: Receiver<Bytes>, mut meter: DeliveryMeter, sinks: &Sinks, stop: &AtomicBool) {
-    let ticks_per_second = unsafe { AudioGetHostClockFrequency() };
+    let ticks_per_second = host_time::ticks_per_second();
     let rate = f64::from(DECODED_RATE);
     let mut demuxer = TsDemuxer::new();
     let mut adts = Vec::new();
@@ -142,16 +142,18 @@ fn decode(received: Receiver<Bytes>, mut meter: DeliveryMeter, sinks: &Sinks, st
                     }
                 };
                 let channels = usize::from(config.channels);
-                let arrival = unsafe { AudioGetCurrentHostTime() } as f64 / ticks_per_second;
+                let arrival = host_time::now() as f64 / ticks_per_second;
                 if let Some(gap) = meter.gap_before(media).filter(|_| frames > 0) {
                     fill_silence(&mut meter, sinks, gap, frames, arrival, ticks_per_second);
+                } else if meter.breaks_before(media) {
+                    unsafe { sinks.for_each(|ring| ring.discontinuity()) };
                 }
                 let end = media + frames as f64 / rate;
                 let stamp = (meter.record(media..end, arrival) * ticks_per_second) as u64;
                 media = end;
                 unsafe {
                     sinks.for_each(|ring| {
-                        ring.push_with(frames, stamp, None, |f, ch| {
+                        ring.push_with(frames, stamp, Captured::Unknown, |f, ch| {
                             pcm[f * channels + ch.min(channels - 1)]
                         });
                     });
@@ -181,7 +183,7 @@ fn fill_silence(
         let stamp = (meter.record(start..end, arrival) * ticks_per_second) as u64;
         unsafe {
             sinks.for_each(|ring| {
-                ring.push_with(frames, stamp, None, |_, _| 0.0);
+                ring.push_with(frames, stamp, Captured::Unknown, |_, _| 0.0);
             });
         }
         start = end;
@@ -261,10 +263,11 @@ mod tests {
         }
         drop(payloads);
         let sinks = Sinks::new();
-        let ring = Arc::new(Ring::new());
+        let ring = Arc::new(Ring::new(rate));
         assert!(sinks.insert(Box::new(Arc::clone(&ring))).is_ok());
         let meter = DeliveryMeter::new(rate, DELIVERY_JITTER);
         decode(received, meter, &sinks, &AtomicBool::new(false));
+        assert!(ring.take_discontinuity().is_some());
         let filled = ring.available() - decoded.iter().sum::<usize>();
         let first = if step(0) > SMALLEST_GAP {
             (step(0) * rate).round() as usize
@@ -300,7 +303,7 @@ mod tests {
                 let due = (start.elapsed().as_secs_f64() * 48000.0) as usize;
                 while sent + 480 <= due {
                     let offset = sent % 48000;
-                    ring.push_with(480, unsafe { AudioGetCurrentHostTime() }, None, |f, ch| {
+                    ring.push_with(480, host_time::now(), Captured::Unknown, |f, ch| {
                         pcm[((offset + f) % 48000) * CHANNELS + ch]
                     });
                     sent += 480;
@@ -315,6 +318,7 @@ mod tests {
         let mut buffer = vec![0.0; 4096 * CHANNELS];
         let start = Instant::now();
         while start.elapsed().as_secs_f64() < seconds {
+            ring.take_discontinuity();
             let frames = ring.pop_into(&mut buffer);
             out.extend_from_slice(&buffer[..frames * CHANNELS]);
             std::thread::sleep(Duration::from_millis(10));
@@ -322,10 +326,80 @@ mod tests {
         out
     }
 
+    /// Claude: a sender whose source stops capturing for 500 ms skips that much
+    /// media time, so the receiver keeps the gap rather than splicing the audio
+    /// on either side of it: it fills the gap with silence when its span has
+    /// grown past it, and starts a new run in its rings when not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_capture_gap_at_the_sender_reaches_the_receiver_as_a_gap_in_media_time() {
+        let port = free_port();
+        let sent = Arc::new(Ring::new(48000.0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let producer = std::thread::spawn({
+            let (sent, stop) = (Arc::clone(&sent), Arc::clone(&stop));
+            move || {
+                let pcm = tone(48000.0, 1000.0, 0.5, 48000);
+                let ticks_per_second = host_time::ticks_per_second();
+                let origin = host_time::now();
+                let mut pushed = 0usize;
+                while !stop.load(Ordering::Relaxed) {
+                    let elapsed = (host_time::now() - origin) as f64 / ticks_per_second;
+                    while (pushed + 480) as f64 / 48000.0 <= elapsed {
+                        let seconds = pushed as f64 / 48000.0;
+                        if !(1.5..2.0).contains(&seconds) {
+                            let captured = origin + (seconds * ticks_per_second) as u64;
+                            let offset = pushed % 48000;
+                            sent.push_with(
+                                480,
+                                host_time::now(),
+                                Captured::Measured(captured),
+                                |f, ch| pcm[((offset + f) % 48000) * CHANNELS + ch],
+                            );
+                        }
+                        pushed += 480;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        });
+        let _output = SrtOutput::open(
+            &socket(SrtMode::Listen { port }),
+            SourceTiming {
+                sample_rate: 48000.0,
+                delivery: Arc::new(DeliverySpan::new(0.0)),
+            },
+            Arc::clone(&sent),
+            Arc::new(AtomicU32::new(1.0f32.to_bits())),
+        )
+        .unwrap();
+        let mut source = SrtSource::open(&socket(SrtMode::Call {
+            host: "127.0.0.1".into(),
+            port,
+        }))
+        .unwrap();
+        let received = Arc::new(Ring::new(48000.0));
+        source.add_sink(Arc::clone(&received)).unwrap();
+        let ring = Arc::clone(&received);
+        let pcm = tokio::task::spawn_blocking(move || collect(&ring, 3.0))
+            .await
+            .unwrap();
+        stop.store(true, Ordering::Relaxed);
+        producer.join().unwrap();
+        assert_eq!(sent.discontinuities(), 1);
+        let silent = pcm
+            .chunks(CHANNELS)
+            .filter(|frame| frame.iter().all(|s| *s == 0.0))
+            .count();
+        assert!(
+            silent > 14400 || received.discontinuities() > 0,
+            "{silent} silent frames and no discontinuity: the receiver's media time ran on through the sender's gap"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_tone_crosses_srt_and_the_sender_takes_a_new_caller() {
         let port = free_port();
-        let sent = Arc::new(Ring::new());
+        let sent = Arc::new(Ring::new(48000.0));
         let stop = Arc::new(AtomicBool::new(false));
         let producer = produce(Arc::clone(&sent), Arc::clone(&stop));
         let output = SrtOutput::open(
@@ -347,7 +421,7 @@ mod tests {
                 port,
             }))
             .unwrap();
-            let received = Arc::new(Ring::new());
+            let received = Arc::new(Ring::new(48000.0));
             source.add_sink(Arc::clone(&received)).unwrap();
             let pcm = tokio::task::spawn_blocking(move || collect(&received, 2.0)).await.unwrap();
 

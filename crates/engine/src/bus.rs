@@ -10,6 +10,7 @@ use spaghetti_common::ipc_protocol::TapMode;
 
 use crate::abl;
 use crate::flow::FlowMeter;
+use crate::host_time;
 use crate::mixer::{Cycles, Fader, START_LIMIT};
 use crate::ring::CHANNELS;
 use crate::rt_slots::RtSlots;
@@ -536,7 +537,7 @@ unsafe extern "C" fn bus_ioproc(
     let first_tap = ins
         .len()
         .saturating_sub(state.slots.load(Ordering::Acquire));
-    let now = unsafe { AudioGetCurrentHostTime() };
+    let now = host_time::now();
     unsafe {
         state.mixes.for_each(|mix| {
             let Some(buffer) = ins.get(first_tap + mix.slot) else {

@@ -4,12 +4,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use coreaudio_sys::AudioGetCurrentHostTime;
 use futures::{SinkExt, StreamExt};
 use spaghetti_common::ipc_protocol::{FlowStatus, SrtMode, SrtSocket};
 use srt_tokio::options::{KeySize, Passphrase};
 
 use crate::flow::{FlowMeter, Link};
+use crate::host_time;
 
 const RETRY_AFTER: Duration = Duration::from_millis(500);
 
@@ -179,7 +179,7 @@ impl SrtLink {
                             if socket.send((origin, message)).await.is_err() {
                                 break;
                             }
-                            state.meter.record(len, unsafe { AudioGetCurrentHostTime() });
+                            state.meter.record(len, host_time::now());
                         }
                         sample = statistics.next() => match sample {
                             Some(sample) => state.counters(sample.tx_loss_data, sample.tx_retransmit_data),
@@ -223,7 +223,7 @@ impl SrtLink {
                     tokio::select! {
                         incoming = socket.next() => match incoming {
                             Some(Ok((_, payload))) => {
-                                state.meter.record(payload.len() as u64, unsafe { AudioGetCurrentHostTime() });
+                                state.meter.record(payload.len() as u64, host_time::now());
                                 if let Err(std::sync::mpsc::TrySendError::Disconnected(_)) = payloads.try_send(payload) {
                                     return;
                                 }

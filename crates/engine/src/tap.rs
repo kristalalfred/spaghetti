@@ -13,8 +13,9 @@ use crate::abl;
 use crate::bus::is_running_output;
 use crate::delivery::DeliverySpan;
 use crate::flow::{FlowMeter, Link};
+use crate::host_time;
 use crate::mixer::{Cycles, START_LIMIT};
-use crate::ring::{CHANNELS, Ring};
+use crate::ring::{CHANNELS, Captured, Ring};
 use crate::sinks::{MAX_SINKS, Sinks, SourceTiming};
 
 unsafe extern "C" {
@@ -365,14 +366,14 @@ fn push_buffers(ring: &Ring, buffers: &[AudioBuffer], now: u64, captured: u64) {
         [] => {}
         [left, right, ..] => {
             let planes = unsafe { [abl::samples(left), abl::samples(right)] };
-            ring.push_with(frames, now, Some(captured), |f, ch| {
+            ring.push_with(frames, now, Captured::Measured(captured), |f, ch| {
                 planes[ch].map_or(0.0, |s| s[f])
             });
         }
         [only] => {
             let channels = only.mNumberChannels.max(1) as usize;
             let samples = unsafe { abl::samples(only) };
-            ring.push_with(frames, now, Some(captured), |f, ch| {
+            ring.push_with(frames, now, Captured::Measured(captured), |f, ch| {
                 samples.map_or(0.0, |s| s[f * channels + ch.min(channels - 1)])
             });
         }
@@ -392,7 +393,7 @@ unsafe extern "C" fn capture_ioproc(
         return 0;
     }
 
-    let now = unsafe { AudioGetCurrentHostTime() };
+    let now = host_time::now();
     let captured = unsafe { in_input_time.as_ref() }
         .filter(|time| time.mFlags & kAudioTimeStampHostTimeValid != 0)
         .map_or(now, |time| time.mHostTime);

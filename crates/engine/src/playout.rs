@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use rubato::audioadapter_buffers::direct::{InterleavedSlice, SequentialSliceOfSlices};
 use rubato::{
@@ -7,10 +7,13 @@ use rubato::{
     WindowFunction,
 };
 
+use std::time::Duration;
+
 use crate::delivery::DeliverySpan;
-use crate::mixer::RAMP;
-use crate::ring::{CHANNELS, LastPush, Ring};
+use crate::mixer::{Cycles, IDLE, RAMP};
+use crate::ring::{CAPACITY_FRAMES, CHANNELS, LastPush, Ring};
 use crate::sinks::SourceTiming;
+use crate::spec::Playback;
 
 pub const MAX_RENDER_FRAMES: usize = 4096;
 const MAX_RATIO_RELATIVE: f64 = 1.01;
@@ -131,6 +134,11 @@ pub struct PlayoutHealth {
     glitch_span: AtomicU32,
     glitch_target: AtomicU32,
     lateness: AtomicU32,
+    /// Claude: whether the latest render played the ring rather than silence.
+    playing: AtomicBool,
+    /// Claude: how long after its latest render an output that still runs
+    /// renders again: `IDLE` past the longest render at its rate.
+    freshness: Duration,
 }
 
 pub struct HealthReport {
@@ -162,6 +170,65 @@ impl PlayoutHealth {
             glitch_span_frames: self.glitch_span.load(Ordering::Relaxed),
             glitch_target_frames: self.glitch_target.load(Ordering::Relaxed),
             lateness_frames: f32::from_bits(self.lateness.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// Claude: whether the output plays the route as of its latest render,
+    /// which `cycles` counts.
+    pub fn playback(&self, cycles: &Cycles) -> Playback {
+        if !cycles.running(self.freshness) {
+            Playback::Stopped
+        } else if self.playing.load(Ordering::Relaxed) {
+            Playback::Playing
+        } else {
+            Playback::Silent
+        }
+    }
+
+    pub fn log(
+        &self,
+        route_id: u32,
+        ring: &Ring,
+        scheduled: bool,
+        reported_glitches: &mut [u32; 5],
+    ) {
+        let report = self.report();
+        let glitches = [
+            report.underruns,
+            report.reprimes,
+            report.resyncs,
+            ring.overflows(),
+            ring.discontinuities(),
+        ];
+        let to_ms = |frames: f64| frames * 1000.0 / self.source_rate;
+        tracing::debug!(
+            route_id,
+            fill_frames = report.fill_avg_frames,
+            fill_ms = to_ms(report.fill_avg_frames as f64),
+            target_ms = to_ms(report.target_frames as f64),
+            delivery_ms = to_ms(report.delivery_frames),
+            correction_ppm = report.correction_ppm,
+            late_ms = scheduled.then(|| to_ms(f64::from(report.lateness_frames))),
+            underruns = glitches[0],
+            reprimes = glitches[1],
+            resyncs = glitches[2],
+            overflows = glitches[3],
+            discontinuities = glitches[4],
+            "route playout health"
+        );
+        if glitches != *reported_glitches {
+            tracing::info!(
+                route_id,
+                underruns = glitches[0] - reported_glitches[0],
+                reprimes = glitches[1] - reported_glitches[1],
+                resyncs = glitches[2] - reported_glitches[2],
+                overflows = glitches[3] - reported_glitches[3],
+                discontinuities = glitches[4] - reported_glitches[4],
+                glitch_delivery_ms = to_ms(report.glitch_span_frames as f64),
+                glitch_target_ms = to_ms(report.glitch_target_frames as f64),
+                "route playout glitched since the last report"
+            );
+            *reported_glitches = glitches;
         }
     }
 
@@ -200,7 +267,7 @@ impl Playout {
         )
         .map_err(|e| format!("create resampler: {e}"))?;
         let input = vec![0.0; resampler.input_frames_max() * CHANNELS];
-        Ok(Self {
+        let playout = Self {
             resampler,
             input,
             indexing: Indexing::default(),
@@ -233,8 +300,32 @@ impl Playout {
                 glitch_span: AtomicU32::new(0),
                 glitch_target: AtomicU32::new(0),
                 lateness: AtomicU32::new(0),
+                playing: AtomicBool::new(false),
+                freshness: IDLE + Duration::from_secs_f64(MAX_RENDER_FRAMES as f64 / device_rate),
             }),
-        })
+        };
+        if let Some(schedule) = schedule {
+            let limit = playout.max_held_seconds();
+            if schedule.delay - schedule.latency > limit {
+                return Err(format!(
+                    "delay exceeds the {:.0} ms held-audio limit at {:.0} Hz plus {:.0} ms output latency",
+                    (limit * 1000.0).floor(),
+                    source_rate,
+                    schedule.latency * 1000.0,
+                ));
+            }
+        }
+        Ok(playout)
+    }
+
+    /// Claude: the longest a scheduled playout can hold a frame between its
+    /// capture and its output: what the ring holds beside the resampler's input
+    /// and the schedule's slack.
+    pub fn max_held_seconds(&self) -> f64 {
+        let rate = self.health.source_rate;
+        let reserve =
+            self.resampler.input_frames_max() + (RESCHEDULE_SECONDS * rate).ceil() as usize;
+        CAPACITY_FRAMES.saturating_sub(reserve) as f64 / rate
     }
 
     pub fn health(&self) -> Arc<PlayoutHealth> {
@@ -243,6 +334,11 @@ impl Playout {
 
     pub fn delay_frames(&self) -> usize {
         self.resampler.output_delay()
+    }
+
+    /// Claude: the output refused a render and played the route silence.
+    pub fn refused(&self) {
+        self.health.playing.store(false, Ordering::Relaxed);
     }
 
     /// Claude: whether the latest render played the ring rather than priming silence.
@@ -261,13 +357,21 @@ impl Playout {
                 && self.resampler.set_chunk_size(frames).is_err())
         {
             silence(out);
+            self.health.playing.store(false, Ordering::Relaxed);
             return;
         }
+        // Claude: what played before a discontinuity does not lead into what
+        // follows it, so the playout primes on the new run as on a new route.
+        if ring.take_discontinuity().is_some() && self.primed {
+            self.primed = false;
+            self.resampler.reset();
+        }
         if self.schedule.is_some() {
-            self.render_scheduled(ring, out, now, output);
+            self.render_scheduled(ring, out, output);
         } else {
             self.render_delivered(ring, out, now);
         }
+        self.health.playing.store(self.primed, Ordering::Relaxed);
     }
 
     fn render_delivered(&mut self, ring: &Ring, out: &mut [&mut [f32]; CHANNELS], now: u64) {
@@ -336,13 +440,7 @@ impl Playout {
     /// and starts the earliest one mid-render behind silence, so it plays on
     /// schedule to the frame. Primed, the controller trims the ratio against
     /// the lateness the way it trims a fill error.
-    fn render_scheduled(
-        &mut self,
-        ring: &Ring,
-        out: &mut [&mut [f32]; CHANNELS],
-        now: u64,
-        output: u64,
-    ) {
+    fn render_scheduled(&mut self, ring: &Ring, out: &mut [&mut [f32]; CHANNELS], output: u64) {
         let frames = out[0].len();
         let need = self.resampler.input_frames_next();
         let schedule = self.schedule.as_ref().expect("a scheduled playout");
@@ -350,7 +448,7 @@ impl Playout {
             + schedule.latency
             + self.resampler.output_delay() as f64 * schedule.ticks_per_device_frame;
         let lateness = ring
-            .tail_captured(schedule.ticks_per_source_frame, now)
+            .tail_captured(schedule.ticks_per_source_frame)
             .map(|captured| {
                 (heard - captured as f64 - schedule.delay) / schedule.ticks_per_source_frame
             });
@@ -444,8 +542,7 @@ impl Playout {
     /// Unlike the raw fill this holds steady through pushes that land late.
     fn estimated_fill(&self, last: &LastPush, now: u64, span: f64) -> f64 {
         // Claude: a push that lands after `now` was read is stamped later than it.
-        let ticks = ((now as u32).wrapping_sub(last.at) as i32).max(0);
-        let since_push = f64::from(ticks) * self.source_frames_per_tick;
+        let since_push = now.saturating_sub(last.at) as f64 * self.source_frames_per_tick;
         last.buffered as f64 + since_push.min(span)
     }
 
@@ -476,6 +573,7 @@ fn silence(out: &mut [&mut [f32]; CHANNELS]) {
 mod tests {
     use super::*;
     use crate::delivery::DeliveryMeter;
+    use crate::ring::Captured;
 
     const TONE_HZ: f64 = 440.0;
     const TICKS_PER_SECOND: f64 = 24_000_000.0;
@@ -702,7 +800,7 @@ mod tests {
                 delivery: source.span(),
             };
             Self {
-                ring: Ring::new(),
+                ring: Ring::new(source_rate),
                 playout: Playout::new(&timing, device_rate, TICKS_PER_SECOND, None).unwrap(),
                 source,
                 source_rate,
@@ -836,9 +934,11 @@ mod tests {
         fn push(&mut self, push: Push) {
             let rate = self.source_rate;
             let stamp = self.source.publish(&push, rate);
-            let captured = self
-                .dated
-                .then(|| (push.media as f64 / rate * TICKS_PER_SECOND) as u64);
+            let captured = if self.dated {
+                Captured::Estimated((push.media as f64 / rate * TICKS_PER_SECOND) as u64)
+            } else {
+                Captured::Unknown
+            };
             self.ring.push_with(
                 push.frames,
                 (stamp * TICKS_PER_SECOND) as u64,
@@ -1335,9 +1435,9 @@ mod tests {
             delivery: Arc::new(DeliverySpan::new(4800.0)),
         };
         let mut playout = Playout::new(&timing, 48000.0, TICKS_PER_SECOND, None).unwrap();
-        let ring = Ring::new();
+        let ring = Ring::new(48000.0);
         let now = (10.0 * TICKS_PER_SECOND) as u64;
-        ring.push_with(960, now + 1, None, |_, _| 0.25);
+        ring.push_with(960, now + 1, Captured::Unknown, |_, _| 0.25);
         let (mut left, mut right) = (vec![0.0; RENDER_FRAMES], vec![0.0; RENDER_FRAMES]);
         playout.render(&ring, &mut [&mut left, &mut right], now, now);
         assert!(
@@ -1435,6 +1535,47 @@ mod tests {
         samples[at..at + frames]
             .iter()
             .fold(0.0f32, |peak, sample| peak.max(sample.abs()))
+    }
+
+    /// Claude: frames captured at T and read once the clock has turned half
+    /// or a whole 32-bit tick count further are long past their time.
+    #[test]
+    fn a_frame_read_long_after_its_capture_is_late_however_far_the_clock_turned() {
+        let timing = SourceTiming {
+            sample_rate: 48000.0,
+            delivery: Arc::new(DeliverySpan::new(0.0)),
+        };
+        let schedule = Schedule {
+            delay: 0.1,
+            latency: 0.0,
+        };
+        let captured = (100.0 * TICKS_PER_SECOND) as u64;
+        for (later, plays) in [
+            (0.1 * TICKS_PER_SECOND, true),
+            ((1u64 << 31) as f64, false),
+            ((1u64 << 32) as f64, false),
+        ] {
+            let mut playout =
+                Playout::new(&timing, 48000.0, TICKS_PER_SECOND, Some(schedule)).unwrap();
+            let ring = Ring::new(48000.0);
+            for block in 0..10 {
+                let at = captured + (block as f64 * 0.01 * TICKS_PER_SECOND) as u64;
+                ring.push_with(480, at, Captured::Estimated(at), |_, _| 0.5);
+            }
+            let now = captured + later as u64;
+            let (mut left, mut right) = (vec![0.0; 480], vec![0.0; 480]);
+            let mut peak = 0.0f32;
+            for render in 0..8 {
+                let at = now + (render as f64 * 0.01 * TICKS_PER_SECOND) as u64;
+                playout.render(&ring, &mut [&mut left, &mut right], at, at);
+                peak = left.iter().fold(peak, |peak, s| peak.max(s.abs()));
+            }
+            assert_eq!(
+                peak > 0.0,
+                plays,
+                "read {later} ticks after capture: peak {peak}"
+            );
+        }
     }
 
     #[test]

@@ -1,8 +1,6 @@
 use std::sync::{Mutex, MutexGuard};
 
-use coreaudio_sys::{
-    AudioConvertHostTimeToNanos, AudioConvertNanosToHostTime, AudioGetCurrentHostTime,
-};
+use crate::host_time;
 
 /// Claude: a round trip slower than this says more about the network than
 /// about the two clocks.
@@ -209,7 +207,7 @@ impl ClockMessage {
 }
 
 pub fn now_nanos() -> u64 {
-    unsafe { AudioConvertHostTimeToNanos(AudioGetCurrentHostTime()) }
+    host_time::to_nanos(host_time::now())
 }
 
 fn seconds(nanos: u64) -> f64 {
@@ -266,7 +264,7 @@ impl SenderClock {
         let frames = (rtp_time as u32).wrapping_sub(latest.rtp_time as u32) as i32;
         let remote = seconds(latest.captured) + f64::from(frames) / rtp_rate;
         let local = known.filter.local(remote)?;
-        (local > 0.0).then(|| unsafe { AudioConvertNanosToHostTime((local * 1e9) as u64) })
+        (local > 0.0).then(|| host_time::from_nanos((local * 1e9) as u64))
     }
 }
 
@@ -403,7 +401,7 @@ mod tests {
             clock.record(reply, probe + 2_000_000);
         }
         let ticks = clock.captured(480, 48000.0).expect("the clock is known");
-        let local = unsafe { AudioConvertHostTimeToNanos(ticks) } as f64 * 1e-9;
+        let local = host_time::to_nanos(ticks) as f64 * 1e-9;
         assert!((local - 10.02).abs() < 1e-6, "captured at {local}");
     }
 }

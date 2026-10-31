@@ -1,7 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use coreaudio_sys::{AudioGetCurrentHostTime, AudioGetHostClockFrequency};
 use spaghetti_common::ipc_protocol::{FlowState, FlowStatus};
+
+use crate::host_time;
 
 const STALL_AFTER_SECONDS: f64 = 3.0;
 
@@ -52,8 +53,8 @@ impl FlowMeter {
         if last_at == 0 {
             return FlowState::Connected;
         }
-        let now = unsafe { AudioGetCurrentHostTime() };
-        let age = now.saturating_sub(last_at) as f64 / unsafe { AudioGetHostClockFrequency() };
+        let now = host_time::now();
+        let age = now.saturating_sub(last_at) as f64 / host_time::ticks_per_second();
         if age > STALL_AFTER_SECONDS {
             FlowState::Stalled
         } else {
@@ -98,12 +99,12 @@ mod tests {
     fn a_connected_flow_is_flowing_while_media_moves_and_stalls_after() {
         let meter = FlowMeter::new();
         assert_eq!(meter.status(connected()).state, FlowState::Connected);
-        let now = unsafe { AudioGetCurrentHostTime() };
+        let now = host_time::now();
         meter.record(8, now);
         assert_eq!(meter.status(connected()).state, FlowState::Flowing);
         assert_eq!(meter.status(connected()).bytes, 8);
 
-        let long_ago = now - (4.0 * unsafe { AudioGetHostClockFrequency() }) as u64;
+        let long_ago = now - (4.0 * host_time::ticks_per_second()) as u64;
         meter.record(8, long_ago);
         assert_eq!(meter.status(connected()).state, FlowState::Stalled);
         meter.restart();
@@ -114,7 +115,7 @@ mod tests {
     #[test]
     fn an_unconnected_flow_reports_its_link_whatever_moved() {
         let meter = FlowMeter::new();
-        meter.record(8, unsafe { AudioGetCurrentHostTime() });
+        meter.record(8, host_time::now());
         assert_eq!(meter.status(Link::Idle).state, FlowState::Idle);
         assert_eq!(meter.status(Link::Connecting).state, FlowState::Connecting);
     }
