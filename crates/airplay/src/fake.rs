@@ -1028,8 +1028,10 @@ pub(crate) mod tests {
     use super::*;
     use crate::clock::PACKET_DURATION;
     use crate::receiver::tests::{MOVE_2_RAOP, SHAIRPORT_SYNC_RAOP};
+    use crate::rtsp::{Connection, OpenError};
     use crate::stream::Settings;
     use crate::{Protocol, Render, Status, Stream};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
 
     pub(crate) const LATENCY: Duration = Duration::from_millis(300);
@@ -2226,6 +2228,33 @@ pub(crate) mod tests {
             0,
             "an attempt began after the wake window"
         );
+    }
+
+    #[test]
+    fn a_connection_cancelled_during_one_address_tries_no_further_address() {
+        let refused = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .and_then(|listener| listener.local_addr())
+            .unwrap();
+        let fake = Fake::start(Behavior::default());
+        let checks = AtomicUsize::new(0);
+        let cancelled_during_the_first_attempt = || checks.fetch_add(1, Ordering::SeqCst) > 0;
+        let opened = Connection::open(
+            &[refused, fake.address],
+            Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(1),
+            vec![],
+            &cancelled_during_the_first_attempt,
+        );
+        assert!(
+            matches!(opened, Err(OpenError::Stopped)),
+            "{:?}",
+            opened
+                .as_ref()
+                .map(Connection::peer_addr)
+                .map_err(ToString::to_string)
+        );
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(fake.accepted(), 0, "a cancelled attempt connected");
     }
 
     fn fake_connections(fake: &Fake) -> Vec<usize> {

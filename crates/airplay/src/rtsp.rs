@@ -366,12 +366,16 @@ impl Connection {
 }
 
 /// Claude: connects on a thread of its own so that `abort` can cut the wait
-/// short; an abandoned attempt ends by itself within `timeout`.
+/// short; an abandoned attempt ends by itself within `timeout`. Nothing is
+/// attempted once `abort` is true.
 pub(crate) fn connect(
     address: SocketAddr,
     timeout: Duration,
     abort: &dyn Fn() -> bool,
 ) -> std::io::Result<TcpStream> {
+    if abort() {
+        return Err(ErrorKind::Interrupted.into());
+    }
     let (sender, receiver) = mpsc::channel();
     thread::Builder::new()
         .name("airplay-connect".into())
