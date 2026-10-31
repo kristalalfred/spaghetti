@@ -345,19 +345,16 @@ fn connect<'a, R>(
     };
     let link = match connector.attempt(&found, protocol) {
         Ok(link) => link,
-        Err(Failure::Refused(reason))
-            if settings.protocol.is_none()
-                && protocol == Protocol::AirPlay2
-                && browser
-                    .receiver(receiver)
-                    .is_some_and(|now| now.service(Protocol::AirPlay1).is_ok()) =>
-        {
+        Err(failure) => {
+            let reason = format!("{name}: {}", failure.reason());
+            let Some(now) = fallback(&settings, protocol, &failure, browser, receiver) else {
+                return Err(reason);
+            };
             warn!(%receiver, %reason, "AirPlay 2 refused; falling back to AirPlay 1");
             connector
-                .attempt(&found, Protocol::AirPlay1)
+                .attempt(&now, Protocol::AirPlay1)
                 .map_err(|failure| format!("{name}: {}", failure.reason()))?
         }
-        Err(failure) => return Err(format!("{name}: {}", failure.reason())),
     };
     let Link {
         mut session,
@@ -410,6 +407,25 @@ fn connect<'a, R>(
         counters: Counters::default(),
         late_packets: 0,
     })
+}
+
+/// Claude: the receiver to try AirPlay 1 with after a handshake failed: only
+/// when the stream picked AirPlay 2 itself, the receiver refused it rather
+/// than failed, and the receiver offers AirPlay 1 as browsing knows it now.
+fn fallback(
+    settings: &Settings,
+    protocol: Protocol,
+    failure: &Failure,
+    browser: &browse::Shared,
+    receiver: &ReceiverId,
+) -> Option<Receiver> {
+    let refused = matches!(failure, Failure::Refused(_));
+    if settings.protocol.is_some() || protocol != Protocol::AirPlay2 || !refused {
+        return None;
+    }
+    browser
+        .receiver(receiver)
+        .filter(|now| now.service(Protocol::AirPlay1).is_ok())
 }
 
 /// Claude: how a stream names itself to the receiver, the same for each

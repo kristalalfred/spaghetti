@@ -521,6 +521,32 @@ fn a_refused_pairing_falls_back_to_airplay_1_unless_airplay_2_was_asked_for() {
 }
 
 #[test]
+fn a_fallback_reaches_an_airplay_1_service_found_after_the_stream_started() {
+    let fake = Fake::start(Behavior {
+        rtsp: Rtsp::RefuseAt(Step::SessionSetup, 400),
+        ..Behavior::default()
+    });
+    let browser = browser(&fake, false);
+    let stream = Stream::start_with(
+        &browser,
+        fake.id(),
+        Ok(settings()),
+        Renders::default().renderer(None),
+    );
+    assert!(wait_until(HANDSHAKE, || fake
+        .requests()
+        .iter()
+        .any(|(_, _, r)| r.method == "POST")));
+    fake.advertise(&browser, SHAIRPORT_SYNC_RAOP);
+    assert!(
+        wait_until(HANDSHAKE, || streaming(&stream)),
+        "{:?}",
+        stream.status()
+    );
+    assert!(fake.methods().contains(&"ANNOUNCE".to_owned()));
+}
+
+#[test]
 fn a_refused_stream_setup_tears_the_session_down_before_falling_back() {
     let fake = Fake::start(Behavior {
         rtsp: Rtsp::RefuseAt(Step::StreamSetup, 400),
