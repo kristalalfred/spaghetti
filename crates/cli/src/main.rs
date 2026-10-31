@@ -70,6 +70,13 @@ enum Command {
         /// Play each frame this many milliseconds after its capture, in step with other routes given the same delay
         #[arg(short, long)]
         delay: Option<u32>,
+        #[arg(
+            long = "latency-offset",
+            value_name = "MS",
+            allow_negative_numbers = true,
+            help = "Milliseconds the output sounds later than reported; negative means earlier (requires --delay)"
+        )]
+        latency_offset_ms: Option<i32>,
         #[command(flatten)]
         srt: SrtArgs,
     },
@@ -204,9 +211,20 @@ fn check_volume(volume: f32) -> Result<(), &'static str> {
 fn route_destination(
     target: &str,
     delay: Option<u32>,
+    latency_offset_ms: Option<i32>,
     srt: &SrtArgs,
     receivers: impl FnOnce() -> Result<Vec<AirPlayReceiverInfo>, String>,
 ) -> Result<Destination, String> {
+    if latency_offset_ms.is_some() {
+        if target.starts_with("srt://") {
+            return Err(
+                "--latency-offset applies only to output devices and AirPlay receivers".into(),
+            );
+        }
+        if delay.is_none() {
+            return Err("--latency-offset requires --delay <ms>".into());
+        }
+    }
     if srt.is_set() && !target.starts_with("srt://") {
         return Err("--latency and --passphrase apply only to srt:// destinations".into());
     }
@@ -219,6 +237,7 @@ fn route_destination(
             return Ok(Destination::AirPlay {
                 receiver: name.to_string(),
                 delay_ms,
+                latency_offset_ms,
             });
         }
         let receivers = receivers()?;
@@ -235,7 +254,11 @@ fn route_destination(
                 ));
             }
         };
-        Ok(Destination::AirPlay { receiver, delay_ms })
+        Ok(Destination::AirPlay {
+            receiver,
+            delay_ms,
+            latency_offset_ms,
+        })
     } else if target.starts_with("srt://") {
         if delay.is_some() {
             return Err("--delay applies only to output devices and AirPlay receivers".into());
@@ -245,6 +268,7 @@ fn route_destination(
         Ok(Destination::Device {
             uid: target.to_string(),
             delay_ms: delay,
+            latency_offset_ms,
         })
     }
 }
@@ -358,11 +382,12 @@ fn run_command(cmd: Command, out: Output) -> Result<(), Box<dyn Error>> {
             destination,
             volume,
             delay,
+            latency_offset_ms,
             srt,
         } => {
             check_volume(volume)?;
             let destination =
-                route_destination(&destination, delay, &srt, || {
+                route_destination(&destination, delay, latency_offset_ms, &srt, || {
                     match client::request(&mut stream, &Request::ListAirPlayReceivers)
                         .map_err(|error| error.to_string())?
                     {
@@ -561,6 +586,73 @@ mod tests {
     }
 
     #[test]
+    fn signed_latency_offsets_parse_for_device_and_airplay_routes() {
+        for target in ["Speakers", "airplay://C4:38:75:04:5E:80"] {
+            for offset in ["-47", "83", "0"] {
+                let cli = Cli::try_parse_from([
+                    "spaghetti",
+                    "route",
+                    "7",
+                    target,
+                    "--delay",
+                    "2500",
+                    "--latency-offset",
+                    offset,
+                ])
+                .unwrap();
+                let Some(Command::Route {
+                    destination,
+                    delay,
+                    latency_offset_ms,
+                    srt,
+                    ..
+                }) = cli.command
+                else {
+                    panic!("expected route");
+                };
+                let offset: i32 = offset.parse().unwrap();
+                assert_eq!(latency_offset_ms, Some(offset));
+                let destination =
+                    route_destination(&destination, delay, latency_offset_ms, &srt, || {
+                        panic!("unexpected listing")
+                    })
+                    .unwrap();
+                let json = serde_json::to_value(destination).unwrap();
+                let kind = if target.starts_with("airplay://") {
+                    "AirPlay"
+                } else {
+                    "Device"
+                };
+                assert_eq!(json[kind]["latency_offset_ms"], offset);
+                assert_eq!(json[kind]["delay_ms"], 2500);
+            }
+        }
+    }
+
+    #[test]
+    fn latency_offsets_require_a_scheduled_device_or_airplay_destination() {
+        for target in ["Speakers", "airplay://Kitchen"] {
+            for offset in [-47, 0, 83] {
+                let error = route_destination(target, None, Some(offset), &srt(), || {
+                    panic!("unexpected listing")
+                })
+                .unwrap_err();
+                assert!(
+                    error.contains("--latency-offset requires --delay"),
+                    "{error}"
+                );
+            }
+        }
+        for delay in [None, Some(2500)] {
+            let error = route_destination("srt://:9000", delay, Some(-47), &srt(), || {
+                panic!("unexpected listing")
+            })
+            .unwrap_err();
+            assert!(error.contains("--latency-offset applies only"), "{error}");
+        }
+    }
+
+    #[test]
     fn airplay_list_and_route_commands_parse() {
         let cli = Cli::try_parse_from(["spaghetti", "airplay", "--json"]).unwrap();
         assert!(cli.json);
@@ -585,7 +677,7 @@ mod tests {
             panic!("expected route");
         };
         assert_eq!(source_id, 7);
-        let destination = route_destination(&destination, delay, &srt, || {
+        let destination = route_destination(&destination, delay, None, &srt, || {
             Ok(vec![receiver("C4:38:75:04:5E:80", "Living room")])
         })
         .unwrap();
@@ -594,6 +686,7 @@ mod tests {
             Destination::AirPlay {
                 receiver: "C4:38:75:04:5E:80".into(),
                 delay_ms: 2500,
+                latency_offset_ms: None
             }
         );
     }
@@ -604,8 +697,9 @@ mod tests {
             ("airplay://Kitchen", None, "require --delay"),
             ("airplay://", Some(2500), "requires a receiver"),
         ] {
-            let error = route_destination(target, delay, &srt(), || panic!("unexpected listing"))
-                .unwrap_err();
+            let error =
+                route_destination(target, delay, None, &srt(), || panic!("unexpected listing"))
+                    .unwrap_err();
             assert!(error.contains(expected), "{error}");
         }
     }
@@ -618,12 +712,19 @@ mod tests {
                 receiver("C4:38:75:04:5E:81", "Kitchen"),
             ])
         };
-        let error = route_destination("airplay://Kitchen", Some(2500), &srt(), list).unwrap_err();
+        let error =
+            route_destination("airplay://Kitchen", Some(2500), None, &srt(), list).unwrap_err();
         assert!(error.contains("ambiguous"));
         assert!(error.contains("C4:38:75:04:5E:80, C4:38:75:04:5E:81"));
         for target in ["kitchen", "Kit", "Absent"] {
-            let error = route_destination(&format!("airplay://{target}"), Some(2500), &srt(), list)
-                .unwrap_err();
+            let error = route_destination(
+                &format!("airplay://{target}"),
+                Some(2500),
+                None,
+                &srt(),
+                list,
+            )
+            .unwrap_err();
             assert!(error.contains("not found"), "{error}");
         }
     }
@@ -637,7 +738,7 @@ mod tests {
             "c43875045e99",
         ] {
             let destination =
-                route_destination(&format!("airplay://{id}"), Some(2500), &srt(), || {
+                route_destination(&format!("airplay://{id}"), Some(2500), None, &srt(), || {
                     panic!("an explicit receiver id must not list receivers")
                 })
                 .unwrap();
@@ -645,7 +746,8 @@ mod tests {
                 destination,
                 Destination::AirPlay {
                     receiver: id.into(),
-                    delay_ms: 2500
+                    delay_ms: 2500,
+                    latency_offset_ms: None
                 }
             );
         }
@@ -655,20 +757,26 @@ mod tests {
     fn an_explicit_id_takes_precedence_over_a_matching_name() {
         let target = "C4:38:75:04:5E:80";
         let listed = std::cell::Cell::new(false);
-        let destination =
-            route_destination(&format!("airplay://{target}"), Some(2500), &srt(), || {
+        let destination = route_destination(
+            &format!("airplay://{target}"),
+            Some(2500),
+            None,
+            &srt(),
+            || {
                 listed.set(true);
                 Ok(vec![
                     receiver(target, "Kitchen"),
                     receiver("C4:38:75:04:5E:81", target),
                 ])
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(
             destination,
             Destination::AirPlay {
                 receiver: target.into(),
-                delay_ms: 2500
+                delay_ms: 2500,
+                latency_offset_ms: None
             }
         );
         assert!(!listed.get());
@@ -680,7 +788,7 @@ mod tests {
         unsupported.support = AirPlaySupport::Unsupported {
             reason: "pairing required".into(),
         };
-        let destination = route_destination("airplay://Kitchen", Some(2500), &srt(), || {
+        let destination = route_destination("airplay://Kitchen", Some(2500), None, &srt(), || {
             Ok(vec![unsupported])
         })
         .unwrap();
@@ -688,11 +796,12 @@ mod tests {
             destination,
             Destination::AirPlay {
                 receiver: "C4:38:75:04:5E:80".into(),
-                delay_ms: 2500
+                delay_ms: 2500,
+                latency_offset_ms: None
             }
         );
         assert_eq!(
-            route_destination("airplay://Kitchen", Some(2500), &srt(), || Err(
+            route_destination("airplay://Kitchen", Some(2500), None, &srt(), || Err(
                 "discovery failed".into()
             ))
             .unwrap_err(),
@@ -703,17 +812,21 @@ mod tests {
     #[test]
     fn existing_destinations_do_not_list_airplay_and_keep_their_delay_rules() {
         assert_eq!(
-            route_destination("Speakers", Some(2500), &srt(), || panic!("listing")).unwrap(),
+            route_destination("Speakers", Some(2500), None, &srt(), || panic!("listing")).unwrap(),
             Destination::Device {
                 uid: "Speakers".into(),
-                delay_ms: Some(2500)
+                delay_ms: Some(2500),
+                latency_offset_ms: None
             }
         );
         assert!(
-            route_destination("srt://:9000", Some(2500), &srt(), || panic!("listing")).is_err()
+            route_destination("srt://:9000", Some(2500), None, &srt(), || panic!(
+                "listing"
+            ))
+            .is_err()
         );
         assert!(matches!(
-            route_destination("srt://:9000", None, &srt(), || panic!("listing")).unwrap(),
+            route_destination("srt://:9000", None, None, &srt(), || panic!("listing")).unwrap(),
             Destination::Srt(_)
         ));
         let options = SrtArgs {
@@ -721,7 +834,7 @@ mod tests {
             passphrase: None,
         };
         assert!(
-            route_destination("airplay://Kitchen", Some(2500), &options, || panic!(
+            route_destination("airplay://Kitchen", Some(2500), None, &options, || panic!(
                 "listing"
             ))
             .unwrap_err()

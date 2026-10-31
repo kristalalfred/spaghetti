@@ -402,6 +402,7 @@ impl Router {
                 Destination::Device {
                     uid,
                     delay_ms: None,
+                    latency_offset_ms: None,
                 },
             ) => {
                 let bus = match self.buses.entry(uid.clone()) {
@@ -436,7 +437,11 @@ impl Router {
                 let timing = source.timing()?;
                 let ring = Arc::new(Ring::new(timing.sample_rate));
                 let output = match &mut destination {
-                    Destination::Device { uid, delay_ms } => {
+                    Destination::Device {
+                        uid,
+                        delay_ms,
+                        latency_offset_ms,
+                    } => {
                         let device = audio::find_device_by_uid(uid)
                             .ok_or_else(|| format!("device '{uid}' not found"))?;
                         let delay = delay_ms.map(|ms| f64::from(ms) / 1000.0);
@@ -447,11 +452,17 @@ impl Router {
                                 Arc::clone(&ring),
                                 Arc::clone(&volume),
                                 delay,
+                                *latency_offset_ms,
                             )
                         }?)
                     }
-                    Destination::AirPlay { receiver, delay_ms } => {
-                        let playout = AirPlayOutput::playout(&timing, *delay_ms)?;
+                    Destination::AirPlay {
+                        receiver,
+                        delay_ms,
+                        latency_offset_ms,
+                    } => {
+                        let playout =
+                            AirPlayOutput::playout(&timing, *delay_ms, *latency_offset_ms)?;
                         let id: airplay::ReceiverId = receiver.parse().map_err(|reason| {
                             format!("invalid AirPlay receiver id '{receiver}': {reason}")
                         })?;
@@ -750,6 +761,16 @@ fn airplay_browser() -> &'static airplay::Browser {
 }
 
 fn validate_schedule_source(source: &SourceSpec, destination: &Destination) -> Result<(), String> {
+    if matches!(
+        destination,
+        Destination::Device {
+            delay_ms: None,
+            latency_offset_ms: Some(_),
+            ..
+        }
+    ) {
+        return Err("a latency offset requires a delay".into());
+    }
     let scheduled = match destination {
         Destination::Device { delay_ms, .. } | Destination::Program { delay_ms, .. } => {
             delay_ms.is_some()
@@ -836,6 +857,7 @@ mod tests {
         Destination::AirPlay {
             receiver: receiver.into(),
             delay_ms,
+            latency_offset_ms: None,
         }
     }
 
@@ -852,6 +874,7 @@ mod tests {
             Destination::Device {
                 uid: "Speakers".into(),
                 delay_ms: Some(2500),
+                latency_offset_ms: None,
             },
             Destination::Program {
                 output: "playback".into(),
@@ -879,10 +902,80 @@ mod tests {
                 &Destination::Device {
                     uid: "Speakers".into(),
                     delay_ms: None,
+                    latency_offset_ms: None
                 }
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn latency_offsets_require_a_delay_before_opening_the_output() {
+        let mut router = Router::new();
+        let _input = router.add_program_input("capture", 48000.0).unwrap();
+        let source = router
+            .create_source(
+                SourceSpec::Program {
+                    input: "capture".into(),
+                },
+                None,
+            )
+            .unwrap();
+        for offset in [-47, 0, 83] {
+            let destination = Destination::Device {
+                uid: "absent".into(),
+                delay_ms: None,
+                latency_offset_ms: Some(offset),
+            };
+            let error = router.create_route(source, destination, 1.0).unwrap_err();
+            assert!(error.contains("latency offset requires a delay"), "{error}");
+        }
+        assert_eq!(router.route_count(), 0);
+    }
+
+    #[test]
+    fn latency_offsets_shift_airplay_delay_bounds_before_discovery() {
+        let mut router = Router::new();
+        let _input = router.add_program_input("capture", 48000.0).unwrap();
+        let source = router
+            .create_source(
+                SourceSpec::Program {
+                    input: "capture".into(),
+                },
+                None,
+            )
+            .unwrap();
+        let timing = router
+            .sources
+            .get_mut(&source)
+            .unwrap()
+            .source
+            .timing()
+            .unwrap();
+        let plain = AirPlayOutput::playout(&timing, 2500, None).unwrap();
+        let minimum_ms = plain.minimum_delay(airplay::LATENCY.as_secs_f64()) * 1000.0;
+        let maximum_ms = plain.max_held_seconds() * 1000.0;
+        for offset in [-47, 0, 83] {
+            let minimum = (minimum_ms + f64::from(offset)).ceil() as u32;
+            let maximum = (maximum_ms + f64::from(offset)).floor() as u32;
+            assert!(AirPlayOutput::playout(&timing, minimum, Some(offset)).is_ok());
+            assert!(AirPlayOutput::playout(&timing, maximum, Some(offset)).is_ok());
+            for (delay_ms, message) in
+                [(minimum - 1, "at least"), (maximum + 1, "held-audio limit")]
+            {
+                let destination = Destination::AirPlay {
+                    receiver: "invalid-receiver".into(),
+                    delay_ms,
+                    latency_offset_ms: Some(offset),
+                };
+                let error = router.create_route(source, destination, 1.0).unwrap_err();
+                assert!(
+                    error.contains(message),
+                    "{offset} ms offset, {delay_ms} ms delay: {error}"
+                );
+            }
+        }
+        assert_eq!(router.route_count(), 0);
     }
 
     #[test]
@@ -928,8 +1021,8 @@ mod tests {
                 .source
                 .timing()
                 .unwrap();
-            assert!(AirPlayOutput::playout(&timing, 2200).is_ok());
-            assert!(AirPlayOutput::playout(&timing, 2500).is_ok());
+            assert!(AirPlayOutput::playout(&timing, 2200, None).is_ok());
+            assert!(AirPlayOutput::playout(&timing, 2500, None).is_ok());
             assert_eq!(router.route_count(), 0);
         }
     }

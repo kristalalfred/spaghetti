@@ -22,7 +22,11 @@ pub struct AirPlayOutput {
 }
 
 impl AirPlayOutput {
-    pub fn playout(source: &SourceTiming, delay_ms: u32) -> Result<Playout, String> {
+    pub fn playout(
+        source: &SourceTiming,
+        delay_ms: u32,
+        latency_offset_ms: Option<i32>,
+    ) -> Result<Playout, String> {
         let delay = f64::from(delay_ms) / 1000.0;
         let playout = Playout::new(
             source,
@@ -30,7 +34,7 @@ impl AirPlayOutput {
             host_time::ticks_per_second(),
             Some(Schedule {
                 delay,
-                latency: 0.0,
+                latency: f64::from(latency_offset_ms.unwrap_or(0)) / 1000.0,
             }),
         )?;
         let minimum = playout.minimum_delay(airplay::LATENCY.as_secs_f64());
@@ -255,7 +259,7 @@ mod tests {
         let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let mut renderer = Renderer {
             ring: Arc::new(Ring::new(timing.sample_rate)),
-            playout: AirPlayOutput::playout(&timing, 2500).unwrap(),
+            playout: AirPlayOutput::playout(&timing, 2500, None).unwrap(),
             volume: Arc::clone(&volume),
             fader: Fader::new(1.0, 44100.0),
             meter: Arc::new(FlowMeter::new()),
@@ -305,7 +309,7 @@ mod tests {
         let ring = Arc::new(Ring::new(rate));
         let mut renderer = Renderer {
             ring: Arc::clone(&ring),
-            playout: AirPlayOutput::playout(&timing, 2500).unwrap(),
+            playout: AirPlayOutput::playout(&timing, 2500, None).unwrap(),
             volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             fader: Fader::new(1.0, rate),
             meter: Arc::new(FlowMeter::new()),
