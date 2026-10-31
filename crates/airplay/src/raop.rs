@@ -1,50 +1,12 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::time::Duration;
 
 use tracing::{debug, info};
 
 use crate::receiver::Txt;
 use crate::rtsp::{Connection, Request, Response};
+use crate::session::{self, Offer, Session, Transport, refusal};
 use crate::{FRAMES_PER_PACKET, SAMPLE_RATE};
-
-/// Claude: what a stream offers the receiver in its handshake.
-pub(crate) struct Offer {
-    pub(crate) control_port: u16,
-    pub(crate) timing_port: u16,
-    pub(crate) first_seq: u16,
-    pub(crate) first_rtp: u32,
-}
-
-/// Claude: a receiver that accepted a stream: where to send audio and control
-/// packets, and the latency it adds to what sync packets say.
-pub(crate) struct Session {
-    pub(crate) connection: Connection,
-    pub(crate) uri: String,
-    pub(crate) audio: SocketAddr,
-    pub(crate) control: SocketAddr,
-    pub(crate) audio_latency: AudioLatency,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AudioLatency {
-    Reported(u32),
-    Assumed(u32),
-}
-
-impl AudioLatency {
-    pub(crate) fn frames(self) -> u32 {
-        match self {
-            AudioLatency::Reported(frames) | AudioLatency::Assumed(frames) => frames,
-        }
-    }
-}
-
-/// Claude: what a receiver whose RECORD answer has no `Audio-Latency` is taken
-/// to add: 11025 frames (0.25 s), what an AirPort Express reports and what
-/// OwnTone allows for every RAOP receiver whatever it reports. An HK Citation
-/// MultiBeam 1100 that reports none played about 0.23 s late when taken to add
-/// nothing.
-const ASSUMED_AUDIO_LATENCY: u32 = 11_025;
 
 enum Failure {
     AnnounceRefused(Response),
@@ -98,10 +60,7 @@ fn attempt(
     let local = connection.local_addr().ip();
     let peer = connection.peer_addr();
     let session_id = getrandom::u32().map_err(|e| Failure::Other(e.to_string()))?;
-    let uri = match local {
-        IpAddr::V4(ip) => format!("rtsp://{ip}/{session_id}"),
-        IpAddr::V6(ip) => format!("rtsp://[{ip}]/{session_id}"),
-    };
+    let uri = session::uri(local, session_id);
     let mut exchange = |request: Request| {
         let response = connection
             .exchange(&request, timeout, abort)
@@ -205,15 +164,9 @@ fn attempt(
         uri,
         audio,
         control,
-        audio_latency: audio_latency(&response),
+        audio_latency: session::audio_latency(&response),
+        transport: Transport::AirPlay1,
     })
-}
-
-fn audio_latency(record: &Response) -> AudioLatency {
-    match record.header("Audio-Latency").and_then(|l| l.parse().ok()) {
-        Some(frames) => AudioLatency::Reported(frames),
-        None => AudioLatency::Assumed(ASSUMED_AUDIO_LATENCY),
-    }
 }
 
 const AUTH_SETUP_UNENCRYPTED: u8 = 0x01;
@@ -240,15 +193,6 @@ fn transport_port(transport: &str, key: &str) -> Option<u16> {
         .filter_map(|part| part.split_once('='))
         .find(|(k, _)| k.trim().eq_ignore_ascii_case(key))
         .and_then(|(_, v)| v.trim().parse().ok())
-}
-
-fn refusal(method: &str, response: &Response) -> String {
-    let status = format!("{} {}", response.status, response.reason);
-    match response.status {
-        401 => format!("it requires a password ({method} answered {status})"),
-        453 => format!("it is busy with another sender ({method} answered {status})"),
-        _ => format!("it refused {method} with {status}"),
-    }
 }
 
 #[cfg(test)]
@@ -280,32 +224,6 @@ mod tests {
         assert_eq!(transport_port(transport, "server_port"), Some(6001));
         assert_eq!(transport_port(transport, "control_port"), Some(6002));
         assert_eq!(transport_port("RTP/AVP/UDP;unicast", "server_port"), None);
-    }
-
-    #[test]
-    fn a_record_answer_without_a_readable_audio_latency_is_taken_to_add_a_quarter_second() {
-        let record = |headers: &[(&str, &str)]| Response {
-            status: 200,
-            reason: "OK".into(),
-            headers: headers
-                .iter()
-                .map(|(n, v)| (n.to_string(), v.to_string()))
-                .collect(),
-            body: Vec::new(),
-        };
-        assert_eq!(
-            audio_latency(&record(&[("Audio-Latency", "4410")])),
-            AudioLatency::Reported(4410)
-        );
-        assert_eq!(
-            audio_latency(&record(&[("audio-latency", "0")])),
-            AudioLatency::Reported(0)
-        );
-        assert_eq!(audio_latency(&record(&[])), AudioLatency::Assumed(11_025));
-        assert_eq!(
-            audio_latency(&record(&[("Audio-Latency", "a lot")])),
-            AudioLatency::Assumed(11_025)
-        );
     }
 
     #[test]

@@ -10,12 +10,14 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
+use crate::airplay2::{self, Failure};
 use crate::backlog::Backlog;
 use crate::browse;
 use crate::clock::{self, Clock, PACKET_DURATION, Timeline};
-use crate::packet::{self, AUDIO_PACKET_LEN, AudioHeader, RETRANSMISSION_LEN, Sync};
-use crate::raop::{self, Offer, Session};
+use crate::packet::{self, AudioHeader, MAX_AUDIO_PACKET_LEN, MAX_RETRANSMISSION_LEN, Sync};
+use crate::raop;
 use crate::rtsp::{Connection, OpenError, ReadError, Request};
+use crate::session::{Offer, Session};
 use crate::turns::Turn;
 use crate::{
     Browser, Counters, FRAMES_PER_PACKET, LATENCY, Protocol, Receiver, ReceiverId, Render, Status,
@@ -217,8 +219,10 @@ pub(crate) struct Settings {
     pub(crate) answer_timeout: Duration,
     pub(crate) teardown_timeout: Duration,
     pub(crate) timing_silence: Duration,
-    pub(crate) keepalive: Duration,
     pub(crate) send_failure_limit: Duration,
+    /// Claude: the protocol the stream must speak, or `None` to speak the one
+    /// `Receiver::protocol` picks.
+    pub(crate) protocol: Option<Protocol>,
     #[cfg(test)]
     pub(crate) failing_sends: Arc<AtomicBool>,
 }
@@ -236,8 +240,8 @@ impl Settings {
             answer_timeout: Duration::from_secs(4),
             teardown_timeout: Duration::from_secs(1),
             timing_silence: Duration::from_secs(15),
-            keepalive: Duration::from_secs(25),
             send_failure_limit: Duration::from_secs(1),
+            protocol: None,
             #[cfg(test)]
             failing_sends: Arc::default(),
         })
@@ -264,6 +268,8 @@ fn run<R: FnMut(Render<'_>)>(
     };
     info!(
         %receiver,
+        protocol = %streamer.session.protocol(),
+        timing = "NTP",
         address = %streamer.session.connection.peer_addr(),
         audio_latency = ?streamer.session.audio_latency,
         "AirPlay stream started"
@@ -289,76 +295,63 @@ fn connect<'a, R>(
     render: R,
 ) -> Result<Streamer<'a, R>, String> {
     let abort = || shared.command() != Command::Play;
-    let supported = |found: &Receiver| found.support().is_ok();
+    let choose = |found: &Receiver| match settings.protocol {
+        Some(protocol) => found.service(protocol).map(|_| protocol),
+        None => found.protocol(),
+    };
     let found = browser
-        .find(receiver, settings.lookup_window, supported, &abort)?
+        .find(
+            receiver,
+            settings.lookup_window,
+            |found| choose(found).is_ok(),
+            &abort,
+        )?
         .ok_or_else(|| {
             format!(
                 "no AirPlay receiver {receiver} was found within {:?}",
                 settings.lookup_window
             )
         })?;
-    let name = &found.name;
-    let service = found
-        .service(Protocol::AirPlay1)
-        .map_err(|reason| format!("{name}: {reason}"))?;
+    let name = found.name.clone();
+    let protocol = choose(&found).map_err(|reason| format!("{name}: {reason}"))?;
     if !turn.wait(&abort) {
         return Err("stopped".into());
     }
-    let client = format!("{:016X}", getrandom::u64().map_err(|e| e.to_string())?);
-    let common = vec![
-        ("User-Agent", USER_AGENT.to_owned()),
-        ("Client-Instance", client.clone()),
-        ("DACP-ID", client),
-        (
-            "Active-Remote",
-            getrandom::u32().map_err(|e| e.to_string())?.to_string(),
-        ),
-    ];
-    let connection = open(
+    let connector = Connector {
         browser,
         receiver,
-        service.addresses.clone(),
-        &settings,
-        common,
-        &abort,
-    )
-    .map_err(|reason| format!("{name}: {reason}"))?;
-    let bind = || {
-        let any = match connection.local_addr() {
-            SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-            SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
-        };
-        UdpSocket::bind(any).map_err(|e| format!("could not open a UDP socket ({e})"))
+        settings: &settings,
+        client: Client::new()?,
+        clock: shared.clock,
+        abort: &abort,
     };
-    let (control, timing, audio) = (bind()?, bind()?, bind()?);
-    control.set_nonblocking(true).map_err(|e| e.to_string())?;
-    let port = |socket: &UdpSocket| {
-        socket
-            .local_addr()
-            .map(|a| a.port())
-            .map_err(|e| e.to_string())
+    let link = match connector.attempt(&found, protocol) {
+        Ok(link) => link,
+        Err(Failure::Refused(reason))
+            if settings.protocol.is_none()
+                && protocol == Protocol::AirPlay2
+                && browser
+                    .receiver(receiver)
+                    .is_some_and(|now| now.service(Protocol::AirPlay1).is_ok()) =>
+        {
+            warn!(%receiver, %reason, "AirPlay 2 refused; falling back to AirPlay 1");
+            connector
+                .attempt(&found, Protocol::AirPlay1)
+                .map_err(|failure| format!("{name}: {}", failure.reason()))?
+        }
+        Err(failure) => return Err(format!("{name}: {}", failure.reason())),
     };
-    let offer = Offer {
-        control_port: port(&control)?,
-        timing_port: port(&timing)?,
-        first_seq: settings.first_seq,
-        first_rtp: settings.first_rtp,
-    };
-    let timing = TimingResponder::start(timing, shared.clock)?;
-    let mut session = raop::negotiate(
-        connection,
-        &service.txt,
-        &offer,
-        settings.answer_timeout,
-        &abort,
-    )
-    .map_err(|reason| format!("{name}: {reason}"))?;
+    let Link {
+        mut session,
+        control,
+        audio,
+        timing,
+    } = link;
 
     let latency_frames = clock::frames(settings.latency);
     let audio_latency = session.audio_latency.frames();
     if audio_latency >= latency_frames {
-        teardown(&mut session, settings.teardown_timeout);
+        session.teardown(settings.teardown_timeout);
         return Err(format!(
             "{name}: it delays audio by {audio_latency} frames, not less than the stream's \
              latency of {latency_frames} frames"
@@ -378,7 +371,7 @@ fn connect<'a, R>(
         audio_latency,
         ssrc: getrandom::u32().map_err(|e| e.to_string())?,
         keepalive: Keepalive {
-            next_at: now + settings.keepalive,
+            next_at: now + session.keepalive().every,
             outstanding: None,
         },
         settings,
@@ -390,8 +383,8 @@ fn connect<'a, R>(
         backlog: Backlog::new(backlog_packets as usize),
         left: Box::new([0.0; FRAMES_PER_PACKET]),
         right: Box::new([0.0; FRAMES_PER_PACKET]),
-        packet: Box::new([0; AUDIO_PACKET_LEN]),
-        retransmission: Box::new([0; RETRANSMISSION_LEN]),
+        packet: Box::new([0; MAX_AUDIO_PACKET_LEN]),
+        retransmission: Box::new([0; MAX_RETRANSMISSION_LEN]),
         next: 0,
         next_sync: now,
         synced: false,
@@ -401,43 +394,141 @@ fn connect<'a, R>(
     })
 }
 
-/// Claude: connects to the receiver, trying again for `wake_window` while it
-/// fails as one waking from standby does. Each try goes to the addresses
-/// browsing knows by then, since a waking receiver may come back on others.
-fn open(
-    browser: &browse::Shared,
-    receiver: &ReceiverId,
-    mut addresses: Vec<SocketAddr>,
-    settings: &Settings,
-    common: Vec<(&'static str, String)>,
-    abort: &dyn Fn() -> bool,
-) -> Result<Connection, String> {
-    let deadline = Instant::now() + settings.wake_window;
-    let mut tries = 0u32;
-    loop {
-        if abort() {
-            return Err("stopped".into());
-        }
-        let tried_at = Instant::now();
-        let reason =
-            match Connection::open(&addresses, settings.connect_timeout, common.clone(), abort) {
-                Ok(connection) => return Ok(connection),
-                Err(OpenError::Transient(reason)) if Instant::now() < deadline => reason,
-                Err(error) => return Err(error.to_string()),
+/// Claude: how a stream names itself to the receiver, the same for each
+/// protocol it tries.
+struct Client {
+    id: String,
+    active_remote: String,
+}
+
+impl Client {
+    fn new() -> Result<Client, String> {
+        Ok(Client {
+            id: format!("{:016X}", getrandom::u64().map_err(|e| e.to_string())?),
+            active_remote: getrandom::u32().map_err(|e| e.to_string())?.to_string(),
+        })
+    }
+
+    fn headers(&self, protocol: Protocol) -> Vec<(&'static str, String)> {
+        let user_agent = match protocol {
+            Protocol::AirPlay1 => USER_AGENT,
+            Protocol::AirPlay2 => airplay2::USER_AGENT,
+        };
+        vec![
+            ("User-Agent", user_agent.to_owned()),
+            ("Client-Instance", self.id.clone()),
+            ("DACP-ID", self.id.clone()),
+            ("Active-Remote", self.active_remote.clone()),
+        ]
+    }
+}
+
+/// Claude: a session and the sockets its packets go through.
+struct Link {
+    session: Session,
+    control: UdpSocket,
+    audio: UdpSocket,
+    timing: TimingResponder,
+}
+
+/// Claude: what each handshake of one stream shares.
+struct Connector<'a> {
+    browser: &'a browse::Shared,
+    receiver: &'a ReceiverId,
+    settings: &'a Settings,
+    client: Client,
+    clock: Clock,
+    abort: &'a dyn Fn() -> bool,
+}
+
+impl Connector<'_> {
+    /// Claude: one handshake speaking `protocol`, holding nothing once it
+    /// fails.
+    fn attempt(&self, found: &Receiver, protocol: Protocol) -> Result<Link, Failure> {
+        let failed = |reason: String| Failure::Failed(reason);
+        let service = found.service(protocol).map_err(failed)?;
+        let connection = self
+            .open(protocol, service.addresses.clone())
+            .map_err(failed)?;
+        let bind = || {
+            let any = match connection.local_addr() {
+                SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+                SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
             };
-        tries += 1;
-        if tries == 1 {
-            info!(%receiver, %reason, "AirPlay receiver not answering; trying again while it wakes");
-        } else {
-            debug!(%receiver, %reason, tries, "AirPlay receiver still not answering");
-        }
-        if !pause_until((tried_at + WAKE_RETRY).min(deadline), abort) {
-            return Err("stopped".into());
-        }
-        if let Some(found) = browser.receiver(receiver)
-            && let Ok(service) = found.service(Protocol::AirPlay1)
-        {
-            addresses = service.addresses.clone();
+            UdpSocket::bind(any).map_err(|e| failed(format!("could not open a UDP socket ({e})")))
+        };
+        let (control, timing, audio) = (bind()?, bind()?, bind()?);
+        control
+            .set_nonblocking(true)
+            .map_err(|e| failed(e.to_string()))?;
+        let port = |socket: &UdpSocket| {
+            socket
+                .local_addr()
+                .map(|a| a.port())
+                .map_err(|e| failed(e.to_string()))
+        };
+        let offer = Offer {
+            control_port: port(&control)?,
+            timing_port: port(&timing)?,
+            first_seq: self.settings.first_seq,
+            first_rtp: self.settings.first_rtp,
+        };
+        let timing = TimingResponder::start(timing, self.clock).map_err(failed)?;
+        let timeout = self.settings.answer_timeout;
+        let session = match protocol {
+            Protocol::AirPlay1 => {
+                raop::negotiate(connection, &service.txt, &offer, timeout, self.abort)
+                    .map_err(failed)?
+            }
+            Protocol::AirPlay2 => airplay2::negotiate(connection, &offer, timeout, self.abort)?,
+        };
+        Ok(Link {
+            session,
+            control,
+            audio,
+            timing,
+        })
+    }
+
+    /// Claude: connects to the receiver, trying again for `wake_window` while
+    /// it fails as one waking from standby does. Each try goes to the
+    /// addresses browsing knows by then, since a waking receiver may come back
+    /// on others.
+    fn open(
+        &self,
+        protocol: Protocol,
+        mut addresses: Vec<SocketAddr>,
+    ) -> Result<Connection, String> {
+        let (settings, abort, receiver) = (self.settings, self.abort, self.receiver);
+        let common = self.client.headers(protocol);
+        let deadline = Instant::now() + settings.wake_window;
+        let mut tries = 0u32;
+        loop {
+            if abort() {
+                return Err("stopped".into());
+            }
+            let tried_at = Instant::now();
+            let reason =
+                match Connection::open(&addresses, settings.connect_timeout, common.clone(), abort)
+                {
+                    Ok(connection) => return Ok(connection),
+                    Err(OpenError::Transient(reason)) if Instant::now() < deadline => reason,
+                    Err(error) => return Err(error.to_string()),
+                };
+            tries += 1;
+            if tries == 1 {
+                info!(%receiver, %reason, "AirPlay receiver not answering; trying again while it wakes");
+            } else {
+                debug!(%receiver, %reason, tries, "AirPlay receiver still not answering");
+            }
+            if !pause_until((tried_at + WAKE_RETRY).min(deadline), abort) {
+                return Err("stopped".into());
+            }
+            if let Some(found) = self.browser.receiver(receiver)
+                && let Ok(service) = found.service(protocol)
+            {
+                addresses = service.addresses.clone();
+            }
         }
     }
 }
@@ -473,8 +564,8 @@ struct Streamer<'a, R> {
     backlog: Backlog,
     left: Box<[f32; FRAMES_PER_PACKET]>,
     right: Box<[f32; FRAMES_PER_PACKET]>,
-    packet: Box<[u8; AUDIO_PACKET_LEN]>,
-    retransmission: Box<[u8; RETRANSMISSION_LEN]>,
+    packet: Box<[u8; MAX_AUDIO_PACKET_LEN]>,
+    retransmission: Box<[u8; MAX_RETRANSMISSION_LEN]>,
     next: u64,
     next_sync: Instant,
     synced: bool,
@@ -575,9 +666,11 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
             ssrc: self.ssrc,
             marker: self.backlog.latest().is_none(),
         };
-        packet::write_audio_packet(&mut self.packet, &header, &self.left, &self.right);
-        let sent = self.send_audio();
-        self.backlog.push(packet, seq, &self.packet);
+        let len = self
+            .session
+            .write_audio(&header, &self.left, &self.right, &mut self.packet);
+        let sent = self.send_audio(len);
+        self.backlog.push(packet, seq, &self.packet[..len]);
         match sent {
             Ok(sent) => {
                 self.failing_since = None;
@@ -598,12 +691,12 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
         }
     }
 
-    fn send_audio(&self) -> std::io::Result<usize> {
+    fn send_audio(&self, len: usize) -> std::io::Result<usize> {
         #[cfg(test)]
         if self.settings.failing_sends.load(Ordering::Acquire) {
             return Err(std::io::Error::other("injected failure"));
         }
-        self.audio.send_to(&self.packet[..], self.session.audio)
+        self.audio.send_to(&self.packet[..len], self.session.audio)
     }
 
     fn sync_if_due(&mut self) {
@@ -684,6 +777,7 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
     }
 
     fn read_rtsp(&mut self) -> Result<(), String> {
+        let needs_ok = self.session.keepalive().needs_ok;
         let connection = &mut self.session.connection;
         match connection.read_ready() {
             Ok(()) | Err(ReadError::TimedOut) => {}
@@ -693,7 +787,7 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
             if let Some((cseq, _)) = self.keepalive.outstanding
                 && response.cseq() == Some(cseq)
             {
-                if response.status != 200 {
+                if response.status != 200 && needs_ok {
                     return Err(format!(
                         "it answered a keep-alive with {} {}",
                         response.status, response.reason
@@ -712,14 +806,15 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
                 return Err("it stopped answering RTSP".into());
             }
         } else if now >= self.keepalive.next_at {
-            self.keepalive.next_at = now + self.settings.keepalive;
-            let options = Request {
-                method: "OPTIONS",
-                uri: "*",
+            let keepalive = self.session.keepalive();
+            self.keepalive.next_at = now + keepalive.every;
+            let request = Request {
+                method: keepalive.method,
+                uri: keepalive.uri,
                 headers: vec![],
                 body: None,
             };
-            let cseq = self.session.connection.send(&options)?;
+            let cseq = self.session.connection.send(&request)?;
             self.keepalive.outstanding = Some((cseq, now));
         }
         if let Some(last) = self.timing.last_request()
@@ -731,20 +826,7 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
     }
 
     fn teardown(&mut self) {
-        teardown(&mut self.session, self.settings.teardown_timeout);
-    }
-}
-
-fn teardown(session: &mut Session, timeout: Duration) {
-    let teardown = Request {
-        method: "TEARDOWN",
-        uri: &session.uri,
-        headers: vec![],
-        body: None,
-    };
-    match session.connection.exchange(&teardown, timeout, &|| false) {
-        Ok(response) => debug!(status = response.status, "TEARDOWN answered"),
-        Err(reason) => debug!(%reason, "TEARDOWN unanswered"),
+        self.session.teardown(self.settings.teardown_timeout);
     }
 }
 

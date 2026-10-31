@@ -72,23 +72,87 @@ impl Response {
 /// Claude: the first complete response in `buf` and how many bytes it took, or
 /// `None` while it is incomplete.
 pub(crate) fn decode_response(buf: &[u8]) -> Result<Option<(Response, usize)>, String> {
+    let Some(message) = decode_message(buf)? else {
+        return Ok(None);
+    };
+    let mut parts = message.first_line.splitn(3, ' ');
+    let protocol = parts.next().unwrap_or_default();
+    let status = parts.next().and_then(|s| s.parse().ok());
+    let (true, Some(status)) = (protocol.contains('/'), status) else {
+        return Err(format!("malformed status line {:?}", message.first_line));
+    };
+    let reason = parts.next().unwrap_or_default().to_owned();
+    Ok(Some((
+        Response {
+            status,
+            reason,
+            headers: message.headers,
+            body: message.body,
+        },
+        message.len,
+    )))
+}
+
+/// Claude: a request a receiver sends, as over an AirPlay 2 event connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IncomingRequest {
+    pub(crate) method: String,
+    pub(crate) uri: String,
+    pub(crate) protocol: String,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Vec<u8>,
+}
+
+impl IncomingRequest {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+pub(crate) fn decode_request(buf: &[u8]) -> Result<Option<(IncomingRequest, usize)>, String> {
+    let Some(message) = decode_message(buf)? else {
+        return Ok(None);
+    };
+    let parts: Vec<&str> = message.first_line.split(' ').collect();
+    let [method, uri, protocol] = parts[..] else {
+        return Err(format!("malformed request line {:?}", message.first_line));
+    };
+    if !protocol.contains('/') {
+        return Err(format!("malformed request line {:?}", message.first_line));
+    }
+    Ok(Some((
+        IncomingRequest {
+            method: method.to_owned(),
+            uri: uri.to_owned(),
+            protocol: protocol.to_owned(),
+            headers: message.headers,
+            body: message.body,
+        },
+        message.len,
+    )))
+}
+
+struct Message {
+    first_line: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    len: usize,
+}
+
+fn decode_message(buf: &[u8]) -> Result<Option<Message>, String> {
     let Some(head_len) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
         return if buf.len() > MAX_HEAD {
-            Err("response headers too long".into())
+            Err("message headers too long".into())
         } else {
             Ok(None)
         };
     };
     let head = String::from_utf8_lossy(&buf[..head_len]);
     let mut lines = head.split("\r\n");
-    let status_line = lines.next().unwrap_or_default();
-    let mut parts = status_line.splitn(3, ' ');
-    let protocol = parts.next().unwrap_or_default();
-    let status = parts.next().and_then(|s| s.parse().ok());
-    let (true, Some(status)) = (protocol.contains('/'), status) else {
-        return Err(format!("malformed status line {status_line:?}"));
-    };
-    let reason = parts.next().unwrap_or_default().to_owned();
+    let first_line = lines.next().unwrap_or_default().to_owned();
     let headers: Vec<(String, String)> = lines
         .filter_map(|line| line.split_once(':'))
         .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
@@ -103,22 +167,18 @@ pub(crate) fn decode_response(buf: &[u8]) -> Result<Option<(Response, usize)>, S
         .transpose()?
         .unwrap_or(0);
     if body_len > MAX_BODY {
-        return Err(format!("response body of {body_len} bytes is too long"));
+        return Err(format!("message body of {body_len} bytes is too long"));
     }
     let body_start = head_len + 4;
     if buf.len() < body_start + body_len {
         return Ok(None);
     }
-    let body = buf[body_start..body_start + body_len].to_vec();
-    Ok(Some((
-        Response {
-            status,
-            reason,
-            headers,
-            body,
-        },
-        body_start + body_len,
-    )))
+    Ok(Some(Message {
+        first_line,
+        headers,
+        body: buf[body_start..body_start + body_len].to_vec(),
+        len: body_start + body_len,
+    }))
 }
 
 /// Claude: an RTSP connection to a receiver. Requests carry the common headers
@@ -299,7 +359,7 @@ impl Connection {
 
 /// Claude: connects on a thread of its own so that `abort` can cut the wait
 /// short; an abandoned attempt ends by itself within `timeout`.
-fn connect(
+pub(crate) fn connect(
     address: SocketAddr,
     timeout: Duration,
     abort: &dyn Fn() -> bool,
@@ -486,6 +546,28 @@ mod tests {
         );
         assert!(decode_response(b"garbage\r\n\r\n").is_err());
         assert!(decode_response(b"RTSP/1.0 200 OK\r\nContent-Length: x\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn requests_parse_once_complete() {
+        let message = b"POST /command RTSP/1.0\r\nCSeq: 3\r\nContent-Length: 2\r\n\r\nabPOST";
+        assert_eq!(decode_request(&message[..40]), Ok(None));
+        let (request, len) = decode_request(message).unwrap().unwrap();
+        assert_eq!(len, message.len() - 4);
+        assert_eq!(
+            (
+                request.method.as_str(),
+                request.uri.as_str(),
+                request.protocol.as_str()
+            ),
+            ("POST", "/command", "RTSP/1.0")
+        );
+        assert_eq!(
+            (request.header("cseq"), request.body.as_slice()),
+            (Some("3"), &b"ab"[..])
+        );
+        assert!(decode_request(b"POST /command\r\n\r\n").is_err());
+        assert!(decode_request(b"RTSP/1.0 200 OK\r\n\r\n").is_err());
     }
 
     #[test]

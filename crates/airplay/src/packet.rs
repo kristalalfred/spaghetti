@@ -1,11 +1,29 @@
 use crate::FRAMES_PER_PACKET;
 use crate::clock::Ntp;
+use crate::hap::{Counted, TAG_LEN};
 
 pub(crate) const RTP_HEADER_LEN: usize = 12;
-const ALAC_HEADER_BITS: usize = 3 + 4 + 12 + 1 + 2 + 1 + 32;
+const ALAC_HEADER_BITS: usize = 3 + 4 + 12 + 1 + 2 + 1;
+const ALAC_COUNT_BITS: usize = 32;
 const ALAC_END_BITS: usize = 3;
-pub(crate) const AUDIO_PACKET_LEN: usize = RTP_HEADER_LEN + alac_frame_len(FRAMES_PER_PACKET);
-pub(crate) const RETRANSMISSION_LEN: usize = 4 + AUDIO_PACKET_LEN;
+const NONCE_LEN: usize = 8;
+const RETRANSMISSION_HEADER_LEN: usize = 4;
+pub(crate) const AIRPLAY1_PACKET_LEN: usize =
+    RTP_HEADER_LEN + alac_frame_len(FRAMES_PER_PACKET, Framing::Counted);
+pub(crate) const AIRPLAY2_PACKET_LEN: usize =
+    RTP_HEADER_LEN + alac_frame_len(FRAMES_PER_PACKET, Framing::Full) + TAG_LEN + NONCE_LEN;
+pub(crate) const MAX_AUDIO_PACKET_LEN: usize = if AIRPLAY1_PACKET_LEN > AIRPLAY2_PACKET_LEN {
+    AIRPLAY1_PACKET_LEN
+} else {
+    AIRPLAY2_PACKET_LEN
+};
+pub(crate) const MAX_RETRANSMISSION_LEN: usize = RETRANSMISSION_HEADER_LEN + MAX_AUDIO_PACKET_LEN;
+const IPV6_HEADER_LEN: usize = 40;
+const UDP_HEADER_LEN: usize = 8;
+const ETHERNET_MTU: usize = 1500;
+/// Claude: receivers resolve to link-local IPv6 addresses, where a datagram
+/// over the MTU is fragmented, which some receivers may never reassemble.
+const _: () = assert!(IPV6_HEADER_LEN + UDP_HEADER_LEN + MAX_RETRANSMISSION_LEN <= ETHERNET_MTU);
 pub(crate) const PAYLOAD_TYPE_AUDIO: u8 = 0x60;
 const MARKER: u8 = 0x80;
 const VERSION_2: u8 = 0x80;
@@ -18,8 +36,24 @@ const TYPE_RETRANSMISSION: u8 = 0x56;
 const SYNC_SEQ: u16 = 7;
 const TIMING_SEQ: u16 = 7;
 
-pub(crate) const fn alac_frame_len(frames: usize) -> usize {
-    (ALAC_HEADER_BITS + 32 * frames + ALAC_END_BITS).div_ceil(8)
+/// Claude: how an uncompressed ALAC frame says how many frames it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Framing {
+    /// Claude: it carries the count, as libraop writes every frame and as the
+    /// AirPlay 1 receivers in use have been heard to play.
+    Counted,
+    /// Claude: it leaves the count out, so the decoder takes the stream's
+    /// frames per packet, as Apple's encoder writes a full frame; four bytes
+    /// shorter, which an AirPlay 2 packet needs to fit the MTU.
+    Full,
+}
+
+pub(crate) const fn alac_frame_len(frames: usize, framing: Framing) -> usize {
+    let count = match framing {
+        Framing::Counted => ALAC_COUNT_BITS,
+        Framing::Full => 0,
+    };
+    (ALAC_HEADER_BITS + count + 32 * frames + ALAC_END_BITS).div_ceil(8)
 }
 
 pub(crate) struct AudioHeader {
@@ -30,13 +64,14 @@ pub(crate) struct AudioHeader {
 }
 
 /// Claude: an RTP packet of payload type 96 carrying the frames as one
-/// uncompressed ALAC frame of 16-bit stereo.
+/// uncompressed ALAC frame of 16-bit stereo; returns its length.
 pub(crate) fn write_audio_packet(
-    out: &mut [u8; AUDIO_PACKET_LEN],
+    out: &mut [u8; MAX_AUDIO_PACKET_LEN],
     header: &AudioHeader,
     left: &[f32; FRAMES_PER_PACKET],
     right: &[f32; FRAMES_PER_PACKET],
-) {
+    framing: Framing,
+) -> usize {
     out[0] = VERSION_2;
     out[1] = PAYLOAD_TYPE_AUDIO | if header.marker { MARKER } else { 0 };
     out[2..4].copy_from_slice(&header.seq.to_be_bytes());
@@ -46,7 +81,23 @@ pub(crate) fn write_audio_packet(
         .iter()
         .zip(right)
         .map(|(&l, &r)| [to_i16(l), to_i16(r)]);
-    write_alac_uncompressed(&mut out[RTP_HEADER_LEN..], frames);
+    RTP_HEADER_LEN + write_alac_uncompressed(&mut out[RTP_HEADER_LEN..], frames, framing)
+}
+
+/// Claude: seals the payload of the `len`-byte packet in `out` as an AirPlay 2
+/// receiver opens it, as pyatv sends it: ChaCha20-Poly1305 with the RTP
+/// timestamp and SSRC as associated data, then the tag, then the nonce's
+/// counter in little-endian. Returns the sealed packet's length.
+pub(crate) fn seal_audio(
+    key: &mut Counted,
+    out: &mut [u8; MAX_AUDIO_PACKET_LEN],
+    len: usize,
+) -> usize {
+    let (header, payload) = out[..len].split_at_mut(RTP_HEADER_LEN);
+    let (tag, counter) = key.seal(&header[4..12], payload);
+    out[len..len + TAG_LEN].copy_from_slice(&tag);
+    out[len + TAG_LEN..len + TAG_LEN + NONCE_LEN].copy_from_slice(&counter.to_le_bytes());
+    len + TAG_LEN + NONCE_LEN
 }
 
 pub(crate) fn to_i16(sample: f32) -> i16 {
@@ -59,17 +110,20 @@ pub(crate) fn to_i16(sample: f32) -> i16 {
 fn write_alac_uncompressed(
     out: &mut [u8],
     frames: impl ExactSizeIterator<Item = [i16; 2]>,
+    framing: Framing,
 ) -> usize {
-    let len = alac_frame_len(frames.len());
+    let len = alac_frame_len(frames.len(), framing);
     out[..len].fill(0);
     let mut bits = BitWriter { out, bit: 0 };
     bits.put(1, 3);
     bits.put(0, 4);
     bits.put(0, 12);
-    bits.put(1, 1);
+    bits.put(u32::from(framing == Framing::Counted), 1);
     bits.put(0, 2);
     bits.put(1, 1);
-    bits.put(frames.len() as u32, 32);
+    if framing == Framing::Counted {
+        bits.put(frames.len() as u32, 32);
+    }
     for [left, right] in frames {
         bits.put(u32::from(left as u16), 16);
         bits.put(u32::from(right as u16), 16);
@@ -150,12 +204,16 @@ pub(crate) fn retransmit_request(packet: &[u8]) -> Option<(u16, u16)> {
     ))
 }
 
-pub(crate) fn write_retransmission(original: &[u8], out: &mut [u8; RETRANSMISSION_LEN]) -> usize {
+pub(crate) fn write_retransmission(
+    original: &[u8],
+    out: &mut [u8; MAX_RETRANSMISSION_LEN],
+) -> usize {
     out[0] = VERSION_2;
     out[1] = MARKER | TYPE_RETRANSMISSION;
     out[2..4].copy_from_slice(&original[2..4]);
-    out[4..4 + original.len()].copy_from_slice(original);
-    4 + original.len()
+    let len = RETRANSMISSION_HEADER_LEN + original.len();
+    out[RETRANSMISSION_HEADER_LEN..len].copy_from_slice(original);
+    len
 }
 
 #[cfg(test)]
@@ -182,10 +240,20 @@ mod tests {
     fn uncompressed_alac_frames_follow_the_bitstream_layout() {
         let mut out = [0xAA; 32];
         let frames = [[0x1234, 0xABCDu16 as i16], [-1, 0]];
-        let len = write_alac_uncompressed(&mut out, frames.into_iter());
+        let len = write_alac_uncompressed(&mut out, frames.into_iter(), Framing::Counted);
         let expected = bytes(concat!(
             "001 0000 000000000000 1 00 1",
             "00000000000000000000000000000010",
+            "0001001000110100 1010101111001101",
+            "1111111111111111 0000000000000000",
+            "111",
+        ));
+        assert_eq!(&out[..len], expected.as_slice());
+
+        let mut out = [0xAA; 32];
+        let len = write_alac_uncompressed(&mut out, frames.into_iter(), Framing::Full);
+        let expected = bytes(concat!(
+            "001 0000 000000000000 0 00 1",
             "0001001000110100 1010101111001101",
             "1111111111111111 0000000000000000",
             "111",
@@ -195,8 +263,8 @@ mod tests {
 
     #[test]
     fn a_full_packet_is_a_header_and_1416_bytes_of_alac() {
-        assert_eq!(alac_frame_len(FRAMES_PER_PACKET), 1416);
-        let mut out = [0; AUDIO_PACKET_LEN];
+        assert_eq!(alac_frame_len(FRAMES_PER_PACKET, Framing::Counted), 1416);
+        let mut out = [0; MAX_AUDIO_PACKET_LEN];
         let mut left = [0.0; FRAMES_PER_PACKET];
         let right = [0.0; FRAMES_PER_PACKET];
         left[0] = 0.5;
@@ -206,21 +274,73 @@ mod tests {
             ssrc: 0x0102_0304,
             marker: true,
         };
-        write_audio_packet(&mut out, &header, &left, &right);
+        assert_eq!(
+            write_audio_packet(&mut out, &header, &left, &right, Framing::Counted),
+            AIRPLAY1_PACKET_LEN
+        );
         assert_eq!(
             out[..12],
             [0x80, 0xE0, 0x12, 0x34, 0x89, 0xAB, 0xCD, 0xEF, 1, 2, 3, 4]
         );
         assert_eq!(out[12..19], [0x20, 0x00, 0x12, 0x00, 0x00, 0x02, 0xC0]);
         assert_eq!(out[19], 0x80);
-        assert_eq!(out[AUDIO_PACKET_LEN - 2..], [0x01, 0xC0]);
+        assert_eq!(
+            out[AIRPLAY1_PACKET_LEN - 2..AIRPLAY1_PACKET_LEN],
+            [0x01, 0xC0]
+        );
 
         let header = AudioHeader {
             marker: false,
             ..header
         };
-        write_audio_packet(&mut out, &header, &left, &right);
+        write_audio_packet(&mut out, &header, &left, &right, Framing::Counted);
         assert_eq!(out[1], 0x60);
+    }
+
+    /// Claude: the payload sealed with key 00..1f and counter 0, with the
+    /// timestamp and SSRC bytes of the header as associated data, built with
+    /// OpenSSL's ChaCha20 and Poly1305 as RFC 8439 composes them.
+    const SEALED_TAG: &str = "bdc6bf7c0992d6aae3d35ceddd05a86b";
+
+    #[test]
+    fn an_airplay_2_packet_seals_its_full_alac_frame_and_fits_ipv6() {
+        assert_eq!(alac_frame_len(FRAMES_PER_PACKET, Framing::Full), 1412);
+        assert_eq!(AIRPLAY2_PACKET_LEN, 1448);
+        assert_eq!(
+            IPV6_HEADER_LEN + UDP_HEADER_LEN + RETRANSMISSION_HEADER_LEN + AIRPLAY2_PACKET_LEN,
+            1500
+        );
+        let header = AudioHeader {
+            seq: 0x1234,
+            timestamp: 0x89AB_CDEF,
+            ssrc: 0x0102_0304,
+            marker: true,
+        };
+        let left: [f32; FRAMES_PER_PACKET] = std::array::from_fn(|i| i as f32 / 1024.0);
+        let right: [f32; FRAMES_PER_PACKET] = std::array::from_fn(|i| -(i as f32) / 2048.0);
+        let mut plain = [0; MAX_AUDIO_PACKET_LEN];
+        let plain_len = write_audio_packet(&mut plain, &header, &left, &right, Framing::Full);
+        assert_eq!(plain_len, 12 + 1412);
+        assert_eq!(plain[12..15], [0x20, 0x00, 0x02]);
+
+        let key = std::array::from_fn(|i| i as u8);
+        let mut counted = Counted::new(&key);
+        let mut sealed = plain;
+        let len = seal_audio(&mut counted, &mut sealed, plain_len);
+        assert_eq!(len, AIRPLAY2_PACKET_LEN);
+        assert_eq!(sealed[..12], plain[..12]);
+        assert!(sealed[12..plain_len] != plain[12..plain_len]);
+        let tag_at = plain_len;
+        assert_eq!(
+            sealed[tag_at..tag_at + 16].to_vec(),
+            crate::srp::tests::hex(SEALED_TAG)
+        );
+        assert_eq!(sealed[tag_at + 16..len], 0u64.to_le_bytes());
+        let len = seal_audio(&mut counted, &mut plain.clone(), plain_len);
+        assert_eq!(len, AIRPLAY2_PACKET_LEN);
+        let mut again = plain;
+        seal_audio(&mut counted, &mut again, plain_len);
+        assert_eq!(again[len - 8..len], 2u64.to_le_bytes());
     }
 
     #[test]
@@ -292,10 +412,10 @@ mod tests {
             None
         );
 
-        let original: Vec<u8> = (0..AUDIO_PACKET_LEN).map(|i| i as u8).collect();
-        let mut out = [0; RETRANSMISSION_LEN];
+        let original: Vec<u8> = (0..AIRPLAY2_PACKET_LEN).map(|i| i as u8).collect();
+        let mut out = [0; MAX_RETRANSMISSION_LEN];
         let len = write_retransmission(&original, &mut out);
-        assert_eq!(len, RETRANSMISSION_LEN);
+        assert_eq!(len, 4 + AIRPLAY2_PACKET_LEN);
         assert_eq!(out[..4], [0x80, 0xD6, original[2], original[3]]);
         assert_eq!(&out[4..len], original.as_slice());
     }

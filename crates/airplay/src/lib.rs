@@ -1,14 +1,18 @@
+mod airplay2;
 mod backlog;
 mod browse;
 mod clock;
 mod dns_sd;
+mod events;
 #[cfg(test)]
 mod fake;
 mod hap;
 mod packet;
+mod pairing;
 mod raop;
 mod receiver;
 mod rtsp;
+mod session;
 mod srp;
 mod stream;
 mod tlv8;
