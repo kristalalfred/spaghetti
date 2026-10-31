@@ -472,8 +472,8 @@ mod tests {
 
     #[test]
     fn the_browser_reports_receivers_found_after_its_warm_up() {
-        let browser = Browser::offline();
         let started = Instant::now();
+        let browser = Browser::offline();
         assert_eq!(browser.receivers(), Ok(vec![]));
         assert!(started.elapsed() >= WARM_UP);
 

@@ -911,7 +911,7 @@ mod tests {
             played_out - teardown_at
         );
         assert!(
-            teardown_at - played_out < Duration::from_millis(100),
+            teardown_at - played_out < PROMPT,
             "TEARDOWN came {:?} late",
             teardown_at - played_out
         );
