@@ -15,7 +15,7 @@ use crate::ring::{CHANNELS, Ring};
 use crate::router::Router;
 use crate::sinks::SourceTiming;
 use crate::stun;
-use crate::{Destination, Frames, HostTime, ProgramInput, SourceSpec};
+use crate::{Destination, Frames, HostTime, Playback, ProgramInput, SourceSpec};
 
 mod turn;
 
@@ -1352,4 +1352,158 @@ async fn frames_after_a_capture_gap_keep_their_capture_dates_across_the_link() {
             "window {window} after the gap: frames match the audio captured within 0.5 ms of their dates by {similarity:.2}"
         );
     }
+}
+
+/// Claude: a route on a delay made as soon as the link is negotiated receives
+/// its first frames before the receiver knows the sender's clock, undated. It
+/// starts playing once the frames come dated, each heard its delay after the
+/// sender captured it. The program renders on a steady clock, each buffer
+/// rendered `AHEAD` before it is heard.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delayed_route_made_as_the_link_comes_up_plays_once_frames_are_dated() {
+    const AHEAD: Duration = Duration::from_millis(10);
+    let (rate, delay, buffer) = (48000.0, 0.3, 480);
+    let engine = Engine::new();
+    let (fixture, input) = engine.fixture(rate);
+    let producer = Producer::feeding(input, rate, |frame, _| noise(frame));
+    let source_id = engine
+        .create_source(peer(PeerRole::Answer, "delayed"))
+        .await;
+    let route = PeerRef::Route(
+        engine
+            .create_route(fixture, peer(PeerRole::Offer, "delayed"))
+            .await,
+    );
+    let mut speaker = engine
+        .router()
+        .add_program_output("speaker", rate, Duration::ZERO)
+        .unwrap();
+    engine
+        .exchange(route, PeerRef::Source(source_id), direct)
+        .await;
+    let delayed = engine
+        .router()
+        .create_route(
+            source_id,
+            Destination::Program {
+                output: "speaker".into(),
+                delay_ms: Some((delay * 1000.0) as u32),
+            },
+            1.0,
+        )
+        .unwrap();
+    let created = Instant::now();
+    let (beside, _) = engine.sink(source_id);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let output = std::thread::spawn({
+        let stop = Arc::clone(&stop);
+        move || {
+            let ticks_per_second = host_time::ticks_per_second();
+            let period = Duration::from_secs_f64(buffer as f64 / rate);
+            let (start, first_heard) = (Instant::now(), host_time::now());
+            let mut played = Vec::new();
+            let (mut left, mut right) = (vec![0.0; buffer], vec![0.0; buffer]);
+            let mut renders = 0u32;
+            while !stop.load(Ordering::Relaxed) {
+                if let Some(wait) =
+                    (start + period * renders).checked_duration_since(Instant::now())
+                {
+                    std::thread::sleep(wait);
+                }
+                let heard = first_heard
+                    + ((AHEAD + period * renders).as_secs_f64() * ticks_per_second) as u64;
+                speaker
+                    .render([&mut left, &mut right], HostTime::from_ticks(heard))
+                    .unwrap();
+                played.push((heard, left.clone()));
+                renders += 1;
+            }
+            played
+        }
+    });
+
+    let first_dated = tokio::task::spawn_blocking(move || {
+        let ticks_per_frame = host_time::ticks_per_second() / rate;
+        while beside.take_discontinuity().is_none() {
+            if created.elapsed() > Duration::from_secs(3) {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Some(beside.tail_captured(ticks_per_frame).is_some())
+    });
+    let playback = || {
+        engine
+            .router()
+            .list_routes()
+            .into_iter()
+            .find(|listed| listed.route_id == delayed)
+            .and_then(|listed| listed.playback)
+    };
+    while playback() != Some(Playback::Playing) && created.elapsed() < Duration::from_secs(3) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let started = created.elapsed();
+    let playing = playback();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    stop.store(true, Ordering::Relaxed);
+    let played = output.join().unwrap();
+    assert_eq!(
+        first_dated.await.unwrap(),
+        Some(false),
+        "the route's first frames came dated, or none came"
+    );
+    assert_eq!(
+        playing,
+        Some(Playback::Playing),
+        "not playing {started:?} after the route was made"
+    );
+
+    let ticks_per_second = host_time::ticks_per_second();
+    let ticks_per_frame = ticks_per_second / rate;
+    let since = played.last().unwrap().0 - (1.0 * ticks_per_second) as u64;
+    let frames: Vec<(f64, f32)> = played
+        .iter()
+        .filter(|(heard, _)| *heard >= since)
+        .flat_map(|(heard, samples)| {
+            samples.iter().enumerate().map(move |(f, &sample)| {
+                let captured = *heard as f64 + f as f64 * ticks_per_frame
+                    - delay * ticks_per_second
+                    - producer.origin as f64;
+                (captured / ticks_per_frame, sample)
+            })
+        })
+        .collect();
+    let similarity = |shift: i64| -> f64 {
+        let (both, heard, sent) =
+            frames
+                .iter()
+                .fold((0.0, 0.0, 0.0), |(both, heard, sent), &(frame, sample)| {
+                    let source = f64::from(noise((frame.round() as i64 + shift).max(0) as usize));
+                    let sample = f64::from(sample);
+                    (
+                        both + sample * source,
+                        heard + sample * sample,
+                        sent + source * source,
+                    )
+                });
+        both / (heard * sent).sqrt()
+    };
+    let window = (0.02 * rate) as i64;
+    let shift = (-window..=window)
+        .max_by(|&a, &b| similarity(a).total_cmp(&similarity(b)))
+        .unwrap();
+    let late = -shift as f64 / rate;
+    assert!(
+        similarity(shift) > 0.3,
+        "frames match the audio captured {} µs before their delay by {:.2}",
+        late * 1e6,
+        similarity(shift)
+    );
+    assert!(
+        late.abs() < 0.0005,
+        "frames heard {} µs after their delay",
+        late * 1e6
+    );
 }

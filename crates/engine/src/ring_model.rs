@@ -34,6 +34,8 @@ pub enum Op {
     /// run before it ended.
     Break(Kind),
     Take,
+    /// Claude: a scheduled consumer's drop of the undated frames at the tail.
+    DiscardUndated,
     Available,
     CapturedAt,
     Date,
@@ -151,6 +153,20 @@ impl Reference {
         self.arrived(frame) + past as f64 / RATE
     }
 
+    /// Claude: drops the taken run's frames from the tail on whose blocks
+    /// were not dated, up to its first dated frame.
+    fn discard_undated(&mut self) -> usize {
+        let start = self.tail;
+        if self.taken.is_some() {
+            let end = self.end();
+            while self.tail < end && !self.block_at(self.tail).dated {
+                let block = self.block_at(self.tail);
+                self.tail = block.start + block.len;
+            }
+        }
+        self.tail - start
+    }
+
     fn last_push(&self) -> (usize, f64) {
         let taken = self.taken.unwrap();
         let last = self
@@ -242,6 +258,7 @@ impl Check {
         match op {
             Op::Push(kind) | Op::Break(kind) => self.push(kind, matches!(op, Op::Break(_))),
             Op::Take => self.take(),
+            Op::DiscardUndated => self.discard_undated(),
             Op::Available => self.available().map(|_| ()),
             Op::CapturedAt => self.captured_at(),
             Op::Date => self.date(),
@@ -303,6 +320,14 @@ impl Check {
             }
             (got, expected) => Err(format!("took {got:?}, expected {expected:?}")),
         }
+    }
+
+    fn discard_undated(&mut self) -> Result<(), String> {
+        let got = self.ring.discard_undated();
+        let expected = self.reference.discard_undated();
+        (got == expected)
+            .then_some(())
+            .ok_or_else(|| format!("discarded {got} undated frames, expected {expected}"))
     }
 
     fn available(&mut self) -> Result<usize, String> {
@@ -549,6 +574,7 @@ mod tests {
         }
         alphabet.extend([
             Op::Take,
+            Op::DiscardUndated,
             Op::Available,
             Op::CapturedAt,
             Op::Date,
@@ -567,10 +593,7 @@ mod tests {
             ran,
             failed.join("\n")
         );
-        assert_eq!(
-            ran,
-            4 * (13 + 13usize.pow(2) + 13usize.pow(3) + 13usize.pow(4))
-        );
+        assert_eq!(ran, 4 * (1..=4).map(|n| 14usize.pow(n)).sum::<usize>());
     }
 
     fn senders_and_sources() -> Vec<(Vec<Op>, usize, usize)> {
@@ -618,5 +641,30 @@ mod tests {
             failed.join("\n")
         );
         assert_eq!(ran, 12 * (1..=7).map(|n| 5usize.pow(n)).sum::<usize>());
+    }
+
+    /// Claude: a consumer that plays only dated frames, as a route on a
+    /// schedule does, and a source that dates its frames only after its first
+    /// ones, as a WebRTC source does until it knows its sender's clock, up to
+    /// five steps.
+    #[test]
+    fn every_interleaving_of_a_scheduled_consumer_and_a_source_dating_late() {
+        let mut alphabet = Vec::new();
+        for kind in [Kind::Unknown, Kind::Estimated] {
+            alphabet.extend([Op::Push(kind), Op::Break(kind)]);
+        }
+        alphabet.extend([Op::Take, Op::DiscardUndated, Op::Look, Op::Pop]);
+        let cases: Vec<_> = configurations()
+            .into_iter()
+            .map(|(packet, push)| (alphabet.clone(), packet, push))
+            .collect();
+        let (ran, failed) = every(&cases, 5);
+        assert!(
+            failed.is_empty(),
+            "{} interleavings:\n{}",
+            ran,
+            failed.join("\n")
+        );
+        assert_eq!(ran, 4 * (1..=5).map(|n| 8usize.pow(n)).sum::<usize>());
     }
 }
