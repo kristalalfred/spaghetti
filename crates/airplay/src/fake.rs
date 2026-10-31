@@ -263,6 +263,15 @@ impl Fake {
         self.advertise_as(browser, Kind::Raop, INSTANCE, interface, record);
     }
 
+    /// Claude: withdraws the AirPlay 1 service advertised on `interface`.
+    pub(crate) fn withdraw(&self, browser: &Browser, interface: u32) {
+        browser.shared().apply([Event::Removed(InstanceKey {
+            kind: Kind::Raop,
+            name: INSTANCE.into(),
+            interface,
+        })]);
+    }
+
     /// Claude: advertises only the AirPlay 2 service, with `record`.
     pub(crate) fn advertise_airplay(&self, browser: &Browser, record: &str) {
         self.advertise_as(browser, Kind::AirPlay, "fake", 1, record);
@@ -2158,6 +2167,124 @@ pub(crate) mod tests {
             fake_connections(&refusing) == [0],
             "a refused handshake was retried"
         );
+    }
+
+    const REQUIRES_A_PIN: &str =
+        "fake: it requires pairing with a PIN; allow AirPlay without a PIN in its settings";
+
+    fn with_a_pin() -> String {
+        SHAIRPORT_SYNC_RAOP.replace("sf=0x4", "sf=0xC")
+    }
+
+    #[test]
+    fn a_queued_stream_to_a_receiver_that_now_requires_a_pin_never_connects() {
+        let fake = Fake::start(Behavior::default());
+        let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+        let first = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(settings()),
+            Renders::default().renderer(None),
+        );
+        assert!(wait_until(Duration::from_secs(2), || streaming(&first)));
+        let queued = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(settings()),
+            Renders::default().renderer(None),
+        );
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(queued.status(), Status::Connecting);
+        fake.advertise(&browser, &with_a_pin());
+        first.finish().wait();
+        assert!(wait_until(Duration::from_secs(2), || queued.status()
+            != Status::Connecting));
+        assert_eq!(queued.status(), Status::Unreachable(REQUIRES_A_PIN.into()));
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(fake.accepted(), 1, "the queued stream connected");
+    }
+
+    #[test]
+    fn a_queued_stream_still_tries_a_receiver_or_service_gone_from_browsing() {
+        let fake = Fake::start(Behavior::default());
+        let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+        let first = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(settings()),
+            Renders::default().renderer(None),
+        );
+        assert!(wait_until(Duration::from_secs(2), || streaming(&first)));
+        let queued = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(settings()),
+            Renders::default().renderer(None),
+        );
+        thread::sleep(Duration::from_millis(100));
+        fake.withdraw(&browser, 1);
+        first.finish().wait();
+        assert!(
+            wait_until(Duration::from_secs(2), || streaming(&queued)),
+            "a receiver gone from browsing is still tried as it was found: {:?}",
+            queued.status()
+        );
+        drop(queued);
+
+        let fake = Fake::start(Behavior::default());
+        let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+        fake.advertise_airplay(&browser, AIRPLAY_2_RECORD);
+        let airplay_1 = || Settings {
+            protocol: Some(Protocol::AirPlay1),
+            ..settings()
+        };
+        let first = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(airplay_1()),
+            Renders::default().renderer(None),
+        );
+        assert!(wait_until(Duration::from_secs(2), || streaming(&first)));
+        let queued = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(airplay_1()),
+            Renders::default().renderer(None),
+        );
+        thread::sleep(Duration::from_millis(100));
+        fake.withdraw(&browser, 1);
+        first.finish().wait();
+        assert!(
+            wait_until(Duration::from_secs(2), || streaming(&queued)),
+            "a service gone from browsing is still tried as it was found: {:?}",
+            queued.status()
+        );
+    }
+
+    #[test]
+    fn a_waking_receiver_that_now_requires_a_pin_ends_its_retries_without_connecting() {
+        let fake = Fake::asleep(Behavior::default());
+        let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+        let waking = Settings {
+            connect_timeout: Duration::from_millis(100),
+            wake_window: Duration::from_secs(3),
+            ..settings()
+        };
+        let stream = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(waking),
+            Renders::default().renderer(None),
+        );
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(stream.status(), Status::Connecting);
+        fake.advertise(&browser, &with_a_pin());
+        fake.wake();
+        assert!(wait_until(Duration::from_secs(2), || stream.status()
+            != Status::Connecting));
+        assert_eq!(stream.status(), Status::Unreachable(REQUIRES_A_PIN.into()));
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(fake.accepted(), 0, "the waking stream connected");
     }
 
     #[test]

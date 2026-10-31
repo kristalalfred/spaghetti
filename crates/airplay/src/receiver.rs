@@ -99,6 +99,17 @@ impl Receiver {
                 .is_some_and(|raop| raop.txt.features("ft") & AIRPLAY_2 == AIRPLAY_2)
     }
 
+    /// Claude: whether `protocol`'s service has only gone from browsing, as
+    /// while a receiver announces itself again, with nothing it still
+    /// advertises turning a stream away.
+    pub(crate) fn missing(&self, protocol: Protocol) -> bool {
+        let service = match protocol {
+            Protocol::AirPlay1 => &self.raop,
+            Protocol::AirPlay2 => &self.airplay,
+        };
+        service.is_none() && self.access().is_ok()
+    }
+
     fn access(&self) -> Result<(), String> {
         let raop = self.raop.as_ref().map(|s| &s.txt);
         let flags = raop.map_or(0, |txt| txt.flags("sf"))
@@ -377,6 +388,18 @@ pub(crate) mod tests {
                 .unwrap_err()
                 .contains("does not offer AirPlay 2")
         );
+    }
+
+    #[test]
+    fn a_service_is_missing_only_when_gone_and_nothing_else_turns_a_stream_away() {
+        let raop_only = receiver(Some(SHAIRPORT_SYNC_RAOP), None);
+        assert!(raop_only.missing(Protocol::AirPlay2));
+        assert!(!raop_only.missing(Protocol::AirPlay1));
+        let pin = CITATION_AIRPLAY.replace("flags=0x4", "flags=0x8");
+        assert!(!receiver(None, Some(&pin)).missing(Protocol::AirPlay1));
+        assert!(receiver(None, Some(CITATION_AIRPLAY)).missing(Protocol::AirPlay1));
+        let refusing = receiver(Some("cn=0,1 et=1 tp=UDP"), None);
+        assert!(!refusing.missing(Protocol::AirPlay1));
     }
 
     #[test]
