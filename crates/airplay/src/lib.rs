@@ -4,11 +4,14 @@ mod clock;
 mod dns_sd;
 #[cfg(test)]
 mod fake;
+mod hap;
 mod packet;
 mod raop;
 mod receiver;
 mod rtsp;
+mod srp;
 mod stream;
+mod tlv8;
 mod turns;
 
 use std::time::{Duration, Instant};
