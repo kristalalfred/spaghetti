@@ -35,6 +35,7 @@ pub(crate) enum Step {
     SessionSetup,
     StreamSetup,
     Record,
+    Feedback,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -826,6 +827,7 @@ fn step_of(request: &FakeRequest) -> Option<Step> {
         ("SETUP", _) if request.plist().contains_key("streams") => Some(Step::StreamSetup),
         ("SETUP", _) => Some(Step::SessionSetup),
         ("RECORD", _) => Some(Step::Record),
+        ("POST", "/feedback") => Some(Step::Feedback),
         _ => None,
     }
 }

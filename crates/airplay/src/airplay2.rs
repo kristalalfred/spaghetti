@@ -188,17 +188,31 @@ fn with_port(mut address: SocketAddr, port: u16) -> SocketAddr {
     address
 }
 
-/// Claude: the session's SETUP, with the fields OwnTone sends for NTP timing.
+/// Claude: the session's SETUP: the fields OwnTone sends for NTP timing, and
+/// those of pyatv's that describe the session rather than claim to be an
+/// iPhone, with a group of its own as OwnTone gives each session.
 fn session_setup(offer: &Offer) -> Result<Vec<u8>, Failure> {
     let mut device = [0u8; 6];
-    let mut uuid = [0u8; 16];
+    let mut session = [0u8; 16];
+    let mut group = [0u8; 16];
     getrandom::fill(&mut device)
-        .and_then(|()| getrandom::fill(&mut uuid))
+        .and_then(|()| getrandom::fill(&mut session))
+        .and_then(|()| getrandom::fill(&mut group))
         .map_err(|e| Failure::Failed(e.to_string()))?;
-    let device_id: Vec<String> = device.iter().map(|b| format!("{b:02X}")).collect();
+    let device_id = device
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":");
     Ok(binary(dictionary([
-        ("deviceID", device_id.join(":").into()),
-        ("sessionUUID", uuid_v4(uuid).into()),
+        ("deviceID", device_id.clone().into()),
+        ("macAddress", device_id.into()),
+        ("sessionUUID", uuid_v4(session).into()),
+        ("groupUUID", uuid_v4(group).into()),
+        ("groupContainsGroupLeader", false.into()),
+        ("isMultiSelectAirPlay", true.into()),
+        ("senderSupportsRelay", false.into()),
+        ("statsCollectionEnabled", false.into()),
         ("timingPort", u64::from(offer.timing_port).into()),
         ("timingProtocol", "NTP".into()),
     ])))
@@ -334,6 +348,12 @@ mod tests {
         let device = session["deviceID"].as_string().unwrap();
         assert_eq!((device.len(), device.matches(':').count()), (17, 5));
         assert_eq!(session["sessionUUID"].as_string().unwrap().len(), 36);
+        assert!(session["sessionUUID"] != session["groupUUID"]);
+        assert_eq!(
+            session["groupContainsGroupLeader"].as_boolean(),
+            Some(false)
+        );
+        assert!(!session.contains_key("model") && !session.contains_key("osName"));
     }
 
     #[test]

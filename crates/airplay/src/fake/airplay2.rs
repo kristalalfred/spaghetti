@@ -267,6 +267,30 @@ fn feedback_keeps_the_session_every_two_seconds() {
 }
 
 #[test]
+fn a_feedback_answered_with_an_error_still_keeps_the_session() {
+    let fake = Fake::start(Behavior {
+        rtsp: Rtsp::RefuseAt(Step::Feedback, 500),
+        ..Behavior::default()
+    });
+    let browser = browser(&fake, false);
+    let stream = Stream::start_with(
+        &browser,
+        fake.id(),
+        Ok(airplay_2()),
+        Renders::default().renderer(None),
+    );
+    let refused = || {
+        fake.requests()
+            .iter()
+            .filter(|(_, _, r)| r.uri == "/feedback")
+            .count()
+    };
+    assert!(wait_until(HANDSHAKE, || refused() >= 2));
+    thread::sleep(Duration::from_millis(100));
+    assert!(streaming(&stream), "{:?}", stream.status());
+}
+
+#[test]
 fn finishing_plays_out_then_tears_the_stream_and_the_session_down() {
     let fake = Fake::start(Behavior::default());
     let browser = browser(&fake, false);
