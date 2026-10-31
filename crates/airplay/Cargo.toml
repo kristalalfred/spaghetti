@@ -8,6 +8,11 @@ license.workspace = true
 tracing = "0.1"
 libc = "0.2"
 getrandom = "0.4"
+chacha20poly1305 = { version = "=0.10.1", default-features = false }
+hkdf = "=0.12.4"
+num-bigint = "=0.4.8"
+plist = { version = "=1.10.3", default-features = false }
+sha2 = "=0.10.9"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

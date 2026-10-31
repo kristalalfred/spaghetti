@@ -1,4 +1,4 @@
-use crate::packet::AUDIO_PACKET_LEN;
+use crate::packet::MAX_AUDIO_PACKET_LEN;
 
 /// Claude: the packets a stream sent most recently, for retransmission. Packets
 /// are numbered from the stream's first; their sequence numbers wrap.
@@ -9,7 +9,8 @@ pub(crate) struct Backlog {
 
 struct Slot {
     packet: Option<u64>,
-    bytes: [u8; AUDIO_PACKET_LEN],
+    len: usize,
+    bytes: [u8; MAX_AUDIO_PACKET_LEN],
 }
 
 impl Backlog {
@@ -19,18 +20,20 @@ impl Backlog {
             slots: (0..capacity)
                 .map(|_| Slot {
                     packet: None,
-                    bytes: [0; AUDIO_PACKET_LEN],
+                    len: 0,
+                    bytes: [0; MAX_AUDIO_PACKET_LEN],
                 })
                 .collect(),
             latest: None,
         }
     }
 
-    pub(crate) fn push(&mut self, packet: u64, seq: u16, bytes: &[u8; AUDIO_PACKET_LEN]) {
+    pub(crate) fn push(&mut self, packet: u64, seq: u16, bytes: &[u8]) {
         let len = self.slots.len() as u64;
         let slot = &mut self.slots[(packet % len) as usize];
         slot.packet = Some(packet);
-        slot.bytes = *bytes;
+        slot.len = bytes.len();
+        slot.bytes[..bytes.len()].copy_from_slice(bytes);
         self.latest = Some((packet, seq));
     }
 
@@ -40,7 +43,7 @@ impl Backlog {
         self.latest.map(|(packet, _)| packet)
     }
 
-    pub(crate) fn get(&self, seq: u16) -> Option<&[u8; AUDIO_PACKET_LEN]> {
+    pub(crate) fn get(&self, seq: u16) -> Option<&[u8]> {
         let (latest, latest_seq) = self.latest?;
         let behind = u64::from(latest_seq.wrapping_sub(seq));
         let len = self.slots.len() as u64;
@@ -49,7 +52,7 @@ impl Backlog {
         }
         let packet = latest.checked_sub(behind)?;
         let slot = &self.slots[(packet % len) as usize];
-        (slot.packet == Some(packet)).then_some(&slot.bytes)
+        (slot.packet == Some(packet)).then_some(&slot.bytes[..slot.len])
     }
 }
 
@@ -57,8 +60,8 @@ impl Backlog {
 mod tests {
     use super::*;
 
-    fn bytes(packet: u64) -> [u8; AUDIO_PACKET_LEN] {
-        let mut bytes = [0; AUDIO_PACKET_LEN];
+    fn bytes(packet: u64) -> Vec<u8> {
+        let mut bytes = vec![0; 100 + packet as usize];
         bytes[..8].copy_from_slice(&packet.to_be_bytes());
         bytes
     }
@@ -78,8 +81,8 @@ mod tests {
             );
         }
         let seq = |packet: u64| first_seq.wrapping_add(packet as u16);
-        assert_eq!(backlog.get(seq(19)), Some(&bytes(19)));
-        assert_eq!(backlog.get(seq(12)), Some(&bytes(12)));
+        assert_eq!(backlog.get(seq(19)), Some(&bytes(19)[..]));
+        assert_eq!(backlog.get(seq(12)), Some(&bytes(12)[..]));
         assert_eq!(backlog.get(seq(11)), None);
         assert_eq!(backlog.get(seq(6)), None);
         assert_eq!(backlog.get(seq(15)), None);

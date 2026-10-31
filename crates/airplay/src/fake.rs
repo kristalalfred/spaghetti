@@ -1,4 +1,4 @@
-use std::io::{ErrorKind, Read, Write};
+use std::io::{Cursor, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,21 +6,63 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chacha20poly1305::aead::AeadInPlace;
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, Tag};
+use plist::{Dictionary, Value};
+
 use crate::browse::{Event, InstanceKey, Kind};
 use crate::clock::{Clock, Ntp};
 use crate::receiver::tests::txt;
-use crate::{Browser, ReceiverId, SAMPLE_RATE};
+use crate::rtsp::{PLIST, Response, decode_response};
+use crate::tlv8::{self, Tlv};
+use crate::{Browser, FRAMES_PER_PACKET, ReceiverId, SAMPLE_RATE, hap, pairing, srp};
 
 const ID: &str = "AA:BB:CC:DD:EE:FF";
 const INSTANCE: &str = "AABBCCDDEEFF@fake";
 const POLL: Duration = Duration::from_millis(5);
+/// Claude: what the fake's `_airplay._tcp` record says when it takes AirPlay 2:
+/// the HK Citation MultiBeam 1100's feature bits.
+pub(crate) const AIRPLAY_2_RECORD: &str =
+    "deviceid=AA:BB:CC:DD:EE:FF features=0x445F8A00,0x1C340 flags=0x4 model=Fake";
+pub(crate) const STREAM_ID: u64 = 1;
+
+/// Claude: a step of a handshake, at which the fake can hang or refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    Announce,
+    PairM1,
+    PairM3,
+    SessionSetup,
+    StreamSetup,
+    Record,
+    Feedback,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum Rtsp {
     #[default]
     Answer,
-    HangAtAnnounce,
+    /// Claude: answers nothing from this step on.
+    HangAt(Step),
+    RefuseAt(Step, u16),
     SilentAfterRecord,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Pairing {
+    #[default]
+    Honest,
+    ErrorAtM2(u8),
+    WrongProof,
+}
+
+/// Claude: what the session's SETUP says about the event port.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum EventPort {
+    #[default]
+    Listening,
+    Closed,
+    Missing,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -28,6 +70,8 @@ pub(crate) struct Behavior {
     pub(crate) auth_setup_required: bool,
     pub(crate) audio_latency: Option<u32>,
     pub(crate) rtsp: Rtsp,
+    pub(crate) pairing: Pairing,
+    pub(crate) event_port: EventPort,
 }
 
 #[derive(Debug, Clone)]
@@ -65,19 +109,49 @@ impl FakeRequest {
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
+
+    pub(crate) fn plist(&self) -> Dictionary {
+        Value::from_reader(Cursor::new(&self.body))
+            .ok()
+            .and_then(Value::into_dictionary)
+            .expect("a binary plist dictionary")
+    }
+
+    pub(crate) fn tlv(&self) -> Tlv {
+        Tlv::decode(&self.body).expect("TLV8 items")
+    }
 }
 
-/// Claude: a minimal AirPlay 1 receiver on localhost that records everything
-/// a stream sends it and answers as `Behavior` says.
+/// Claude: what the fake learns from a stream and shares between its threads.
+#[derive(Default)]
+struct State {
+    seen: Mutex<Vec<Seen>>,
+    control_port: Mutex<Option<u16>>,
+    timing_port: Mutex<Option<u16>>,
+    audio_key: Mutex<Option<[u8; 32]>>,
+    events: Mutex<Events>,
+    connections: Mutex<Vec<TcpStream>>,
+    stop: AtomicBool,
+}
+
+/// Claude: the fake's side of a stream's event connection: it sends requests
+/// sealed with its own counter and keeps the answers it opens.
+#[derive(Default)]
+struct Events {
+    sending: Option<(TcpStream, hap::Channel)>,
+    next_cseq: u32,
+    answers: Vec<Response>,
+}
+
+/// Claude: a minimal AirPlay receiver on localhost that records everything a
+/// stream sends it and answers as `Behavior` says. Like a real speaker, it
+/// takes AirPlay 1 and AirPlay 2 on one port.
 pub(crate) struct Fake {
     address: SocketAddr,
     listener: TcpListener,
-    seen: Arc<Mutex<Vec<Seen>>>,
-    client: Arc<Mutex<Option<(u16, u16)>>>,
     control: UdpSocket,
     timing: UdpSocket,
-    connections: Arc<Mutex<Vec<TcpStream>>>,
-    stop: Arc<AtomicBool>,
+    state: Arc<State>,
 }
 
 impl Fake {
@@ -101,26 +175,23 @@ impl Fake {
                 .set_read_timeout(Some(Duration::from_millis(20)))
                 .unwrap();
         }
-        let ports = (
-            audio.local_addr().unwrap().port(),
-            control.local_addr().unwrap().port(),
-            timing.local_addr().unwrap().port(),
-        );
+        let ports = Ports {
+            audio: audio.local_addr().unwrap().port(),
+            control: control.local_addr().unwrap().port(),
+            timing: timing.local_addr().unwrap().port(),
+        };
         let fake = Fake {
             address: listener.local_addr().unwrap(),
             listener: listener.try_clone().unwrap(),
-            seen: Arc::default(),
-            client: Arc::default(),
             control: control.try_clone().unwrap(),
             timing,
-            connections: Arc::default(),
-            stop: Arc::default(),
+            state: Arc::default(),
         };
         for (socket, audio) in [(audio, true), (control, false)] {
-            let (seen, stop) = (fake.seen.clone(), fake.stop.clone());
+            let state = fake.state.clone();
             thread::spawn(move || {
                 let mut buf = [0u8; 2048];
-                while !stop.load(Ordering::Acquire) {
+                while !state.stop.load(Ordering::Acquire) {
                     if let Ok(len) = socket.recv(&mut buf) {
                         let (at, bytes) = (Instant::now(), buf[..len].to_vec());
                         let seen_now = if audio {
@@ -128,31 +199,36 @@ impl Fake {
                         } else {
                             Seen::Control { bytes }
                         };
-                        seen.lock().unwrap().push(seen_now);
+                        state.seen.lock().unwrap().push(seen_now);
                     }
                 }
             });
         }
-        let (seen, client, connections, stop) = (
-            fake.seen.clone(),
-            fake.client.clone(),
-            fake.connections.clone(),
-            fake.stop.clone(),
-        );
+        let state = fake.state.clone();
         thread::spawn(move || {
             let mut count = 0;
-            while !stop.load(Ordering::Acquire) {
+            while !state.stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        connections
+                        state
+                            .connections
                             .lock()
                             .unwrap()
                             .push(stream.try_clone().unwrap());
-                        let (seen, client, stop) = (seen.clone(), client.clone(), stop.clone());
+                        let state = state.clone();
                         let connection = count;
                         count += 1;
                         thread::spawn(move || {
-                            serve(stream, connection, behavior, ports, &seen, &client, &stop);
+                            Server {
+                                stream,
+                                connection,
+                                behavior,
+                                ports,
+                                state,
+                                channel: None,
+                                secret: None,
+                            }
+                            .serve();
                         });
                     }
                     Err(_) => thread::sleep(POLL),
@@ -181,11 +257,9 @@ impl Fake {
         self.advertise_as(browser, Kind::Raop, INSTANCE, record);
     }
 
-    /// Claude: advertises only the AirPlay 2 service, as a receiver does whose
-    /// `_airplay._tcp` record resolves before its `_raop._tcp` one.
-    pub(crate) fn advertise_airplay(&self, browser: &Browser) {
-        let record = format!("deviceid={ID} model=Fake flags=0x4");
-        self.advertise_as(browser, Kind::AirPlay, "fake", &record);
+    /// Claude: advertises only the AirPlay 2 service, with `record`.
+    pub(crate) fn advertise_airplay(&self, browser: &Browser, record: &str) {
+        self.advertise_as(browser, Kind::AirPlay, "fake", record);
     }
 
     fn advertise_as(&self, browser: &Browser, kind: Kind, name: &str, record: &str) {
@@ -210,7 +284,7 @@ impl Fake {
     }
 
     pub(crate) fn seen(&self) -> Vec<Seen> {
-        self.seen.lock().unwrap().clone()
+        self.state.seen.lock().unwrap().clone()
     }
 
     pub(crate) fn requests(&self) -> Vec<(Instant, usize, FakeRequest)> {
@@ -234,11 +308,13 @@ impl Fake {
             .collect()
     }
 
+    /// Claude: each audio packet as it arrived, opened with the stream's key
+    /// when it was sealed.
     pub(crate) fn audio(&self) -> Vec<(Instant, AudioPacket)> {
         self.seen()
             .into_iter()
             .filter_map(|seen| match seen {
-                Seen::Audio { at, bytes } => Some((at, decode_audio(&bytes))),
+                Seen::Audio { at, bytes } => Some((at, decode_audio(&self.open(&bytes)))),
                 _ => None,
             })
             .collect()
@@ -252,6 +328,24 @@ impl Fake {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Claude: an audio packet's RTP header and plaintext payload. A sealed
+    /// packet opens, as an AirPlay 2 receiver opens it, with the key the
+    /// stream's SETUP sent, or the test fails.
+    pub(crate) fn open(&self, bytes: &[u8]) -> Vec<u8> {
+        let Some(key) = *self.state.audio_key.lock().unwrap() else {
+            return bytes.to_vec();
+        };
+        let (sealed, trailer) = bytes.split_at(bytes.len() - 24);
+        let (tag, counter) = trailer.split_at(16);
+        let mut nonce = Nonce::default();
+        nonce[4..].copy_from_slice(counter);
+        let mut payload = sealed[12..].to_vec();
+        ChaCha20Poly1305::new(&key.into())
+            .decrypt_in_place_detached(&nonce, &bytes[4..12], &mut payload, Tag::from_slice(tag))
+            .expect("the packet opens with the stream's key");
+        [&bytes[..12], &payload[..]].concat()
     }
 
     pub(crate) fn control(&self) -> Vec<Vec<u8>> {
@@ -279,13 +373,9 @@ impl Fake {
         })
     }
 
-    fn client(&self, which: fn((u16, u16)) -> u16) -> SocketAddr {
-        let ports = self
-            .client
-            .lock()
-            .unwrap()
-            .expect("the stream has sent SETUP");
-        SocketAddr::from((Ipv4Addr::LOCALHOST, which(ports)))
+    fn client(&self, port: &Mutex<Option<u16>>) -> SocketAddr {
+        let port = port.lock().unwrap().expect("the stream has said its port");
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port))
     }
 
     /// Claude: sends a timing request saying it was sent at `sent`, and returns
@@ -296,7 +386,7 @@ impl Fake {
         request[24..32].copy_from_slice(&sent.to_be_bytes());
         let before = Instant::now();
         self.timing
-            .send_to(&request, self.client(|(_, timing)| timing))
+            .send_to(&request, self.client(&self.state.timing_port))
             .unwrap();
         let mut reply = [0u8; 32];
         let deadline = before + Duration::from_secs(1);
@@ -314,12 +404,32 @@ impl Fake {
         request[4..6].copy_from_slice(&first.to_be_bytes());
         request[6..8].copy_from_slice(&count.to_be_bytes());
         self.control
-            .send_to(&request, self.client(|(control, _)| control))
+            .send_to(&request, self.client(&self.state.control_port))
             .unwrap();
     }
 
+    /// Claude: sends a request over the stream's event connection and returns
+    /// its CSeq.
+    pub(crate) fn send_event(&self) -> u32 {
+        let mut events = self.state.events.lock().unwrap();
+        events.next_cseq += 1;
+        let cseq = events.next_cseq;
+        let (stream, channel) = events
+            .sending
+            .as_mut()
+            .expect("the stream opened its event connection");
+        stream
+            .write_all(&channel.seal(&event_request(cseq)))
+            .unwrap();
+        cseq
+    }
+
+    pub(crate) fn event_answers(&self) -> Vec<Response> {
+        self.state.events.lock().unwrap().answers.clone()
+    }
+
     pub(crate) fn close_connections(&self) {
-        for connection in self.connections.lock().unwrap().iter() {
+        for connection in self.state.connections.lock().unwrap().iter() {
             let _ = connection.shutdown(Shutdown::Both);
         }
     }
@@ -327,8 +437,11 @@ impl Fake {
 
 impl Drop for Fake {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.state.stop.store(true, Ordering::Release);
         self.close_connections();
+        if let Some((stream, _)) = &self.state.events.lock().unwrap().sending {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
     }
 }
 
@@ -355,103 +468,397 @@ fn bound_without_listening() -> TcpListener {
     socket
 }
 
-fn serve(
-    mut stream: TcpStream,
+#[derive(Debug, Clone, Copy)]
+struct Ports {
+    audio: u16,
+    control: u16,
+    timing: u16,
+}
+
+/// Claude: one RTSP connection to the fake.
+struct Server {
+    stream: TcpStream,
     connection: usize,
     behavior: Behavior,
-    (audio, control, timing): (u16, u16, u16),
-    seen: &Mutex<Vec<Seen>>,
-    client: &Mutex<Option<(u16, u16)>>,
-    stop: &AtomicBool,
-) {
-    stream
-        .set_read_timeout(Some(Duration::from_millis(20)))
-        .unwrap();
-    let mut received = Vec::new();
-    let mut auth_setup = false;
-    let mut silent = false;
-    loop {
-        let request = loop {
-            if let Some((request, len)) = parse_request(&received) {
-                received.drain(..len);
-                break Some(request);
-            }
-            let mut chunk = [0u8; 4096];
-            match stream.read(&mut chunk) {
-                Ok(0) => break None,
-                Ok(n) => received.extend_from_slice(&chunk[..n]),
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                    if stop.load(Ordering::Acquire) {
-                        break None;
+    ports: Ports,
+    state: Arc<State>,
+    channel: Option<hap::Channel>,
+    secret: Option<[u8; srp::PROOF_LEN]>,
+}
+
+/// Claude: the fake's SRP verifier and public value, computed once: a real
+/// receiver draws a salt and a private value for each pairing, but the fake
+/// spares a debug build that arithmetic.
+fn transient_server() -> &'static srp::Server {
+    static SERVER: std::sync::OnceLock<srp::Server> = std::sync::OnceLock::new();
+    SERVER.get_or_init(|| {
+        let mut salt = [0u8; 16];
+        let mut private = [0u8; 32];
+        getrandom::fill(&mut salt).unwrap();
+        getrandom::fill(&mut private).unwrap();
+        srp::Server::new(pairing::USER, pairing::TRANSIENT_PIN, &salt, &private)
+    })
+}
+
+/// Claude: what the fake answers a request with, before any encryption.
+struct Answer {
+    status: &'static str,
+    headers: String,
+    body: Vec<u8>,
+    content_type: Option<&'static str>,
+}
+
+impl Answer {
+    fn ok() -> Answer {
+        Answer::status("200 OK")
+    }
+
+    fn status(status: &'static str) -> Answer {
+        Answer {
+            status,
+            headers: String::new(),
+            body: Vec::new(),
+            content_type: None,
+        }
+    }
+
+    fn with_body(mut self, content_type: &'static str, body: Vec<u8>) -> Answer {
+        self.content_type = Some(content_type);
+        self.body = body;
+        self
+    }
+}
+
+impl Server {
+    fn serve(mut self) {
+        self.stream
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let mut received = Vec::new();
+        let mut auth_setup = false;
+        let mut silent = false;
+        loop {
+            let request = loop {
+                if let Some((request, len)) = parse_request(&received) {
+                    received.drain(..len);
+                    break Some(request);
+                }
+                let mut chunk = [0u8; 4096];
+                match self.stream.read(&mut chunk) {
+                    Ok(0) => break None,
+                    Ok(n) => match &mut self.channel {
+                        Some(channel) => channel
+                            .open(&chunk[..n], &mut received)
+                            .expect("requests open with the control keys"),
+                        None => received.extend_from_slice(&chunk[..n]),
+                    },
+                    Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                        if self.state.stop.load(Ordering::Acquire) {
+                            break None;
+                        }
                     }
+                    Err(_) => break None,
                 }
-                Err(_) => break None,
-            }
-        };
-        let Some(request) = request else {
-            seen.lock().unwrap().push(Seen::Closed {
+            };
+            let Some(request) = request else {
+                self.state.seen.lock().unwrap().push(Seen::Closed {
+                    at: Instant::now(),
+                    connection: self.connection,
+                });
+                return;
+            };
+            self.state.seen.lock().unwrap().push(Seen::Request {
                 at: Instant::now(),
-                connection,
+                connection: self.connection,
+                request: request.clone(),
             });
-            return;
-        };
-        seen.lock().unwrap().push(Seen::Request {
-            at: Instant::now(),
-            connection,
-            request: request.clone(),
-        });
-        if silent {
-            continue;
-        }
-        let cseq = request.header("CSeq").unwrap_or("0").to_owned();
-        let mut headers = String::new();
-        let mut body = Vec::new();
-        let status = match request.method.as_str() {
-            "OPTIONS" => {
-                headers.push_str(
-                    "Public: ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, POST\r\n",
-                );
-                "200 OK"
+            if silent {
+                continue;
             }
-            "POST" if request.uri == "/auth-setup" => {
-                auth_setup = true;
-                body = vec![0x42; 32];
-                "200 OK"
+            let step = step_of(&request);
+            if let (Rtsp::HangAt(hang), Some(step)) = (self.behavior.rtsp, step)
+                && hang == step
+            {
+                silent = true;
+                continue;
             }
-            "ANNOUNCE" if behavior.rtsp == Rtsp::HangAtAnnounce => continue,
-            "ANNOUNCE" if behavior.auth_setup_required && !auth_setup => "403 Forbidden",
-            "SETUP" => {
-                let transport = request.header("Transport").unwrap_or_default();
-                let port = |key: &str| {
-                    transport
-                        .split(';')
-                        .find_map(|part| part.strip_prefix(key)?.strip_prefix('='))
-                        .and_then(|p| p.parse().ok())
-                        .unwrap()
-                };
-                *client.lock().unwrap() = Some((port("control_port"), port("timing_port")));
-                headers.push_str(&format!(
-                    "Session: DEADBEEF;timeout=60\r\nTransport: RTP/AVP/UDP;unicast;mode=record;\
-                     server_port={audio};control_port={control};timing_port={timing}\r\n"
-                ));
-                "200 OK"
-            }
-            "RECORD" => {
-                if let Some(latency) = behavior.audio_latency {
-                    headers.push_str(&format!("Audio-Latency: {latency}\r\n"));
+            let answer = match (self.behavior.rtsp, step) {
+                (Rtsp::RefuseAt(refused, status), Some(step)) if refused == step => {
+                    Answer::status(status_line(status))
                 }
-                silent = behavior.rtsp == Rtsp::SilentAfterRecord;
-                "200 OK"
+                _ => match request.method.as_str() {
+                    "OPTIONS" => {
+                        let mut answer = Answer::ok();
+                        answer.headers.push_str(
+                            "Public: ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, POST\r\n",
+                        );
+                        answer
+                    }
+                    "POST" if request.uri == "/auth-setup" => {
+                        auth_setup = true;
+                        Answer::ok().with_body("application/octet-stream", vec![0x42; 32])
+                    }
+                    "POST" if request.uri == "/pair-setup" => self.pair(&request),
+                    "GET" if request.uri == "/info" => {
+                        let mut info = Dictionary::new();
+                        info.insert("features".into(), 0x0001_C340_445F_8A00u64.into());
+                        info.insert("pk".into(), Value::Data(vec![0x27; 32]));
+                        let mut body = Vec::new();
+                        Value::Dictionary(info).to_writer_binary(&mut body).unwrap();
+                        Answer::ok().with_body(PLIST, body)
+                    }
+                    "ANNOUNCE" if self.behavior.auth_setup_required && !auth_setup => {
+                        Answer::status("403 Forbidden")
+                    }
+                    "SETUP" if request.body.is_empty() => self.setup_raop(&request),
+                    "SETUP" => self.setup_airplay_2(&request),
+                    "RECORD" => {
+                        let mut answer = Answer::ok();
+                        if let Some(latency) = self.behavior.audio_latency {
+                            answer
+                                .headers
+                                .push_str(&format!("Audio-Latency: {latency}\r\n"));
+                        }
+                        silent = self.behavior.rtsp == Rtsp::SilentAfterRecord;
+                        answer
+                    }
+                    _ => Answer::ok(),
+                },
+            };
+            let cseq = request.header("CSeq").unwrap_or("0");
+            let content_type = answer
+                .content_type
+                .map(|t| format!("Content-Type: {t}\r\n"))
+                .unwrap_or_default();
+            let mut response = format!(
+                "RTSP/1.0 {}\r\nCSeq: {cseq}\r\nServer: fake\r\n{}{content_type}Content-Length: {}\r\n\r\n",
+                answer.status,
+                answer.headers,
+                answer.body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&answer.body);
+            if let Some(channel) = &mut self.channel {
+                response = channel.seal(&response);
             }
-            _ => "200 OK",
-        };
-        let mut response =
-            format!("RTSP/1.0 {status}\r\nCSeq: {cseq}\r\nServer: fake\r\n{headers}Content-Length: {}\r\n\r\n", body.len())
-                .into_bytes();
-        response.extend_from_slice(&body);
-        if stream.write_all(&response).is_err() {
-            return;
+            if self.stream.write_all(&response).is_err() {
+                return;
+            }
+            if self.channel.is_none()
+                && let Some(secret) = self.secret
+            {
+                self.channel = Some(hap::Channel::new(&hap::keys(
+                    &secret,
+                    "Control-Salt",
+                    "Control-Read-Encryption-Key",
+                    "Control-Write-Encryption-Key",
+                )));
+            }
         }
+    }
+
+    /// Claude: the server side of transient pairing, as an AirPlay 2 receiver
+    /// answers M1 and M3.
+    fn pair(&mut self, request: &FakeRequest) -> Answer {
+        let tlv = request.tlv();
+        let answer = |items: &[(u8, &[u8])]| {
+            Answer::ok().with_body("application/octet-stream", Tlv::encode(items))
+        };
+        match tlv.get(tlv8::STATE) {
+            Some([1]) => {
+                assert_eq!(tlv.get(tlv8::METHOD), Some(&[0][..]));
+                assert_eq!(tlv.get(tlv8::FLAGS), Some(&[0x10][..]));
+                if let Pairing::ErrorAtM2(error) = self.behavior.pairing {
+                    return answer(&[(tlv8::STATE, &[2]), (tlv8::ERROR, &[error])]);
+                }
+                let server = transient_server();
+                answer(&[
+                    (tlv8::STATE, &[2]),
+                    (tlv8::SALT, &server.salt),
+                    (tlv8::PUBLIC_KEY, &server.public),
+                ])
+            }
+            Some([3]) => {
+                let server = transient_server();
+                let client_public = tlv.get(tlv8::PUBLIC_KEY).expect("M3 has A");
+                let proof = tlv.get(tlv8::PROOF).expect("M3 has a proof");
+                let Some((mut server_proof, key)) = server.verify(client_public, proof) else {
+                    return answer(&[(tlv8::STATE, &[4]), (tlv8::ERROR, &[2])]);
+                };
+                if self.behavior.pairing == Pairing::WrongProof {
+                    server_proof[0] ^= 1;
+                } else {
+                    self.secret = Some(key);
+                }
+                answer(&[(tlv8::STATE, &[4]), (tlv8::PROOF, &server_proof)])
+            }
+            state => panic!("pair-setup in state {state:?}"),
+        }
+    }
+
+    fn setup_raop(&self, request: &FakeRequest) -> Answer {
+        let transport = request.header("Transport").unwrap_or_default();
+        let port = |key: &str| {
+            transport
+                .split(';')
+                .find_map(|part| part.strip_prefix(key)?.strip_prefix('='))
+                .and_then(|p| p.parse().ok())
+                .unwrap()
+        };
+        *self.state.control_port.lock().unwrap() = Some(port("control_port"));
+        *self.state.timing_port.lock().unwrap() = Some(port("timing_port"));
+        let Ports {
+            audio,
+            control,
+            timing,
+        } = self.ports;
+        let mut answer = Answer::ok();
+        answer.headers = format!(
+            "Session: DEADBEEF;timeout=60\r\nTransport: RTP/AVP/UDP;unicast;mode=record;\
+             server_port={audio};control_port={control};timing_port={timing}\r\n"
+        );
+        answer
+    }
+
+    fn setup_airplay_2(&self, request: &FakeRequest) -> Answer {
+        let setup = request.plist();
+        let number = |dictionary: &Dictionary, key: &str| {
+            dictionary[key]
+                .as_unsigned_integer()
+                .unwrap_or_else(|| panic!("{key} is a number"))
+        };
+        let reply = if let Some(streams) = setup.get("streams").and_then(Value::as_array) {
+            let stream = streams[0].as_dictionary().unwrap();
+            let key = stream["shk"].as_data().unwrap().try_into().unwrap();
+            *self.state.audio_key.lock().unwrap() = Some(key);
+            *self.state.control_port.lock().unwrap() = Some(number(stream, "controlPort") as u16);
+            let mut reply = Dictionary::new();
+            reply.insert("type".into(), number(stream, "type").into());
+            reply.insert("dataPort".into(), u64::from(self.ports.audio).into());
+            reply.insert("controlPort".into(), u64::from(self.ports.control).into());
+            reply.insert("streamID".into(), STREAM_ID.into());
+            let mut streams = Dictionary::new();
+            streams.insert("streams".into(), vec![Value::Dictionary(reply)].into());
+            streams
+        } else {
+            *self.state.timing_port.lock().unwrap() = Some(number(&setup, "timingPort") as u16);
+            let secret = self.secret.expect("the stream paired first");
+            let mut reply = Dictionary::new();
+            if self.behavior.event_port != EventPort::Missing {
+                let port = self.listen_for_events(secret);
+                reply.insert("eventPort".into(), u64::from(port).into());
+            }
+            reply.insert("timingPort".into(), u64::from(self.ports.timing).into());
+            reply
+        };
+        let mut body = Vec::new();
+        Value::Dictionary(reply)
+            .to_writer_binary(&mut body)
+            .unwrap();
+        Answer::ok().with_body(PLIST, body)
+    }
+
+    /// Claude: opens the port the stream's event connection comes to. Once it
+    /// connects, the fake sends two requests in one write and keeps every
+    /// answer.
+    fn listen_for_events(&self, secret: [u8; srp::PROOF_LEN]) -> u16 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        if self.behavior.event_port == EventPort::Closed {
+            return port;
+        }
+        listener.set_nonblocking(true).unwrap();
+        let state = self.state.clone();
+        let keys = hap::keys(
+            &secret,
+            "Events-Salt",
+            "Events-Write-Encryption-Key",
+            "Events-Read-Encryption-Key",
+        );
+        thread::spawn(move || {
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(_) if state.stop.load(Ordering::Acquire) => return,
+                    Err(_) => thread::sleep(POLL),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .unwrap();
+            {
+                let mut events = state.events.lock().unwrap();
+                let mut sending = hap::Channel::new(&keys);
+                let first = sending.seal(&event_request(1));
+                let second = sending.seal(&event_request(2));
+                stream.write_all(&[first, second].concat()).unwrap();
+                events.next_cseq = 2;
+                events.sending = Some((stream.try_clone().unwrap(), sending));
+            }
+            let mut opening = hap::Channel::new(&keys);
+            let mut plaintext = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !state.stop.load(Ordering::Acquire) {
+                match stream.read(&mut chunk) {
+                    Ok(0) => return,
+                    Ok(n) => opening
+                        .open(&chunk[..n], &mut plaintext)
+                        .expect("event answers open with the event keys"),
+                    Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                        continue;
+                    }
+                    Err(_) => return,
+                }
+                while let Some((answer, len)) = decode_response(&plaintext).unwrap() {
+                    plaintext.drain(..len);
+                    state.events.lock().unwrap().answers.push(answer);
+                }
+            }
+        });
+        port
+    }
+}
+
+fn event_request(cseq: u32) -> Vec<u8> {
+    let mut body = Vec::new();
+    let mut command = Dictionary::new();
+    command.insert("type".into(), "updateMRSupportedCommands".into());
+    Value::Dictionary(command)
+        .to_writer_binary(&mut body)
+        .unwrap();
+    let mut request = format!(
+        "POST /command RTSP/1.0\r\nCSeq: {cseq}\r\nServer: AirTunes/366.0\r\nContent-Type: {PLIST}\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(&body);
+    request
+}
+
+fn step_of(request: &FakeRequest) -> Option<Step> {
+    match (request.method.as_str(), request.uri.as_str()) {
+        ("ANNOUNCE", _) => Some(Step::Announce),
+        ("POST", "/pair-setup") => match request.tlv().get(tlv8::STATE) {
+            Some([1]) => Some(Step::PairM1),
+            _ => Some(Step::PairM3),
+        },
+        ("SETUP", _) if request.body.is_empty() => None,
+        ("SETUP", _) if request.plist().contains_key("streams") => Some(Step::StreamSetup),
+        ("SETUP", _) => Some(Step::SessionSetup),
+        ("RECORD", _) => Some(Step::Record),
+        ("POST", "/feedback") => Some(Step::Feedback),
+        _ => None,
+    }
+}
+
+fn status_line(status: u16) -> &'static str {
+    match status {
+        400 => "400 Bad Request",
+        403 => "403 Forbidden",
+        470 => "470 Connection Authorization Required",
+        500 => "500 Internal Server Error",
+        _ => panic!("no status line for {status}"),
     }
 }
 
@@ -488,11 +895,14 @@ pub(crate) struct AudioPacket {
     pub(crate) seq: u16,
     pub(crate) timestamp: u32,
     pub(crate) marker: bool,
+    /// Claude: whether the ALAC frame carries its frame count.
+    pub(crate) counted: bool,
     pub(crate) frames: Vec<[i16; 2]>,
 }
 
 /// Claude: reads an RTP packet carrying an uncompressed ALAC frame, checking
-/// every field of the frame's layout.
+/// every field of the frame's layout. A frame without its count holds the
+/// stream's frames per packet.
 pub(crate) fn decode_audio(bytes: &[u8]) -> AudioPacket {
     assert_eq!(bytes[0], 0x80);
     assert_eq!(bytes[1] & 0x7F, 0x60);
@@ -503,10 +913,14 @@ pub(crate) fn decode_audio(bytes: &[u8]) -> AudioPacket {
     assert_eq!(bits.take(3), 1, "channel pair element");
     assert_eq!(bits.take(4), 0, "element instance");
     assert_eq!(bits.take(12), 0, "unused");
-    assert_eq!(bits.take(1), 1, "has size");
+    let counted = bits.take(1) == 1;
     assert_eq!(bits.take(2), 0, "shift");
     assert_eq!(bits.take(1), 1, "not compressed");
-    let count = bits.take(32) as usize;
+    let count = if counted {
+        bits.take(32) as usize
+    } else {
+        FRAMES_PER_PACKET
+    };
     let frames = (0..count)
         .map(|_| [bits.take(16) as u16 as i16, bits.take(16) as u16 as i16])
         .collect();
@@ -516,6 +930,7 @@ pub(crate) fn decode_audio(bytes: &[u8]) -> AudioPacket {
         seq: u16::from_be_bytes([bytes[2], bytes[3]]),
         timestamp: u32::from_be_bytes(bytes[4..8].try_into().unwrap()),
         marker: bytes[1] & 0x80 != 0,
+        counted,
         frames,
     }
 }
@@ -588,20 +1003,23 @@ pub(crate) fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> b
 }
 
 #[cfg(test)]
-mod tests {
+mod airplay2;
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
     use crate::clock::PACKET_DURATION;
     use crate::receiver::tests::{MOVE_2_RAOP, SHAIRPORT_SYNC_RAOP};
     use crate::stream::Settings;
-    use crate::{FRAMES_PER_PACKET, Render, Status, Stream};
+    use crate::{Protocol, Render, Status, Stream};
     use std::sync::mpsc;
 
-    const LATENCY: Duration = Duration::from_millis(300);
+    pub(crate) const LATENCY: Duration = Duration::from_millis(300);
     /// Claude: how soon a cancelled stream lets go, well short of the play-out,
     /// lookup and answer timeouts it would otherwise wait for.
-    const PROMPT: Duration = Duration::from_millis(250);
+    pub(crate) const PROMPT: Duration = Duration::from_millis(250);
 
-    fn settings() -> Settings {
+    pub(crate) fn settings() -> Settings {
         Settings {
             latency: LATENCY,
             lookup_window: Duration::from_millis(500),
@@ -613,7 +1031,7 @@ mod tests {
         }
     }
 
-    fn expected_frame(n: usize, i: usize) -> [i16; 2] {
+    pub(crate) fn expected_frame(n: usize, i: usize) -> [i16; 2] {
         if i == 0 {
             return [n as i16, -1];
         }
@@ -624,10 +1042,10 @@ mod tests {
     /// Claude: what a stream asked its renderer for, call by call. Each packet
     /// carries its call number in its first frame.
     #[derive(Clone, Default)]
-    struct Renders(Arc<Mutex<Vec<Instant>>>);
+    pub(crate) struct Renders(Arc<Mutex<Vec<Instant>>>);
 
     impl Renders {
-        fn renderer(
+        pub(crate) fn renderer(
             &self,
             stall: Option<(usize, Duration)>,
         ) -> impl FnMut(Render<'_>) + Send + 'static {
@@ -652,16 +1070,16 @@ mod tests {
             }
         }
 
-        fn play_at(&self, call: usize) -> Instant {
+        pub(crate) fn play_at(&self, call: usize) -> Instant {
             self.0.lock().unwrap()[call]
         }
 
-        fn count(&self) -> usize {
+        pub(crate) fn count(&self) -> usize {
             self.0.lock().unwrap().len()
         }
     }
 
-    fn call_of(packet: &AudioPacket) -> usize {
+    pub(crate) fn call_of(packet: &AudioPacket) -> usize {
         let call = packet.frames[0][0] as u16 as usize;
         for (i, frame) in packet.frames.iter().enumerate() {
             assert_eq!(*frame, expected_frame(call, i), "frame {i} of call {call}");
@@ -669,7 +1087,7 @@ mod tests {
         call
     }
 
-    fn streaming(stream: &Stream) -> bool {
+    pub(crate) fn streaming(stream: &Stream) -> bool {
         matches!(stream.status(), Status::Streaming(_))
     }
 
@@ -748,20 +1166,27 @@ mod tests {
         }
     }
 
-    fn check_sync_mapping(audio_latency: Option<u32>, first_seq: u16, first_rtp: u32) {
+    pub(crate) fn check_sync_mapping(
+        protocol: Protocol,
+        audio_latency: Option<u32>,
+        first_seq: u16,
+        first_rtp: u32,
+    ) {
         let fake = Fake::start(Behavior {
             audio_latency,
             ..Behavior::default()
         });
         let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+        fake.advertise_airplay(&browser, AIRPLAY_2_RECORD);
         let renders = Renders::default();
         let settings = Settings {
             first_seq,
             first_rtp,
+            protocol: Some(protocol),
             ..settings()
         };
         let stream = Stream::start_with(&browser, fake.id(), Ok(settings), renders.renderer(None));
-        assert!(wait_until(Duration::from_secs(4), || fake.syncs().len() >= 3));
+        assert!(wait_until(Duration::from_secs(10), || fake.syncs().len() >= 3));
         let clock = stream.clock();
         drop(stream);
 
@@ -799,17 +1224,18 @@ mod tests {
 
     #[test]
     fn sync_packets_account_for_the_audio_latency_a_receiver_reports() {
-        check_sync_mapping(Some(4_410), 1000, 5_000_000);
+        check_sync_mapping(Protocol::AirPlay1, Some(4_410), 1000, 5_000_000);
     }
 
     #[test]
     fn a_receiver_reporting_no_audio_latency_is_taken_to_add_a_quarter_second() {
-        check_sync_mapping(None, 1000, 5_000_000);
+        check_sync_mapping(Protocol::AirPlay1, None, 1000, 5_000_000);
     }
 
     #[test]
     fn sequence_numbers_and_rtp_times_wrap_without_a_seam() {
         check_sync_mapping(
+            Protocol::AirPlay1,
             Some(11_025),
             65_530,
             u32::MAX - 3 * FRAMES_PER_PACKET as u32 + 100,
@@ -1309,7 +1735,7 @@ mod tests {
     fn a_receiver_waits_for_its_raop_service_within_the_lookup_window() {
         let fake = Fake::start(Behavior::default());
         let browser = Browser::offline();
-        fake.advertise_airplay(&browser);
+        fake.advertise_airplay(&browser, "deviceid=AA:BB:CC:DD:EE:FF model=Fake flags=0x4");
         let stream = Stream::start_with(
             &browser,
             fake.id(),
@@ -1325,7 +1751,7 @@ mod tests {
         );
 
         let browser = Browser::offline();
-        fake.advertise_airplay(&browser);
+        fake.advertise_airplay(&browser, "deviceid=AA:BB:CC:DD:EE:FF model=Fake flags=0x4");
         let stream = Stream::start_with(
             &browser,
             fake.id(),
@@ -1340,7 +1766,7 @@ mod tests {
             panic!("{:?}", stream.status())
         };
         assert!(
-            reason.starts_with("fake: it offers only AirPlay 2"),
+            reason.starts_with("fake: it does not take AirPlay 2 audio"),
             "{reason}"
         );
     }
@@ -1400,7 +1826,7 @@ mod tests {
         );
 
         let fake = Fake::start(Behavior {
-            rtsp: Rtsp::HangAtAnnounce,
+            rtsp: Rtsp::HangAt(Step::Announce),
             ..Behavior::default()
         });
         let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
