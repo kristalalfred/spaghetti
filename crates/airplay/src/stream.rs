@@ -54,6 +54,24 @@ impl Stream {
         Self::start_with(browser, receiver, Settings::new(), render)
     }
 
+    /// Claude: as `start`, speaking `protocol` and no other: a receiver that
+    /// does not offer it, or refuses it, is unreachable.
+    pub fn start_with_protocol<R>(
+        browser: &Browser,
+        receiver: ReceiverId,
+        protocol: Protocol,
+        render: R,
+    ) -> Self
+    where
+        R: FnMut(Render<'_>) + Send + 'static,
+    {
+        let settings = Settings::new().map(|settings| Settings {
+            protocol: Some(protocol),
+            ..settings
+        });
+        Self::start_with(browser, receiver, settings, render)
+    }
+
     pub(crate) fn start_with<R>(
         browser: &Browser,
         receiver: ReceiverId,

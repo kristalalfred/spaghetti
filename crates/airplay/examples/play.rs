@@ -4,16 +4,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use airplay::{Browser, FRAMES_PER_PACKET, ReceiverId, Render, SAMPLE_RATE, Status, Stream};
+use airplay::{
+    Browser, FRAMES_PER_PACKET, Protocol, ReceiverId, Render, SAMPLE_RATE, Status, Stream,
+};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "usage: play
-       play RECEIVER (--sine HZ | --wav FILE) [--seconds N] [--gain DB]
+       play RECEIVER (--sine HZ | --wav FILE) [--seconds N] [--gain DB] [--airplay 1|2]
 
 Without arguments, lists the AirPlay receivers on the network. RECEIVER is a
 receiver's name or device ID. --wav plays 16-bit 44.1 kHz stereo; --gain
-defaults to -20 dB.";
+defaults to -20 dB. --airplay speaks that protocol and no other; without it the
+stream speaks AirPlay 2 to receivers that pair transiently and AirPlay 1 to the
+rest.";
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -47,8 +51,8 @@ fn run(args: &[String]) -> Result<(), String> {
 
 fn list(browser: &Browser) -> Result<(), String> {
     for receiver in browser.receivers()? {
-        let support = match receiver.support() {
-            Ok(()) => "supported".to_owned(),
+        let support = match receiver.protocol() {
+            Ok(protocol) => format!("plays over {protocol}"),
             Err(reason) => format!("unsupported: {reason}"),
         };
         let model = receiver.model.as_deref().unwrap_or("?");
@@ -74,6 +78,7 @@ struct Options {
     source: Source,
     seconds: Option<f64>,
     gain: f32,
+    protocol: Option<Protocol>,
 }
 
 enum Source {
@@ -86,6 +91,7 @@ impl Options {
         let mut source = None;
         let mut seconds = None;
         let mut gain_db = -20.0f32;
+        let mut protocol = None;
         let mut args = args.iter();
         while let Some(flag) = args.next() {
             let mut value = || {
@@ -102,6 +108,13 @@ impl Options {
                 "--wav" => source = Some(Source::Wav(read_wav(value()?)?)),
                 "--seconds" => seconds = Some(number(value()?)?),
                 "--gain" => gain_db = number(value()?)? as f32,
+                "--airplay" => {
+                    protocol = Some(match value()?.as_str() {
+                        "1" => Protocol::AirPlay1,
+                        "2" => Protocol::AirPlay2,
+                        other => return Err(format!("--airplay takes 1 or 2, not {other:?}")),
+                    })
+                }
                 _ => return Err(format!("unknown option {flag:?}\n\n{USAGE}")),
             }
         }
@@ -110,6 +123,7 @@ impl Options {
             source,
             seconds,
             gain: 10f32.powf(gain_db / 20.0),
+            protocol,
         })
     }
 
@@ -192,6 +206,7 @@ fn mach_time(at: Instant) -> u64 {
 }
 
 fn play(browser: &Browser, id: ReceiverId, options: Options) -> Result<(), String> {
+    let protocol = options.protocol;
     let total = options.frames();
     let rendered_all = Arc::new(AtomicBool::new(false));
     let mut first_play_at = None;
@@ -223,7 +238,10 @@ fn play(browser: &Browser, id: ReceiverId, options: Options) -> Result<(), Strin
         }
     };
     eprintln!("connecting to {id}");
-    let stream = Stream::start(browser, id, render);
+    let stream = match protocol {
+        Some(protocol) => Stream::start_with_protocol(browser, id, protocol, render),
+        None => Stream::start(browser, id, render),
+    };
     let mut last = Status::Connecting;
     loop {
         let status = stream.status();
