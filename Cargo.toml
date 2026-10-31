@@ -12,3 +12,6 @@ license = "MIT"
 
 [profile.dev.package.rubato]
 opt-level = 3
+
+[profile.dev.package.num-bigint]
+opt-level = 3
