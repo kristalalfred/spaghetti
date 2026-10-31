@@ -1725,6 +1725,7 @@ dependencies = [
 name = "spaghetti"
 version = "0.1.0"
 dependencies = [
+ "airplay",
  "clap",
  "serde",
  "serde_json",

@@ -215,10 +215,16 @@ fn route_destination(
         if name.is_empty() {
             return Err("airplay:// requires a receiver name or id".into());
         }
+        if name.parse::<airplay::ReceiverId>().is_ok() {
+            return Ok(Destination::AirPlay {
+                receiver: name.to_string(),
+                delay_ms,
+            });
+        }
         let receivers = receivers()?;
         let matches: Vec<_> = receivers.iter().filter(|r| r.name == name).collect();
         let receiver = match matches.as_slice() {
-            [] => name.to_string(),
+            [] => return Err(format!("AirPlay receiver name '{name}' not found")),
             [receiver] => receiver.id.clone(),
             _ => {
                 let mut ids: Vec<_> = matches.iter().map(|r| r.id.as_str()).collect();
@@ -615,14 +621,30 @@ mod tests {
         let error = route_destination("airplay://Kitchen", Some(2500), &srt(), list).unwrap_err();
         assert!(error.contains("ambiguous"));
         assert!(error.contains("C4:38:75:04:5E:80, C4:38:75:04:5E:81"));
-        for target in ["kitchen", "Kit", "Absent", "c4:38:75:04:5e:80"] {
+        for target in ["kitchen", "Kit", "Absent"] {
+            let error = route_destination(&format!("airplay://{target}"), Some(2500), &srt(), list)
+                .unwrap_err();
+            assert!(error.contains("not found"), "{error}");
+        }
+    }
+
+    #[test]
+    fn explicit_ids_reach_the_daemon_unchanged_without_listing() {
+        for id in [
+            "C4:38:75:04:5E:99",
+            "c4:38:75:04:5e:99",
+            "C43875045E99",
+            "c43875045e99",
+        ] {
             let destination =
-                route_destination(&format!("airplay://{target}"), Some(2500), &srt(), list)
-                    .unwrap();
+                route_destination(&format!("airplay://{id}"), Some(2500), &srt(), || {
+                    panic!("an explicit receiver id must not list receivers")
+                })
+                .unwrap();
             assert_eq!(
                 destination,
                 Destination::AirPlay {
-                    receiver: target.into(),
+                    receiver: id.into(),
                     delay_ms: 2500
                 }
             );
@@ -630,26 +652,12 @@ mod tests {
     }
 
     #[test]
-    fn undiscovered_ids_reach_the_daemon_unchanged() {
-        let id = "C4:38:75:04:5E:99";
-        let destination = route_destination(&format!("airplay://{id}"), Some(2500), &srt(), || {
-            Ok(vec![])
-        })
-        .unwrap();
-        assert_eq!(
-            destination,
-            Destination::AirPlay {
-                receiver: id.into(),
-                delay_ms: 2500
-            }
-        );
-    }
-
-    #[test]
-    fn an_exact_name_takes_precedence_over_a_matching_id() {
+    fn an_explicit_id_takes_precedence_over_a_matching_name() {
         let target = "C4:38:75:04:5E:80";
+        let listed = std::cell::Cell::new(false);
         let destination =
             route_destination(&format!("airplay://{target}"), Some(2500), &srt(), || {
+                listed.set(true);
                 Ok(vec![
                     receiver(target, "Kitchen"),
                     receiver("C4:38:75:04:5E:81", target),
@@ -659,10 +667,11 @@ mod tests {
         assert_eq!(
             destination,
             Destination::AirPlay {
-                receiver: "C4:38:75:04:5E:81".into(),
+                receiver: target.into(),
                 delay_ms: 2500
             }
         );
+        assert!(!listed.get());
     }
 
     #[test]
