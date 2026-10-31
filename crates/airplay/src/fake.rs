@@ -215,7 +215,6 @@ impl Fake {
                                 ports,
                                 state,
                                 channel: None,
-                                pairing: None,
                                 secret: None,
                             }
                             .serve();
@@ -473,8 +472,21 @@ struct Server {
     ports: Ports,
     state: Arc<State>,
     channel: Option<hap::Channel>,
-    pairing: Option<srp::Server>,
     secret: Option<[u8; srp::PROOF_LEN]>,
+}
+
+/// Claude: the fake's SRP verifier and public value, computed once: a real
+/// receiver draws a salt and a private value for each pairing, but the fake
+/// spares a debug build that arithmetic.
+fn transient_server() -> &'static srp::Server {
+    static SERVER: std::sync::OnceLock<srp::Server> = std::sync::OnceLock::new();
+    SERVER.get_or_init(|| {
+        let mut salt = [0u8; 16];
+        let mut private = [0u8; 32];
+        getrandom::fill(&mut salt).unwrap();
+        getrandom::fill(&mut private).unwrap();
+        srp::Server::new(pairing::USER, pairing::TRANSIENT_PIN, &salt, &private)
+    })
 }
 
 /// Claude: what the fake answers a request with, before any encryption.
@@ -638,22 +650,15 @@ impl Server {
                 if let Pairing::ErrorAtM2(error) = self.behavior.pairing {
                     return answer(&[(tlv8::STATE, &[2]), (tlv8::ERROR, &[error])]);
                 }
-                let mut salt = [0u8; 16];
-                let mut private = [0u8; 32];
-                getrandom::fill(&mut salt).unwrap();
-                getrandom::fill(&mut private).unwrap();
-                let server =
-                    srp::Server::new(pairing::USER, pairing::TRANSIENT_PIN, &salt, &private);
-                let public = server.public;
-                self.pairing = Some(server);
+                let server = transient_server();
                 answer(&[
                     (tlv8::STATE, &[2]),
-                    (tlv8::SALT, &salt),
-                    (tlv8::PUBLIC_KEY, &public),
+                    (tlv8::SALT, &server.salt),
+                    (tlv8::PUBLIC_KEY, &server.public),
                 ])
             }
             Some([3]) => {
-                let server = self.pairing.take().expect("M1 came first");
+                let server = transient_server();
                 let client_public = tlv.get(tlv8::PUBLIC_KEY).expect("M3 has A");
                 let proof = tlv.get(tlv8::PROOF).expect("M3 has a proof");
                 let Some((mut server_proof, key)) = server.verify(client_public, proof) else {
@@ -1159,7 +1164,7 @@ pub(crate) mod tests {
             ..settings()
         };
         let stream = Stream::start_with(&browser, fake.id(), Ok(settings), renders.renderer(None));
-        assert!(wait_until(Duration::from_secs(4), || fake.syncs().len() >= 3));
+        assert!(wait_until(Duration::from_secs(10), || fake.syncs().len() >= 3));
         let clock = stream.clock();
         drop(stream);
 

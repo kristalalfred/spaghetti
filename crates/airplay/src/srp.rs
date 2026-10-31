@@ -146,7 +146,7 @@ fn full_width(value: &BigUint) -> Option<[u8; PUBLIC_LEN]> {
 #[cfg(test)]
 pub(crate) struct Server {
     user: String,
-    salt: Vec<u8>,
+    pub(crate) salt: Vec<u8>,
     verifier: BigUint,
     private: BigUint,
     pub(crate) public: [u8; PUBLIC_LEN],
