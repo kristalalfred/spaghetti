@@ -12,10 +12,19 @@ use std::io::Write;
 /// machine.
 const HANDSHAKE: Duration = Duration::from_secs(10);
 
+/// Claude: the suite's settings with room for the fake's SRP in a debug build
+/// to answer pairing, for a stream that picks its protocol.
+fn automatic() -> Settings {
+    Settings {
+        answer_timeout: Duration::from_secs(3),
+        ..settings()
+    }
+}
+
 fn airplay_2() -> Settings {
     Settings {
         protocol: Some(Protocol::AirPlay2),
-        ..settings()
+        ..automatic()
     }
 }
 
@@ -448,7 +457,7 @@ fn a_stream_setup_left_unanswered_tears_down_within_its_bound_and_is_unreachable
         ..Behavior::default()
     });
     let browser = browser(&fake, true);
-    let settings = settings();
+    let settings = automatic();
     let bound = settings.answer_timeout + settings.teardown_timeout;
     let stream = Stream::start_with(
         &browser,
@@ -487,7 +496,7 @@ fn a_wrong_pairing_proof_is_never_trusted_or_fallen_back_from() {
     let stream = Stream::start_with(
         &browser,
         fake.id(),
-        Ok(settings()),
+        Ok(automatic()),
         Renders::default().renderer(None),
     );
     assert!(wait_until(HANDSHAKE, || stream.status() != Status::Connecting));
@@ -521,7 +530,7 @@ fn a_refused_pairing_falls_back_to_airplay_1_unless_airplay_2_was_asked_for() {
         let stream = Stream::start_with(
             &both,
             fake.id(),
-            Ok(settings()),
+            Ok(automatic()),
             Renders::default().renderer(None),
         );
         assert!(
@@ -582,7 +591,7 @@ fn a_fallback_reaches_an_airplay_1_service_found_after_the_stream_started() {
     let stream = Stream::start_with(
         &browser,
         fake.id(),
-        Ok(settings()),
+        Ok(automatic()),
         Renders::default().renderer(None),
     );
     assert!(wait_until(HANDSHAKE, || fake
@@ -608,7 +617,7 @@ fn a_refused_stream_setup_tears_the_session_down_before_falling_back() {
     let stream = Stream::start_with(
         &browser,
         fake.id(),
-        Ok(settings()),
+        Ok(automatic()),
         Renders::default().renderer(None),
     );
     assert!(
