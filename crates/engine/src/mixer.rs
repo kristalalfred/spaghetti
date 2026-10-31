@@ -319,7 +319,7 @@ mod tests {
                 }
             }
         });
-        let finished = cycles.wait_fade(3, FADE_LIMIT);
+        let finished = cycles.wait_fade(3, Duration::from_secs(2));
         let frames = rendered.load(Ordering::Acquire);
         ticking.join().unwrap();
         assert!(finished);
