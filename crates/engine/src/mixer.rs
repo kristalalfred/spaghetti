@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use coreaudio_sys::{AudioGetCurrentHostTime, AudioGetHostClockFrequency};
+use crate::host_time;
 
 /// Mix multiple audio sources with individual volumes into an output buffer.
 /// All buffers are interleaved f32.
@@ -22,6 +22,7 @@ pub fn mix(inputs: &[&[f32]], volumes: &[f32], output: &mut [f32]) {
 
 /// Claude: how long a new tap waits for its first cycles, and a route for its
 /// fade-out, before going on regardless.
+#[cfg(target_os = "macos")]
 pub const START_LIMIT: Duration = Duration::from_millis(250);
 pub const FADE_LIMIT: Duration = Duration::from_millis(250);
 /// Claude: an output that has not cycled for this long is not playing.
@@ -73,8 +74,8 @@ impl Cycles {
 
     /// Claude: whether a cycle ran within `within`.
     pub fn running(&self, within: Duration) -> bool {
-        let ticks = within.as_secs_f64() * unsafe { AudioGetHostClockFrequency() };
-        let now = unsafe { AudioGetCurrentHostTime() };
+        let ticks = within.as_secs_f64() * host_time::ticks_per_second();
+        let now = host_time::now();
         let at = self.at.load(Ordering::Relaxed);
         at != 0 && (now.saturating_sub(at) as f64) < ticks
     }
@@ -94,6 +95,7 @@ impl Cycles {
             .is_some()
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub fn wait(&self, cycles: u64, limit: Duration) -> bool {
         let target = self.sequence.load(Ordering::SeqCst) / 2 + cycles;
         self.wait_until(Instant::now() + limit, |p| p.cycles >= target)
@@ -290,7 +292,7 @@ mod tests {
             move || {
                 for _ in 0..3 {
                     std::thread::sleep(Duration::from_millis(5));
-                    cycles.tick(unsafe { AudioGetCurrentHostTime() }, 352, 44100.0);
+                    cycles.tick(host_time::now(), 352, 44100.0);
                 }
             }
         });
@@ -303,7 +305,7 @@ mod tests {
     fn a_fade_waits_for_rendered_audio_after_a_stall_longer_than_idle() {
         use std::sync::{Arc, atomic::AtomicUsize};
         let cycles = Arc::new(Cycles::new());
-        cycles.tick(unsafe { AudioGetCurrentHostTime() }, 352, 44100.0);
+        cycles.tick(host_time::now(), 352, 44100.0);
         let rendered = Arc::new(AtomicUsize::new(0));
         let ticking = std::thread::spawn({
             let cycles = Arc::clone(&cycles);
@@ -313,7 +315,7 @@ mod tests {
                 for _ in 0..11 {
                     std::thread::sleep(Duration::from_millis(8));
                     rendered.fetch_add(352, Ordering::Release);
-                    cycles.tick(unsafe { AudioGetCurrentHostTime() }, 352, 44100.0);
+                    cycles.tick(host_time::now(), 352, 44100.0);
                 }
             }
         });
@@ -345,7 +347,7 @@ mod tests {
                 ] {
                     std::thread::sleep(Duration::from_millis(8));
                     rendered.fetch_add(1, Ordering::Release);
-                    cycles.tick(unsafe { AudioGetCurrentHostTime() }, frames, rate);
+                    cycles.tick(host_time::now(), frames, rate);
                 }
             }
         });
@@ -359,7 +361,7 @@ mod tests {
     #[test]
     fn a_fade_that_never_resumes_has_one_bounded_deadline() {
         let cycles = Cycles::new();
-        cycles.tick(unsafe { AudioGetCurrentHostTime() }, 352, 44100.0);
+        cycles.tick(host_time::now(), 352, 44100.0);
         let started = Instant::now();
         assert!(!cycles.wait_fade(3, FADE_LIMIT));
         assert!(started.elapsed() < FADE_LIMIT + Duration::from_millis(40));

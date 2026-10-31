@@ -3,18 +3,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use coreaudio_sys::{AudioGetCurrentHostTime, AudioGetHostClockFrequency};
 use spaghetti_common::ipc_protocol::{
-    Destination, FlowState, FlowStatus, PeerRef, PeerRole, SourceSpec, TurnServer, WebRtcPeer,
+    FlowState, FlowStatus, PeerRef, PeerRole, TurnServer, WebRtcPeer,
 };
 use tokio::net::UdpSocket;
 
 use crate::codec::tests::measure;
+use crate::host_time;
 use crate::playout::{HealthReport, Playout};
 use crate::ring::{CHANNELS, Ring};
 use crate::router::Router;
-use crate::sinks::{Sinks, SourceTiming};
+use crate::sinks::SourceTiming;
 use crate::stun;
+use crate::{Destination, Frames, HostTime, ProgramInput, SourceSpec};
 
 mod turn;
 
@@ -61,12 +62,20 @@ impl Engine {
             .unwrap_or_else(|message| panic!("create route: {message}"))
     }
 
-    fn fixture(&self, sample_rate: f64) -> (u32, Arc<Sinks>) {
-        self.router().create_fixture_source(sample_rate)
+    /// Claude: a source the test pushes itself, through a program input of its own.
+    fn fixture(&self, sample_rate: f64) -> (u32, ProgramInput) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let name = format!("fixture {}", NEXT.fetch_add(1, Ordering::Relaxed));
+        let mut router = self.router();
+        let input = router.add_program_input(&name, sample_rate).unwrap();
+        let source = router
+            .create_source(SourceSpec::Program { input: name }, None)
+            .unwrap();
+        (source, input)
     }
 
     fn sink(&self, source_id: u32) -> (Arc<Ring>, SourceTiming) {
-        self.router().attach_fixture_sink(source_id)
+        self.router().attach_raw_sink(source_id)
     }
 
     async fn listed(&self, peer: PeerRef) -> (FlowStatus, Option<String>) {
@@ -168,8 +177,8 @@ struct Producer {
 }
 
 impl Producer {
-    fn start(sinks: Arc<Sinks>, rate: f64) -> Self {
-        Self::feeding(sinks, rate, move |frame, channel| {
+    fn start(input: ProgramInput, rate: f64) -> Self {
+        Self::feeding(input, rate, move |frame, channel| {
             let phase = 2.0 * std::f64::consts::PI * TONE_HZ * frame as f64 / rate;
             [LEFT, RIGHT][channel] * phase.sin() as f32
         })
@@ -177,21 +186,21 @@ impl Producer {
 
     /// Claude: `sample(frame, channel)` is the source's audio.
     fn feeding(
-        sinks: Arc<Sinks>,
+        mut input: ProgramInput,
         rate: f64,
         sample: impl Fn(usize, usize) -> f32 + Send + 'static,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
-        let ticks_per_second = unsafe { AudioGetHostClockFrequency() };
-        let origin = unsafe { AudioGetCurrentHostTime() };
+        let ticks_per_second = host_time::ticks_per_second();
+        let origin = host_time::now();
         let thread = std::thread::spawn({
             let (stop, paused) = (Arc::clone(&stop), Arc::clone(&paused));
             move || {
                 let chunk = (rate / 100.0) as usize;
                 let (mut start, mut base, mut sent) = (origin, 0usize, 0usize);
                 while !stop.load(Ordering::Relaxed) {
-                    let now = unsafe { AudioGetCurrentHostTime() };
+                    let now = host_time::now();
                     if paused.load(Ordering::Relaxed) {
                         (start, base) = (now, sent);
                     } else {
@@ -201,13 +210,13 @@ impl Producer {
                             let at = sent;
                             let captured =
                                 start + ((at - base) as f64 / rate * ticks_per_second) as u64;
-                            unsafe {
-                                sinks.for_each(|ring| {
-                                    ring.push_with(chunk, now, Some(captured), |f, ch| {
-                                        sample(at + f, ch)
-                                    });
-                                });
-                            }
+                            let frames: Vec<f32> = (0..chunk * CHANNELS)
+                                .map(|i| sample(at + i / CHANNELS, i % CHANNELS))
+                                .collect();
+                            input.push(
+                                Frames::interleaved(&frames).unwrap(),
+                                HostTime::from_ticks(captured),
+                            );
                             sent += chunk;
                         }
                     }
@@ -243,9 +252,11 @@ async fn collect(ring: &Arc<Ring>, seconds: f64) -> Vec<f32> {
     tokio::task::spawn_blocking(move || {
         let mut out = Vec::new();
         let mut buffer = vec![0.0; 4096 * CHANNELS];
+        ring.take_discontinuity();
         ring.discard(ring.available());
         let start = Instant::now();
         while start.elapsed().as_secs_f64() < seconds {
+            ring.take_discontinuity();
             let frames = ring.pop_into(&mut buffer);
             out.extend_from_slice(&buffer[..frames * CHANNELS]);
             std::thread::sleep(Duration::from_millis(10));
@@ -262,14 +273,15 @@ async fn collect(ring: &Arc<Ring>, seconds: f64) -> Vec<f32> {
 async fn collect_dated(ring: &Arc<Ring>, rate: f64, seconds: f64) -> Vec<(u64, f32)> {
     let ring = Arc::clone(ring);
     tokio::task::spawn_blocking(move || {
-        let ticks_per_frame = unsafe { AudioGetHostClockFrequency() } / rate;
+        let ticks_per_frame = host_time::ticks_per_second() / rate;
         let mut dated = Vec::new();
         let mut buffer = vec![0.0; 4096 * CHANNELS];
+        ring.take_discontinuity();
         ring.discard(ring.available());
         let start = Instant::now();
         while start.elapsed().as_secs_f64() < seconds {
-            let captured =
-                ring.tail_captured(ticks_per_frame, unsafe { AudioGetCurrentHostTime() });
+            ring.take_discontinuity();
+            let captured = ring.tail_captured(ticks_per_frame);
             let frames = ring.pop_into(&mut buffer);
             if let Some(captured) = captured {
                 dated.extend((0..frames).map(|f| {
@@ -317,7 +329,7 @@ async fn play(
 ) -> (Vec<f32>, HealthReport, f32) {
     let ring = Arc::clone(ring);
     tokio::task::spawn_blocking(move || {
-        let ticks_per_second = unsafe { AudioGetHostClockFrequency() };
+        let ticks_per_second = host_time::ticks_per_second();
         let mut playout = Playout::new(&timing, 48000.0, ticks_per_second, None).unwrap();
         let health = playout.health();
         let frames = 512;
@@ -332,7 +344,7 @@ async fn play(
             if let Some(wait) = due.checked_duration_since(Instant::now()) {
                 std::thread::sleep(wait);
             }
-            let now = unsafe { AudioGetCurrentHostTime() };
+            let now = host_time::now();
             playout.render(&ring, &mut [&mut left, &mut right], now, now);
             out.extend_from_slice(&left);
             renders += 1;
@@ -569,8 +581,8 @@ async fn fake_stun(
 #[tokio::test(flavor = "multi_thread")]
 async fn an_offered_route_and_an_answering_source_carry_a_stereo_tone() {
     let engine = Engine::new();
-    let (fixture, sinks) = engine.fixture(48000.0);
-    let _producer = Producer::start(sinks, 48000.0);
+    let (fixture, input) = engine.fixture(48000.0);
+    let _producer = Producer::start(input, 48000.0);
     let source = PeerRef::Source(engine.create_source(peer(PeerRole::Answer, "tone")).await);
     let route = PeerRef::Route(
         engine
@@ -647,8 +659,8 @@ async fn a_link_offers_a_host_candidate_on_every_interface_the_default_route_fir
 #[tokio::test(flavor = "multi_thread")]
 async fn a_44_1_khz_source_advances_rtp_time_by_960_per_packet() {
     let engine = Engine::new();
-    let (fixture, sinks) = engine.fixture(44100.0);
-    let _producer = Producer::start(sinks, 44100.0);
+    let (fixture, input) = engine.fixture(44100.0);
+    let _producer = Producer::start(input, 44100.0);
     let source = PeerRef::Source(engine.create_source(peer(PeerRole::Answer, "cd")).await);
     let route = PeerRef::Route(
         engine
@@ -688,8 +700,8 @@ async fn a_44_1_khz_source_advances_rtp_time_by_960_per_packet() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_receiver_stalls_when_packets_stop_and_flows_when_they_resume() {
     let engine = Engine::new();
-    let (fixture, sinks) = engine.fixture(48000.0);
-    let producer = Producer::start(sinks, 48000.0);
+    let (fixture, input) = engine.fixture(48000.0);
+    let producer = Producer::start(input, 48000.0);
     let source = PeerRef::Source(engine.create_source(peer(PeerRole::Answer, "stall")).await);
     let route = PeerRef::Route(
         engine
@@ -723,8 +735,8 @@ async fn a_receiver_stalls_when_packets_stop_and_flows_when_they_resume() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stun_answer_in_time_becomes_a_candidate_and_a_late_one_changes_nothing() {
     let engine = Engine::new();
-    let (fixture, sinks) = engine.fixture(48000.0);
-    let _producer = Producer::start(sinks, 48000.0);
+    let (fixture, input) = engine.fixture(48000.0);
+    let _producer = Producer::start(input, 48000.0);
     let mapped: SocketAddrV4 = "203.0.113.7:40000".parse().unwrap();
     let (stun_server, late, _stun) = fake_stun(mapped).await;
     let source = PeerRef::Source(engine.create_source(peer(PeerRole::Answer, "stun")).await);
@@ -765,8 +777,8 @@ async fn a_stun_answer_in_time_becomes_a_candidate_and_a_late_one_changes_nothin
 #[tokio::test(flavor = "multi_thread")]
 async fn garbage_on_the_media_sockets_does_not_end_the_link() {
     let engine = Engine::new();
-    let (fixture, sinks) = engine.fixture(48000.0);
-    let _producer = Producer::start(sinks, 48000.0);
+    let (fixture, input) = engine.fixture(48000.0);
+    let _producer = Producer::start(input, 48000.0);
     let source = PeerRef::Source(
         engine
             .create_source(peer(PeerRole::Answer, "garbage"))
@@ -824,7 +836,7 @@ async fn garbage_on_the_media_sockets_does_not_end_the_link() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unanswered_offer_describes_itself_after_the_stun_deadline_and_stays_connecting() {
     let engine = Engine::new();
-    let (fixture, _sinks) = engine.fixture(48000.0);
+    let (fixture, _input) = engine.fixture(48000.0);
     let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let created = Instant::now();
     let offering = WebRtcPeer {
@@ -873,8 +885,8 @@ async fn an_unanswered_offer_describes_itself_after_the_stun_deadline_and_stays_
 #[tokio::test(flavor = "multi_thread")]
 async fn the_unreachable_deadline_waits_for_the_answer_however_late_it_comes() {
     let engine = Engine::new();
-    let (fixture, sinks) = engine.fixture(48000.0);
-    let _producer = Producer::start(sinks, 48000.0);
+    let (fixture, input) = engine.fixture(48000.0);
+    let _producer = Producer::start(input, 48000.0);
     let source = PeerRef::Source(
         engine
             .create_source(peer(PeerRole::Answer, "patient"))
@@ -914,7 +926,7 @@ async fn the_unreachable_deadline_waits_for_the_answer_however_late_it_comes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_applied_answer_whose_peer_is_silent_makes_the_offerer_unreachable_10_s_later() {
     let engine = Engine::new();
-    let (fixture, _sinks) = engine.fixture(48000.0);
+    let (fixture, _input) = engine.fixture(48000.0);
     let source = PeerRef::Source(engine.create_source(peer(PeerRole::Answer, "silent")).await);
     let route = PeerRef::Route(
         engine
@@ -962,8 +974,8 @@ async fn an_applied_answer_whose_peer_is_silent_makes_the_offerer_unreachable_10
 #[tokio::test(flavor = "multi_thread")]
 async fn closing_one_side_makes_the_other_lost() {
     let engine = Engine::new();
-    let (fixture, sinks) = engine.fixture(48000.0);
-    let _producer = Producer::start(sinks, 48000.0);
+    let (fixture, input) = engine.fixture(48000.0);
+    let _producer = Producer::start(input, 48000.0);
     let source_id = engine
         .create_source(peer(PeerRole::Answer, "closing"))
         .await;
@@ -1016,7 +1028,7 @@ async fn closing_one_side_makes_the_other_lost() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_remote_description_applies_once_per_generation() {
     let engine = Engine::new();
-    let (fixture, _sinks) = engine.fixture(48000.0);
+    let (fixture, _input) = engine.fixture(48000.0);
     let source = PeerRef::Source(engine.create_source(peer(PeerRole::Answer, "once")).await);
     let route = PeerRef::Route(
         engine
@@ -1123,8 +1135,8 @@ async fn a_peer_takes_stun_and_turn_servers_only_as_host_and_port() {
 #[tokio::test(flavor = "multi_thread")]
 async fn concealment_keeps_a_lossy_reordered_stream_continuous() {
     let engine = Engine::new();
-    let (fixture, sinks) = engine.fixture(48000.0);
-    let _producer = Producer::start(sinks, 48000.0);
+    let (fixture, input) = engine.fixture(48000.0);
+    let _producer = Producer::start(input, 48000.0);
     let source = PeerRef::Source(engine.create_source(peer(PeerRole::Answer, "lossy")).await);
     let route = PeerRef::Route(
         engine
@@ -1182,8 +1194,8 @@ fn noise(frame: usize) -> f32 {
 async fn a_receiving_source_dates_frames_by_when_the_sender_captured_them() {
     for rate in [48000.0, 44100.0] {
         let engine = Engine::new();
-        let (fixture, sinks) = engine.fixture(rate);
-        let producer = Producer::feeding(sinks, rate, |frame, _| noise(frame));
+        let (fixture, input) = engine.fixture(rate);
+        let producer = Producer::feeding(input, rate, |frame, _| noise(frame));
         let source_id = engine.create_source(peer(PeerRole::Answer, "dated")).await;
         let route = PeerRef::Route(
             engine
@@ -1204,7 +1216,7 @@ async fn a_receiving_source_dates_frames_by_when_the_sender_captured_them() {
             "{rate} Hz: {} dated frames",
             dated.len()
         );
-        let ticks_per_frame = unsafe { AudioGetHostClockFrequency() } / rate;
+        let ticks_per_frame = host_time::ticks_per_second() / rate;
         let frames: Vec<(f64, f32)> = dated
             .iter()
             .map(|&(at, sample)| ((at - producer.origin) as f64 / ticks_per_frame, sample))
@@ -1228,6 +1240,116 @@ async fn a_receiving_source_dates_frames_by_when_the_sender_captured_them() {
             late.abs() < 0.0005,
             "{rate} Hz: frames dated {} µs after their capture",
             late * 1e6
+        );
+    }
+}
+
+/// Claude: a source that stops capturing for a while and goes on: frames after
+/// the gap reach the receiver dated by when the sender captured them, so the
+/// sender's RTP time skipped the gap rather than running on through it. Every
+/// frame collected was captured after the gap.
+#[tokio::test(flavor = "multi_thread")]
+async fn frames_after_a_capture_gap_keep_their_capture_dates_across_the_link() {
+    let rate = 48000.0;
+    let (gap_at, gap) = (3.0, 0.3);
+    let engine = Engine::new();
+    let (fixture, mut input) = engine.fixture(rate);
+    let stop = Arc::new(AtomicBool::new(false));
+    let ticks_per_second = host_time::ticks_per_second();
+    let origin = host_time::now();
+    let producer = std::thread::spawn({
+        let stop = Arc::clone(&stop);
+        move || {
+            let chunk = 480;
+            let mut sent = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                let elapsed = (host_time::now() - origin) as f64 / ticks_per_second;
+                while (sent + chunk) as f64 / rate <= elapsed {
+                    let seconds = sent as f64 / rate;
+                    if (gap_at..gap_at + gap).contains(&seconds) {
+                        sent += chunk;
+                        continue;
+                    }
+                    let frames: Vec<f32> = (0..chunk * CHANNELS)
+                        .map(|i| noise(sent + i / CHANNELS))
+                        .collect();
+                    let captured = origin + (seconds * ticks_per_second) as u64;
+                    input.push(
+                        Frames::interleaved(&frames).unwrap(),
+                        HostTime::from_ticks(captured),
+                    );
+                    sent += chunk;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    });
+    let source_id = engine.create_source(peer(PeerRole::Answer, "gap")).await;
+    let route = PeerRef::Route(
+        engine
+            .create_route(fixture, peer(PeerRole::Offer, "gap"))
+            .await,
+    );
+    let source = PeerRef::Source(source_id);
+    let (ring, _) = engine.sink(source_id);
+    let shim = Shim::exchange(&engine, route, source, Impairment::None).await;
+    engine
+        .wait_for(source, FlowState::Flowing, Duration::from_secs(5))
+        .await;
+    let resumed = Duration::from_secs_f64(gap_at + gap + 0.1);
+    let since_origin =
+        Duration::from_secs_f64((host_time::now() - origin) as f64 / ticks_per_second);
+    tokio::time::sleep(resumed.saturating_sub(since_origin)).await;
+
+    let dated = collect_dated(&ring, rate, 0.8).await;
+    stop.store(true, Ordering::Relaxed);
+    producer.join().unwrap();
+    let sent = shim.rtp.lock().unwrap().clone();
+    let skipped = sent
+        .windows(2)
+        .map(|pair| pair[1].1.wrapping_sub(pair[0].1))
+        .max()
+        .unwrap();
+    assert!(
+        f64::from(skipped) > (gap - 0.1) * rate,
+        "the RTP time ran on through the gap: its largest step is {skipped}"
+    );
+    let ticks_per_frame = ticks_per_second / rate;
+    let frames: Vec<(f64, f32)> = dated
+        .iter()
+        .map(|&(at, sample)| (at.saturating_sub(origin) as f64 / ticks_per_frame, sample))
+        .collect();
+    assert!(
+        frames.len() > 24000,
+        "{} frames dated after the gap",
+        frames.len()
+    );
+    // Claude: each 50 ms on its own, since a link that splices the gap
+    // misdates frames only until the sender's next clock reply.
+    for (window, frames) in frames.chunks((0.05 * rate) as usize).enumerate() {
+        let energy = |shift: i64| -> (f64, f64, f64) {
+            frames
+                .iter()
+                .fold((0.0, 0.0, 0.0), |(both, heard, sent), &(frame, sample)| {
+                    let source = f64::from(noise((frame.round() as i64 + shift).max(0) as usize));
+                    let sample = f64::from(sample);
+                    (
+                        both + sample * source,
+                        heard + sample * sample,
+                        sent + source * source,
+                    )
+                })
+        };
+        let tolerance = (0.0005 * rate) as i64;
+        let similarity = (-tolerance..=tolerance)
+            .map(|shift| {
+                let (both, heard, sent) = energy(shift);
+                both / (heard * sent).sqrt()
+            })
+            .fold(f64::MIN, f64::max);
+        assert!(
+            similarity > 0.3,
+            "window {window} after the gap: frames match the audio captured within 0.5 ms of their dates by {similarity:.2}"
         );
     }
 }

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use rubato::audioadapter_buffers::direct::{InterleavedSlice, SequentialSliceOfSlices};
 use rubato::{
@@ -7,10 +7,13 @@ use rubato::{
     WindowFunction,
 };
 
+use std::time::Duration;
+
 use crate::delivery::DeliverySpan;
-use crate::mixer::RAMP;
+use crate::mixer::{Cycles, IDLE, RAMP};
 use crate::ring::{CAPACITY_FRAMES, CHANNELS, LastPush, Ring};
 use crate::sinks::SourceTiming;
+use crate::spec::Playback;
 
 pub const MAX_RENDER_FRAMES: usize = 4096;
 const MAX_RATIO_RELATIVE: f64 = 1.01;
@@ -27,7 +30,6 @@ const CONTROL_DAMPING: f64 = 1.0;
 /// Claude: a scheduled playout further off its schedule than this re-primes
 /// rather than resample its way back.
 const RESCHEDULE_SECONDS: f64 = 0.02;
-
 
 /// Claude: a route that plays each frame `delay` seconds after the source
 /// captured it, on a device that takes `latency` seconds from a render's
@@ -131,6 +133,11 @@ pub struct PlayoutHealth {
     glitch_span: AtomicU32,
     glitch_target: AtomicU32,
     lateness: AtomicU32,
+    /// Claude: whether the latest render played the ring rather than silence.
+    playing: AtomicBool,
+    /// Claude: how long after its latest render an output that still runs
+    /// renders again: `IDLE` past the longest render at its rate.
+    freshness: Duration,
 }
 
 pub struct HealthReport {
@@ -165,12 +172,24 @@ impl PlayoutHealth {
         }
     }
 
+    /// Claude: whether the output plays the route as of its latest render,
+    /// which `cycles` counts.
+    pub fn playback(&self, cycles: &Cycles) -> Playback {
+        if !cycles.running(self.freshness) {
+            Playback::Stopped
+        } else if self.playing.load(Ordering::Relaxed) {
+            Playback::Playing
+        } else {
+            Playback::Silent
+        }
+    }
+
     pub fn log(
         &self,
         route_id: u32,
         ring: &Ring,
         scheduled: bool,
-        reported_glitches: &mut [u32; 4],
+        reported_glitches: &mut [u32; 5],
     ) {
         let report = self.report();
         let glitches = [
@@ -178,6 +197,7 @@ impl PlayoutHealth {
             report.reprimes,
             report.resyncs,
             ring.overflows(),
+            ring.discontinuities(),
         ];
         let to_ms = |frames: f64| frames * 1000.0 / self.source_rate;
         tracing::debug!(
@@ -187,12 +207,12 @@ impl PlayoutHealth {
             target_ms = to_ms(report.target_frames as f64),
             delivery_ms = to_ms(report.delivery_frames),
             correction_ppm = report.correction_ppm,
-            late_ms = scheduled
-                .then(|| to_ms(f64::from(report.lateness_frames))),
+            late_ms = scheduled.then(|| to_ms(f64::from(report.lateness_frames))),
             underruns = glitches[0],
             reprimes = glitches[1],
             resyncs = glitches[2],
             overflows = glitches[3],
+            discontinuities = glitches[4],
             "route playout health"
         );
         if glitches != *reported_glitches {
@@ -202,6 +222,7 @@ impl PlayoutHealth {
                 reprimes = glitches[1] - reported_glitches[1],
                 resyncs = glitches[2] - reported_glitches[2],
                 overflows = glitches[3] - reported_glitches[3],
+                discontinuities = glitches[4] - reported_glitches[4],
                 glitch_delivery_ms = to_ms(report.glitch_span_frames as f64),
                 glitch_target_ms = to_ms(report.glitch_target_frames as f64),
                 "route playout glitched since the last report"
@@ -278,6 +299,8 @@ impl Playout {
                 glitch_span: AtomicU32::new(0),
                 glitch_target: AtomicU32::new(0),
                 lateness: AtomicU32::new(0),
+                playing: AtomicBool::new(false),
+                freshness: IDLE + Duration::from_secs_f64(MAX_RENDER_FRAMES as f64 / device_rate),
             }),
         };
         if let Some(schedule) = schedule {
@@ -285,7 +308,9 @@ impl Playout {
             if schedule.delay - schedule.latency > limit {
                 return Err(format!(
                     "delay exceeds the {:.0} ms held-audio limit at {:.0} Hz plus {:.0} ms output latency",
-                    (limit * 1000.0).floor(), source_rate, schedule.latency * 1000.0,
+                    (limit * 1000.0).floor(),
+                    source_rate,
+                    schedule.latency * 1000.0,
                 ));
             }
         }
@@ -314,12 +339,18 @@ impl Playout {
                 / self.health.source_rate
     }
 
+    #[cfg(target_os = "macos")]
     pub fn device_rate(&self) -> f64 {
         self.device_rate
     }
 
     pub fn delay_frames(&self) -> usize {
         self.resampler.output_delay()
+    }
+
+    /// Claude: the output refused a render and played the route silence.
+    pub fn refused(&self) {
+        self.health.playing.store(false, Ordering::Relaxed);
     }
 
     /// Claude: whether the latest render played the ring rather than priming silence.
@@ -338,13 +369,21 @@ impl Playout {
                 && self.resampler.set_chunk_size(frames).is_err())
         {
             silence(out);
+            self.health.playing.store(false, Ordering::Relaxed);
             return;
         }
+        // Claude: what played before a discontinuity does not lead into what
+        // follows it, so the playout primes on the new run as on a new route.
+        if ring.take_discontinuity().is_some() && self.primed {
+            self.primed = false;
+            self.resampler.reset();
+        }
         if self.schedule.is_some() {
-            self.render_scheduled(ring, out, now, output);
+            self.render_scheduled(ring, out, output);
         } else {
             self.render_delivered(ring, out, now);
         }
+        self.health.playing.store(self.primed, Ordering::Relaxed);
     }
 
     fn render_delivered(&mut self, ring: &Ring, out: &mut [&mut [f32]; CHANNELS], now: u64) {
@@ -413,13 +452,7 @@ impl Playout {
     /// and starts the earliest one mid-render behind silence, so it plays on
     /// schedule to the frame. Primed, the controller trims the ratio against
     /// the lateness the way it trims a fill error.
-    fn render_scheduled(
-        &mut self,
-        ring: &Ring,
-        out: &mut [&mut [f32]; CHANNELS],
-        now: u64,
-        output: u64,
-    ) {
+    fn render_scheduled(&mut self, ring: &Ring, out: &mut [&mut [f32]; CHANNELS], output: u64) {
         let frames = out[0].len();
         let need = self.resampler.input_frames_next();
         let schedule = self.schedule.as_ref().expect("a scheduled playout");
@@ -427,7 +460,7 @@ impl Playout {
             + schedule.latency
             + self.resampler.output_delay() as f64 * schedule.ticks_per_device_frame;
         let lateness = ring
-            .tail_captured(schedule.ticks_per_source_frame, now)
+            .tail_captured(schedule.ticks_per_source_frame)
             .map(|captured| {
                 (heard - captured as f64 - schedule.delay) / schedule.ticks_per_source_frame
             });
@@ -521,8 +554,7 @@ impl Playout {
     /// Unlike the raw fill this holds steady through pushes that land late.
     fn estimated_fill(&self, last: &LastPush, now: u64, span: f64) -> f64 {
         // Claude: a push that lands after `now` was read is stamped later than it.
-        let ticks = ((now as u32).wrapping_sub(last.at) as i32).max(0);
-        let since_push = f64::from(ticks) * self.source_frames_per_tick;
+        let since_push = now.saturating_sub(last.at) as f64 * self.source_frames_per_tick;
         last.buffered as f64 + since_push.min(span)
     }
 
@@ -553,6 +585,7 @@ fn silence(out: &mut [&mut [f32]; CHANNELS]) {
 mod tests {
     use super::*;
     use crate::delivery::DeliveryMeter;
+    use crate::ring::Captured;
 
     const TONE_HZ: f64 = 440.0;
     const TICKS_PER_SECOND: f64 = 24_000_000.0;
@@ -780,7 +813,7 @@ mod tests {
                 delivery: source.span(),
             };
             Self {
-                ring: Ring::new(),
+                ring: Ring::new(source_rate),
                 playout: Playout::new(&timing, device_rate, TICKS_PER_SECOND, None).unwrap(),
                 source,
                 source_rate,
@@ -920,9 +953,11 @@ mod tests {
         fn push(&mut self, push: Push) {
             let rate = self.source_rate;
             let stamp = self.source.publish(&push, rate);
-            let captured = self
-                .dated
-                .then(|| (push.media as f64 / rate * TICKS_PER_SECOND) as u64);
+            let captured = if self.dated {
+                Captured::Estimated((push.media as f64 / rate * TICKS_PER_SECOND) as u64)
+            } else {
+                Captured::Unknown
+            };
             self.ring.push_with(
                 push.frames,
                 (stamp * TICKS_PER_SECOND) as u64,
@@ -1419,9 +1454,9 @@ mod tests {
             delivery: Arc::new(DeliverySpan::new(4800.0)),
         };
         let mut playout = Playout::new(&timing, 48000.0, TICKS_PER_SECOND, None).unwrap();
-        let ring = Ring::new();
+        let ring = Ring::new(48000.0);
         let now = (10.0 * TICKS_PER_SECOND) as u64;
-        ring.push_with(960, now + 1, None, |_, _| 0.25);
+        ring.push_with(960, now + 1, Captured::Unknown, |_, _| 0.25);
         let (mut left, mut right) = (vec![0.0; RENDER_FRAMES], vec![0.0; RENDER_FRAMES]);
         playout.render(&ring, &mut [&mut left, &mut right], now, now);
         assert!(
@@ -1497,9 +1532,15 @@ mod tests {
             let playout = Playout::new(&timing, 44100.0, TICKS_PER_SECOND, None).unwrap();
             let limit = playout.max_held_seconds();
             assert!(limit >= 2.5, "{rate} Hz: only {limit} s held");
-            let schedule = Schedule { delay: limit + 1.0 / rate, latency: 0.0 };
+            let schedule = Schedule {
+                delay: limit + 1.0 / rate,
+                latency: 0.0,
+            };
             assert!(Playout::new(&timing, 44100.0, TICKS_PER_SECOND, Some(schedule)).is_err());
-            let schedule = Schedule { delay: 2.5, latency: 0.0 };
+            let schedule = Schedule {
+                delay: 2.5,
+                latency: 0.0,
+            };
             assert!(Playout::new(&timing, 44100.0, TICKS_PER_SECOND, Some(schedule)).is_ok());
         }
     }
@@ -1514,7 +1555,10 @@ mod tests {
         let limit = Playout::new(&timing, 44100.0, TICKS_PER_SECOND, None)
             .unwrap()
             .max_held_seconds();
-        let schedule = Schedule { delay: limit, latency: 0.0 };
+        let schedule = Schedule {
+            delay: limit,
+            latency: 0.0,
+        };
         let burst = (rate / 2.0) as usize;
         let bursts = on_time(rate, burst, limit + 4.0);
         let mut sim = Sim::scheduled(rate, 44100.0, 0.0, schedule, bursts, 0.0);
@@ -1527,20 +1571,33 @@ mod tests {
     fn future_output_and_local_output_play_at_the_same_capture_plus_delay() {
         for rate in [48000.0, 96000.0] {
             for ahead in [0.0, 2.0] {
-                let schedule = Schedule { delay: 2.5, latency: 0.0 };
+                let schedule = Schedule {
+                    delay: 2.5,
+                    latency: 0.0,
+                };
                 let mut sim = Sim::scheduled(
-                    rate, 44100.0, 0.0, schedule,
-                    on_time(rate, (rate * 0.02) as usize, 20.0), 0.0013,
+                    rate,
+                    44100.0,
+                    0.0,
+                    schedule,
+                    on_time(rate, (rate * 0.02) as usize, 20.0),
+                    0.0013,
                 );
                 sim.render_ahead = ahead;
                 sim.run(10.0);
                 assert_eq!(sim.glitches(), [0; 3], "{rate} Hz, {ahead} s ahead");
                 let error = sim.schedule_error(schedule, 2.0);
-                assert!(error.abs() < 50e-6, "{rate} Hz, {ahead} s ahead: {error} s off");
+                assert!(
+                    error.abs() < 50e-6,
+                    "{rate} Hz, {ahead} s ahead: {error} s off"
+                );
                 let first = sim.first_sound();
                 let output = sim.render_times[first / RENDER_FRAMES]
                     + (first % RENDER_FRAMES) as f64 / 44100.0;
-                assert!((output - schedule.delay).abs() < 0.005, "first sound at {output}");
+                assert!(
+                    (output - schedule.delay).abs() < 0.005,
+                    "first sound at {output}"
+                );
             }
         }
     }
@@ -1577,6 +1634,47 @@ mod tests {
         samples[at..at + frames]
             .iter()
             .fold(0.0f32, |peak, sample| peak.max(sample.abs()))
+    }
+
+    /// Claude: frames captured at T and read once the clock has turned half
+    /// or a whole 32-bit tick count further are long past their time.
+    #[test]
+    fn a_frame_read_long_after_its_capture_is_late_however_far_the_clock_turned() {
+        let timing = SourceTiming {
+            sample_rate: 48000.0,
+            delivery: Arc::new(DeliverySpan::new(0.0)),
+        };
+        let schedule = Schedule {
+            delay: 0.1,
+            latency: 0.0,
+        };
+        let captured = (100.0 * TICKS_PER_SECOND) as u64;
+        for (later, plays) in [
+            (0.1 * TICKS_PER_SECOND, true),
+            ((1u64 << 31) as f64, false),
+            ((1u64 << 32) as f64, false),
+        ] {
+            let mut playout =
+                Playout::new(&timing, 48000.0, TICKS_PER_SECOND, Some(schedule)).unwrap();
+            let ring = Ring::new(48000.0);
+            for block in 0..10 {
+                let at = captured + (block as f64 * 0.01 * TICKS_PER_SECOND) as u64;
+                ring.push_with(480, at, Captured::Estimated(at), |_, _| 0.5);
+            }
+            let now = captured + later as u64;
+            let (mut left, mut right) = (vec![0.0; 480], vec![0.0; 480]);
+            let mut peak = 0.0f32;
+            for render in 0..8 {
+                let at = now + (render as f64 * 0.01 * TICKS_PER_SECOND) as u64;
+                playout.render(&ring, &mut [&mut left, &mut right], at, at);
+                peak = left.iter().fold(peak, |peak, s| peak.max(s.abs()));
+            }
+            assert_eq!(
+                peak > 0.0,
+                plays,
+                "read {later} ticks after capture: peak {peak}"
+            );
+        }
     }
 
     #[test]

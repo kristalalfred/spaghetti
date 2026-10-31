@@ -2,10 +2,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
-use coreaudio_sys::{AudioGetCurrentHostTime, AudioGetHostClockFrequency};
 use spaghetti_common::ipc_protocol::{FlowState, FlowStatus};
 
 use crate::flow::{FlowMeter, Link};
+use crate::host_time;
 use crate::mixer::{Cycles, Fader};
 use crate::playout::{Playout, PlayoutHealth, Schedule};
 use crate::ring::{CHANNELS, Ring};
@@ -17,7 +17,7 @@ pub struct AirPlayOutput {
     health: Arc<PlayoutHealth>,
     meter: Arc<FlowMeter>,
     cycles: Arc<Cycles>,
-    reported_glitches: [u32; 4],
+    reported_glitches: [u32; 5],
     reported_state: Option<FlowState>,
 }
 
@@ -27,7 +27,7 @@ impl AirPlayOutput {
         let playout = Playout::new(
             source,
             f64::from(airplay::SAMPLE_RATE),
-            unsafe { AudioGetHostClockFrequency() },
+            host_time::ticks_per_second(),
             Some(Schedule {
                 delay,
                 latency: 0.0,
@@ -64,13 +64,13 @@ impl AirPlayOutput {
             meter: Arc::clone(&meter),
             cycles: Arc::clone(&cycles),
         };
-        let frequency = unsafe { AudioGetHostClockFrequency() };
+        let frequency = host_time::ticks_per_second();
         let receiver_name = receiver.to_string();
         let stream = airplay::Stream::start(browser, receiver, move |mut render| {
             let before = Instant::now();
-            let now = unsafe { AudioGetCurrentHostTime() };
+            let now = host_time::now();
             let after = Instant::now();
-            // Codex: these clocks share macOS monotonic time. The midpoint bounds
+            // Codex: these clocks share the host's monotonic time. The midpoint bounds
             // sampling error by half the bracket, plus one rounded host tick.
             let anchor = before + after.duration_since(before) / 2;
             let output = host_ticks(render.play_at, anchor, now, frequency);
@@ -82,7 +82,7 @@ impl AirPlayOutput {
             health,
             meter,
             cycles,
-            reported_glitches: [0; 4],
+            reported_glitches: [0; 5],
             reported_state: None,
         }
     }
@@ -195,6 +195,7 @@ mod tests {
     use super::*;
     use crate::delivery::DeliverySpan;
     use crate::mixer::IDLE;
+    use crate::ring::Captured;
     use std::time::Duration;
 
     #[test]
@@ -227,10 +228,10 @@ mod tests {
         assert_eq!(status().state, FlowState::Connected);
         assert_eq!(status().bytes, 0);
         assert_eq!(status().packets_retransmitted, 7);
-        let now = unsafe { AudioGetCurrentHostTime() };
+        let now = host_time::now();
         meter.record(8, now);
         assert_eq!(status().state, FlowState::Flowing);
-        let age = (4.0 * unsafe { AudioGetHostClockFrequency() }) as u64;
+        let age = (4.0 * host_time::ticks_per_second()) as u64;
         meter.record(8, now - age);
         assert_eq!(status().state, FlowState::Stalled);
         for (transport, expected) in [
@@ -253,15 +254,15 @@ mod tests {
         };
         let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let mut renderer = Renderer {
-            ring: Arc::new(Ring::new()),
+            ring: Arc::new(Ring::new(timing.sample_rate)),
             playout: AirPlayOutput::playout(&timing, 2500).unwrap(),
             volume: Arc::clone(&volume),
             fader: Fader::new(1.0, 44100.0),
             meter: Arc::new(FlowMeter::new()),
             cycles: Arc::new(Cycles::new()),
         };
-        let frequency = unsafe { AudioGetHostClockFrequency() };
-        let start = unsafe { AudioGetCurrentHostTime() };
+        let frequency = host_time::ticks_per_second();
+        let start = host_time::now();
         let (mut left, mut right) = ([1.0; 352], [1.0; 352]);
         renderer.render(
             &mut [&mut left, &mut right],
@@ -274,7 +275,7 @@ mod tests {
         let captured = start - (0.5 * frequency) as u64;
         renderer
             .ring
-            .push_with(44100, start, Some(captured), |_, _| 0.5);
+            .push_with(44100, start, Captured::Measured(captured), |_, _| 0.5);
         for i in 0..30 {
             let now = start + (i as f64 * 352.0 / 44100.0 * frequency) as u64;
             if i == 15 {
@@ -292,5 +293,60 @@ mod tests {
         }
         assert!(renderer.meter.bytes() > 0);
         assert!(left.iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn a_new_run_discards_old_audio_and_waits_for_its_own_capture_time() {
+        let rate = f64::from(airplay::SAMPLE_RATE);
+        let timing = SourceTiming {
+            sample_rate: rate,
+            delivery: Arc::new(DeliverySpan::new(352.0)),
+        };
+        let ring = Arc::new(Ring::new(rate));
+        let mut renderer = Renderer {
+            ring: Arc::clone(&ring),
+            playout: AirPlayOutput::playout(&timing, 2500).unwrap(),
+            volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            fader: Fader::new(1.0, rate),
+            meter: Arc::new(FlowMeter::new()),
+            cycles: Arc::new(Cycles::new()),
+        };
+        let start = host_time::now();
+        let ticks = |seconds: f64| (seconds * host_time::ticks_per_second()) as u64;
+        let (mut left, mut right) = ([0.0; 352], [0.0; 352]);
+        assert!(ring.push_with(
+            rate as usize,
+            start,
+            Captured::Measured(start - ticks(0.5)),
+            |_, _| 0.5,
+        ));
+        for i in 0..16 {
+            let now = start + ticks(i as f64 * 352.0 / rate);
+            renderer.render(&mut [&mut left, &mut right], now, now + ticks(2.0));
+        }
+        assert!(left.iter().all(|s| (*s - 0.5).abs() < 0.01));
+        let bytes = renderer.meter.bytes();
+        ring.discontinuity();
+        assert!(ring.push_with(
+            rate as usize,
+            start + ticks(0.25),
+            Captured::Measured(start + ticks(0.5)),
+            |_, _| -0.25,
+        ));
+        renderer.render(
+            &mut [&mut left, &mut right],
+            start + ticks(0.25),
+            start + ticks(2.25),
+        );
+        assert!(left.iter().chain(right.iter()).all(|s| *s == 0.0));
+        assert_eq!(renderer.meter.bytes(), bytes);
+        assert_eq!(ring.discontinuities(), 1);
+        for i in 0..16 {
+            let now = start + ticks(1.0 + i as f64 * 352.0 / rate);
+            renderer.render(&mut [&mut left, &mut right], now, now + ticks(2.0));
+        }
+        assert_eq!(left, right);
+        assert!(left.iter().all(|s| (*s + 0.25).abs() < 0.01));
+        assert!(renderer.meter.bytes() > bytes);
     }
 }

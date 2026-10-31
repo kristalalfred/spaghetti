@@ -99,6 +99,15 @@ impl DeliveryMeter {
         (gap > SMALLEST_GAP && gap <= self.seconds).then_some(end..start)
     }
 
+    /// Claude: whether a push starting at `start` breaks from the latest one:
+    /// media missing that `gap_before` does not fill, or media going back.
+    pub fn breaks_before(&self, start: f64) -> bool {
+        let Some(latest) = &self.latest else {
+            return false;
+        };
+        (start - latest.end).abs() > SMALLEST_GAP && self.gap_before(start).is_none()
+    }
+
     /// Claude: a push of the media `media` covers, in seconds, that arrived at
     /// `arrival` seconds. Its first frame is the one that waited longest. Returns
     /// when it would have arrived at the fastest transit; a ring push stamped with

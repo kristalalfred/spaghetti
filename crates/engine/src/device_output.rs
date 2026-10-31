@@ -7,10 +7,12 @@ use spaghetti_common::ipc_protocol::FlowStatus;
 use crate::abl;
 use crate::audio;
 use crate::flow::{FlowMeter, Link};
+use crate::host_time;
 use crate::mixer::{Cycles, Fader};
 use crate::playout::{Playout, PlayoutHealth, Schedule};
 use crate::ring::{CHANNELS, Ring};
 use crate::sinks::SourceTiming;
+use crate::spec::Playback;
 
 /// Claude: a route's output to a Core Audio device. The device pulls through the
 /// render callback, and `Playout` resamples the route's ring to the device rate.
@@ -20,7 +22,7 @@ pub struct DeviceOutput {
     health: Arc<PlayoutHealth>,
     meter: Arc<FlowMeter>,
     cycles: Arc<Cycles>,
-    reported_glitches: [u32; 4],
+    reported_glitches: [u32; 5],
     scheduled: bool,
 }
 
@@ -46,10 +48,10 @@ impl DeviceOutput {
 
         let dst_asbd = route_format(device_format.mSampleRate);
         tracing::info!(
-            sample_rate        = dst_asbd.mSampleRate,
+            sample_rate = dst_asbd.mSampleRate,
             channels_per_frame = dst_asbd.mChannelsPerFrame,
-            format_flags       = dst_asbd.mFormatFlags,
-            bytes_per_frame    = dst_asbd.mBytesPerFrame,
+            format_flags = dst_asbd.mFormatFlags,
+            bytes_per_frame = dst_asbd.mBytesPerFrame,
             "dst_asbd (output unit client format)"
         );
         unsafe { unit.set_client_format(&dst_asbd) }?;
@@ -68,7 +70,7 @@ impl DeviceOutput {
         let playout = Playout::new(
             &source,
             dst_asbd.mSampleRate,
-            unsafe { AudioGetHostClockFrequency() },
+            host_time::ticks_per_second(),
             schedule,
         )?;
         let health = playout.health();
@@ -99,7 +101,7 @@ impl DeviceOutput {
             health,
             meter,
             cycles,
-            reported_glitches: [0; 4],
+            reported_glitches: [0; 5],
             scheduled: schedule.is_some(),
         })
     }
@@ -122,13 +124,13 @@ impl DeviceOutput {
         &self.cycles
     }
 
+    pub fn playback(&self) -> Playback {
+        self.health.playback(&self.cycles)
+    }
+
     pub fn log_health(&mut self, route_id: u32, ring: &Ring) {
-        self.health.log(
-            route_id,
-            ring,
-            self.scheduled,
-            &mut self.reported_glitches,
-        );
+        self.health
+            .log(route_id, ring, self.scheduled, &mut self.reported_glitches);
     }
 }
 
@@ -213,7 +215,10 @@ impl OutputUnit {
             return Err(format!("get output device format failed: {status}"));
         }
         if format.mSampleRate <= 0.0 {
-            return Err(format!("output device reports sample rate {}", format.mSampleRate));
+            return Err(format!(
+                "output device reports sample rate {}",
+                format.mSampleRate
+            ));
         }
         Ok(format)
     }
@@ -326,7 +331,7 @@ unsafe extern "C" fn route_render_callback(
         return 0;
     }
 
-    let now = unsafe { AudioGetCurrentHostTime() };
+    let now = host_time::now();
     let state = unsafe { &mut *(in_ref_con as *mut OutputCallbackState) };
     let buffers = unsafe { abl::buffers_mut(io_data) };
     let n_buffers = buffers.len();
@@ -335,7 +340,13 @@ unsafe extern "C" fn route_render_callback(
     let Some(mut out) = output_planes(buffers, in_number_frames as usize) else {
         for buffer in unsafe { abl::buffers_mut(io_data) } {
             if !buffer.mData.is_null() {
-                unsafe { std::ptr::write_bytes(buffer.mData.cast::<u8>(), 0, buffer.mDataByteSize as usize) };
+                unsafe {
+                    std::ptr::write_bytes(
+                        buffer.mData.cast::<u8>(),
+                        0,
+                        buffer.mDataByteSize as usize,
+                    )
+                };
             }
         }
         return 0;

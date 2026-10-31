@@ -3,13 +3,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
-use coreaudio_sys::{AudioGetCurrentHostTime, AudioGetHostClockFrequency};
 use spaghetti_common::ipc_protocol::{FlowStatus, WebRtcPeer};
 
 use crate::clock::SenderClock;
 use crate::codec::{Codec, DECODED_RATE, Decoder, OPUS_DELAY_FRAMES, StreamFormat};
 use crate::delivery::{DeliveryMeter, DeliverySpan};
-use crate::ring::{CHANNELS, Ring};
+use crate::host_time;
+use crate::ring::{CHANNELS, Captured, Ring};
 use crate::sinks::{MAX_SINKS, Sinks, SourceTiming};
 use crate::webrtc::{IncomingPacket, Media, PeerLink, REORDER_TIMEOUT};
 
@@ -116,8 +116,7 @@ impl Drop for WebRtcSource {
 /// RTP time order with gaps where some never arrived; each missing 20 ms is
 /// concealed so the rings stay continuous, and a packet at or behind the last
 /// one decoded or concealed is dropped. Concealment bridges gaps the routes'
-/// jitter buffers outlast; after a longer one they have re-primed and would
-/// only discard it. Each 20 ms lands as a push of its own, so a concealed gap
+/// jitter buffers outlast; a longer one is a discontinuity in the rings. Each 20 ms lands as a push of its own, so a concealed gap
 /// reads as the late delivery it is, not as one long push. A packet's frames
 /// end where its RTP span ends, since the decoder drops part of the pre-skip
 /// from the first one. Once the sender's clock is known, each push carries
@@ -131,7 +130,7 @@ fn decode(
     concealed: &AtomicU64,
     stop: &AtomicBool,
 ) {
-    let ticks_per_second = unsafe { AudioGetHostClockFrequency() };
+    let ticks_per_second = host_time::ticks_per_second();
     let rate = f64::from(DECODED_RATE);
     let mut pcm = Vec::new();
     let mut last: Option<u64> = None;
@@ -155,13 +154,16 @@ fn decode(
         for _ in 0..bridged {
             conceal(&mut decoder, &mut pcm);
         }
+        if bridged < missing {
+            unsafe { sinks.for_each(|ring| ring.discontinuity()) };
+        }
         concealed.fetch_add(bridged, Ordering::Relaxed);
         if let Err(e) = decoder.decode(&packet.data, &mut pcm) {
             tracing::debug!(error = e, "concealed an undecodable Opus packet");
             conceal(&mut decoder, &mut pcm);
         }
         last = Some(packet.rtp_time);
-        let arrival = unsafe { AudioGetCurrentHostTime() } as f64 / ticks_per_second;
+        let arrival = host_time::now() as f64 / ticks_per_second;
         let decoded = (pcm.len() / CHANNELS) as u64;
         let first = (packet.rtp_time + PACKET_FRAMES).wrapping_sub(decoded);
         for (slot, slot_pcm) in pcm.chunks(PACKET_FRAMES as usize * CHANNELS).enumerate() {
@@ -170,8 +172,9 @@ fn decode(
             let start = rtp_time as f64 / rate;
             let due = meter.record(start..start + frames as f64 / rate, arrival);
             let stamp = (due * ticks_per_second) as u64;
-            let captured =
-                clock.captured(rtp_time.wrapping_sub(u64::from(OPUS_DELAY_FRAMES)), rate);
+            let captured = clock
+                .captured(rtp_time.wrapping_sub(u64::from(OPUS_DELAY_FRAMES)), rate)
+                .map_or(Captured::Unknown, Captured::Estimated);
             unsafe {
                 sinks.for_each(|ring| {
                     ring.push_with(frames, stamp, captured, |f, ch| slot_pcm[f * CHANNELS + ch]);

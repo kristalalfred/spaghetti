@@ -2,22 +2,24 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use spaghetti_common::ipc_protocol::{
-    AirPlayReceiverInfo, AirPlaySupport, Destination, FlowState, FlowStatus, PeerRef, RouteInfo,
-    SourceInfo, SourceSpec,
+    AirPlayReceiverInfo, AirPlaySupport, FlowState, FlowStatus, PeerRef,
 };
 
 use crate::airplay_sender::AirPlayOutput;
 use crate::audio;
 use crate::bus::DeviceBus;
 use crate::device_output::DeviceOutput;
-#[cfg(test)]
-use crate::fixture::FixtureSource;
 use crate::flow::{FlowMeter, Link};
 use crate::mixer::{Cycles, FADE_LIMIT, IDLE};
+use crate::program_io::{
+    InputShared, OutputShared, ProgramInput, ProgramOutput, ProgramRoute, ProgramSource,
+};
 use crate::ring::Ring;
 use crate::sinks::SourceTiming;
+use crate::spec::{Destination, Playback, RouteInfo, SourceInfo, SourceSpec};
 use crate::srt_receiver::SrtSource;
 use crate::srt_sender::SrtOutput;
 use crate::tap::TapSource;
@@ -29,16 +31,20 @@ enum Source {
     Tap(TapSource),
     Srt(SrtSource),
     WebRtc(WebRtcSource),
-    #[cfg(test)]
-    Fixture(FixtureSource),
+    Program(ProgramSource),
 }
 
 impl Source {
-    fn open(source_id: u32, spec: &SourceSpec) -> Result<Self, String> {
+    fn open(source_id: u32, spec: &SourceSpec, programs: &Programs) -> Result<Self, String> {
         match spec {
-            SourceSpec::Tap { pids, mode } => TapSource::create(source_id, pids, *mode).map(Self::Tap),
+            SourceSpec::Tap { pids, mode } => {
+                TapSource::create(source_id, pids, *mode).map(Self::Tap)
+            }
             SourceSpec::Srt(socket) => SrtSource::open(socket).map(Self::Srt),
             SourceSpec::WebRtc(peer) => WebRtcSource::open(peer).map(Self::WebRtc),
+            SourceSpec::Program { input } => programs
+                .input(input)
+                .map(|shared| Self::Program(ProgramSource::open(shared))),
         }
     }
 
@@ -47,8 +53,7 @@ impl Source {
             Self::Tap(tap) => tap.timing(),
             Self::Srt(srt) => Ok(srt.timing()),
             Self::WebRtc(webrtc) => Ok(webrtc.timing()),
-            #[cfg(test)]
-            Self::Fixture(fixture) => Ok(fixture.timing()),
+            Self::Program(program) => Ok(program.timing()),
         }
     }
 
@@ -57,8 +62,7 @@ impl Source {
             Self::Tap(tap) => tap.add_sink(ring),
             Self::Srt(srt) => srt.add_sink(ring),
             Self::WebRtc(webrtc) => webrtc.add_sink(ring),
-            #[cfg(test)]
-            Self::Fixture(fixture) => fixture.add_sink(ring),
+            Self::Program(program) => program.add_sink(ring),
         }
     }
 
@@ -67,8 +71,7 @@ impl Source {
             Self::Tap(tap) => tap.remove_sink(slot),
             Self::Srt(srt) => srt.remove_sink(slot),
             Self::WebRtc(webrtc) => webrtc.remove_sink(slot),
-            #[cfg(test)]
-            Self::Fixture(fixture) => fixture.remove_sink(slot),
+            Self::Program(program) => program.remove_sink(slot),
         }
     }
 
@@ -77,8 +80,7 @@ impl Source {
             Self::Tap(tap) => &tap.label,
             Self::Srt(srt) => &srt.label,
             Self::WebRtc(webrtc) => &webrtc.label,
-            #[cfg(test)]
-            Self::Fixture(_) => "fixture",
+            Self::Program(program) => &program.label,
         }
     }
 
@@ -87,8 +89,7 @@ impl Source {
             Self::Tap(tap) => tap.status(),
             Self::Srt(srt) => srt.status(),
             Self::WebRtc(webrtc) => webrtc.status(),
-            #[cfg(test)]
-            Self::Fixture(fixture) => fixture.status(),
+            Self::Program(program) => program.status(),
         }
     }
 
@@ -105,13 +106,14 @@ enum Output {
     AirPlay(AirPlayOutput),
     Srt(SrtOutput),
     WebRtc(WebRtcOutput),
+    Program(ProgramRoute),
 }
 
 impl Output {
     fn start(&self) -> Result<(), String> {
         match self {
             Self::Device(device) => device.start(),
-            Self::AirPlay(_) | Self::Srt(_) | Self::WebRtc(_) => Ok(()),
+            Self::AirPlay(_) | Self::Srt(_) | Self::WebRtc(_) | Self::Program(_) => Ok(()),
         }
     }
 
@@ -121,6 +123,7 @@ impl Output {
             Self::AirPlay(airplay) => airplay.status(),
             Self::Srt(srt) => srt.status(),
             Self::WebRtc(webrtc) => webrtc.status(),
+            Self::Program(program) => program.status(),
         }
     }
 
@@ -130,6 +133,7 @@ impl Output {
             Self::AirPlay(airplay) => airplay.log_health(route_id, ring),
             Self::Srt(srt) => srt.log_health(route_id, ring),
             Self::WebRtc(webrtc) => webrtc.log_health(route_id, ring),
+            Self::Program(program) => program.log_health(route_id, ring),
         }
     }
 
@@ -144,6 +148,16 @@ impl Output {
         match self {
             Self::Device(device) => Some(device.cycles()).filter(|cycles| cycles.running(IDLE)),
             Self::AirPlay(airplay) => airplay.is_playing().then(|| airplay.cycles()),
+            Self::Program(program) => Some(program.cycles()).filter(|cycles| cycles.running(IDLE)),
+            Self::Srt(_) | Self::WebRtc(_) => None,
+        }
+    }
+
+    fn playback(&self) -> Option<Playback> {
+        match self {
+            Self::Device(device) => Some(device.playback()),
+            Self::Program(program) => Some(program.playback()),
+            Self::AirPlay(_) => None,
             Self::Srt(_) | Self::WebRtc(_) => None,
         }
     }
@@ -202,6 +216,39 @@ impl Path {
             Self::Bus { cycles, .. } => Some(cycles.as_ref()).filter(|cycles| cycles.running(IDLE)),
         }
     }
+
+    /// Claude: a bus mixes its taps in the cycle they capture, so it plays a
+    /// route whenever it runs.
+    fn playback(&self) -> Option<Playback> {
+        match self {
+            Self::Ring { output, .. } => output.playback(),
+            Self::Bus { cycles, .. } if cycles.running(IDLE) => Some(Playback::Playing),
+            Self::Bus { .. } => Some(Playback::Stopped),
+        }
+    }
+}
+
+/// Claude: the inputs and outputs the embedding program registered, by name.
+#[derive(Default)]
+struct Programs {
+    inputs: HashMap<String, Arc<InputShared>>,
+    outputs: HashMap<String, Arc<OutputShared>>,
+}
+
+impl Programs {
+    fn input(&self, name: &str) -> Result<Arc<InputShared>, String> {
+        self.inputs
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("no program input '{name}'"))
+    }
+
+    fn output(&self, name: &str) -> Result<Arc<OutputShared>, String> {
+        self.outputs
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("no program output '{name}'"))
+    }
 }
 
 /// Claude: the routing graph. Sources feed routes through their sinks, and a
@@ -213,6 +260,7 @@ pub struct Router {
     sources: HashMap<u32, SourceEntry>,
     buses: HashMap<String, DeviceBus>,
     finishing: Vec<airplay::Finishing>,
+    programs: Programs,
     next_source_id: u32,
     next_route_id: u32,
 }
@@ -224,6 +272,7 @@ impl Router {
             sources: HashMap::new(),
             buses: HashMap::new(),
             finishing: Vec::new(),
+            programs: Programs::default(),
             next_source_id: 1,
             next_route_id: 1,
         }
@@ -231,9 +280,14 @@ impl Router {
 
     pub fn create_source(&mut self, spec: SourceSpec, tag: Option<String>) -> Result<u32, String> {
         let id = self.next_source_id;
-        let source = Source::open(id, &spec)?;
+        let source = Source::open(id, &spec, &self.programs)?;
         self.next_source_id += 1;
-        tracing::info!(source_id = id, label = source.label(), ?tag, "created source");
+        tracing::info!(
+            source_id = id,
+            label = source.label(),
+            ?tag,
+            "created source"
+        );
         self.sources.insert(id, SourceEntry { spec, tag, source });
         Ok(id)
     }
@@ -271,7 +325,11 @@ impl Router {
         let SourceSpec::Tap { pids, mode } = &entry.spec else {
             unreachable!("matched as a tap above");
         };
-        for route in self.routes.values().filter(|route| route.source_id == source_id) {
+        for route in self
+            .routes
+            .values()
+            .filter(|route| route.source_id == source_id)
+        {
             if let (Path::Bus { slot, .. }, Destination::Device { uid, .. }) =
                 (&route.path, &route.destination)
                 && let Some(bus) = self.buses.get(uid)
@@ -375,8 +433,8 @@ impl Router {
             }
             _ => {
                 let source = &mut entry.source;
-                let ring = Arc::new(Ring::new());
                 let timing = source.timing()?;
+                let ring = Arc::new(Ring::new(timing.sample_rate));
                 let output = match &mut destination {
                     Destination::Device { uid, delay_ms } => {
                         let device = audio::find_device_by_uid(uid)
@@ -411,6 +469,16 @@ impl Router {
                             Arc::clone(&ring),
                             Arc::clone(&volume),
                         ))
+                    }
+                    Destination::Program { output, delay_ms } => {
+                        let delay = delay_ms.map(|ms| f64::from(ms) / 1000.0);
+                        Output::Program(ProgramRoute::open(
+                            &self.programs.output(output)?,
+                            timing,
+                            Arc::clone(&ring),
+                            Arc::clone(&volume),
+                            delay,
+                        )?)
                     }
                     Destination::Srt(socket) => Output::Srt(SrtOutput::open(
                         socket,
@@ -534,6 +602,7 @@ impl Router {
                 destination: r.destination.clone(),
                 volume: f32::from_bits(r.volume.load(Ordering::Relaxed)),
                 status: r.path.status(),
+                playback: r.path.playback(),
                 local_description: r.path.peer().and_then(PeerLink::local_description),
             })
             .collect()
@@ -544,8 +613,7 @@ impl Router {
     }
 
     pub fn log_health(&mut self) {
-        self.finishing
-            .retain(|finishing| !finishing.is_finished());
+        self.finishing.retain(|finishing| !finishing.is_finished());
         for (&route_id, route) in &mut self.routes {
             if let Path::Ring { ring, output, .. } = &mut route.path {
                 output.log_health(route_id, ring);
@@ -575,6 +643,83 @@ impl Router {
             .filter(|(_, r)| matches!(&r.destination, Destination::Device { uid, .. } if uid == device_uid))
             .map(|(&id, _)| id)
             .collect()
+    }
+
+    /// Claude: registers audio the program captures itself at `sample_rate`,
+    /// which `SourceSpec::Program` names from now on. The program pushes it
+    /// through the returned input, from its capture callback.
+    pub fn add_program_input(
+        &mut self,
+        name: &str,
+        sample_rate: f64,
+    ) -> Result<ProgramInput, String> {
+        let Entry::Vacant(vacant) = self.programs.inputs.entry(name.to_string()) else {
+            return Err(format!("program input '{name}' already exists"));
+        };
+        let shared = InputShared::new(name, sample_rate)?;
+        vacant.insert(Arc::clone(&shared));
+        tracing::info!(name, sample_rate, "added program input");
+        Ok(ProgramInput::new(shared))
+    }
+
+    /// Claude: registers an output the program plays itself at `sample_rate`,
+    /// which `Destination::Program` names from now on. The program renders it
+    /// through the returned output, from its playback callback. `latency` is
+    /// the least time from a render to its first frame being heard, which
+    /// bounds the delays its routes can hold.
+    pub fn add_program_output(
+        &mut self,
+        name: &str,
+        sample_rate: f64,
+        latency: Duration,
+    ) -> Result<ProgramOutput, String> {
+        let Entry::Vacant(vacant) = self.programs.outputs.entry(name.to_string()) else {
+            return Err(format!("program output '{name}' already exists"));
+        };
+        let shared = OutputShared::new(sample_rate, latency)?;
+        vacant.insert(Arc::clone(&shared));
+        tracing::info!(name, sample_rate, ?latency, "added program output");
+        Ok(ProgramOutput::new(shared))
+    }
+
+    /// Claude: destroys the sources made from the input, then forgets it. Its
+    /// real-time end keeps working and feeds nothing.
+    pub fn remove_program_input(&mut self, name: &str) -> Result<(), String> {
+        if !self.programs.inputs.contains_key(name) {
+            return Err(format!("no program input '{name}'"));
+        }
+        let sources: Vec<u32> = self
+            .sources
+            .iter()
+            .filter(
+                |(_, entry)| matches!(&entry.spec, SourceSpec::Program { input } if input == name),
+            )
+            .map(|(&id, _)| id)
+            .collect();
+        for source_id in sources {
+            self.destroy_source(source_id)?;
+        }
+        self.programs.inputs.remove(name);
+        Ok(())
+    }
+
+    /// Claude: destroys the routes to the output, fading out those it plays,
+    /// then forgets it. Its real-time end keeps rendering silence.
+    pub fn remove_program_output(&mut self, name: &str) -> Result<(), String> {
+        if !self.programs.outputs.contains_key(name) {
+            return Err(format!("no program output '{name}'"));
+        }
+        let routes: Vec<u32> = self
+            .routes
+            .iter()
+            .filter(|(_, route)| matches!(&route.destination, Destination::Program { output, .. } if output == name))
+            .map(|(&id, _)| id)
+            .collect();
+        for route_id in routes {
+            self.destroy_route(route_id)?;
+        }
+        self.programs.outputs.remove(name);
+        Ok(())
     }
 }
 
@@ -606,12 +751,14 @@ fn airplay_browser() -> &'static airplay::Browser {
 
 fn validate_schedule_source(source: &SourceSpec, destination: &Destination) -> Result<(), String> {
     let scheduled = match destination {
-        Destination::Device { delay_ms, .. } => delay_ms.is_some(),
+        Destination::Device { delay_ms, .. } | Destination::Program { delay_ms, .. } => {
+            delay_ms.is_some()
+        }
         Destination::AirPlay { .. } => true,
         Destination::Srt(_) | Destination::WebRtc(_) => false,
     };
     let dated = match source {
-        SourceSpec::Tap { .. } | SourceSpec::WebRtc(_) => true,
+        SourceSpec::Tap { .. } | SourceSpec::WebRtc(_) | SourceSpec::Program { .. } => true,
         SourceSpec::Srt(_) => false,
     };
     if scheduled && !dated {
@@ -658,35 +805,18 @@ impl Default for Router {
 
 #[cfg(test)]
 impl Router {
-    /// Claude: a source the test feeds through the returned sinks. No spec
-    /// describes it, so it is stored as a tap of no processes.
-    pub fn create_fixture_source(&mut self, sample_rate: f64) -> (u32, Arc<crate::sinks::Sinks>) {
-        let id = self.next_source_id;
-        self.next_source_id += 1;
-        let fixture = FixtureSource::new(sample_rate);
-        let sinks = fixture.sinks();
-        let spec = SourceSpec::Tap {
-            pids: Vec::new(),
-            mode: spaghetti_common::ipc_protocol::TapMode::Mirror,
-        };
-        self.sources.insert(
-            id,
-            SourceEntry {
-                spec,
-                tag: None,
-                source: Source::Fixture(fixture),
-            },
-        );
-        (id, sinks)
-    }
-
     /// Claude: a ring the source feeds, which the test reads the way a route's
     /// output would, with the timing such an output is built for.
-    pub fn attach_fixture_sink(&mut self, source_id: u32) -> (Arc<Ring>, SourceTiming) {
-        let source = &mut self.sources.get_mut(&source_id).expect("the source exists").source;
-        let ring = Arc::new(Ring::new());
+    pub fn attach_raw_sink(&mut self, source_id: u32) -> (Arc<Ring>, SourceTiming) {
+        let source = &mut self
+            .sources
+            .get_mut(&source_id)
+            .expect("the source exists")
+            .source;
+        let timing = source.timing().expect("the source has timing");
+        let ring = Arc::new(Ring::new(timing.sample_rate));
         source.add_sink(Arc::clone(&ring)).expect("a free sink");
-        (ring, source.timing().expect("a fixture has timing"))
+        (ring, timing)
     }
 
     pub fn route_ring(&self, route_id: u32) -> Arc<Ring> {
@@ -723,6 +853,10 @@ mod tests {
                 uid: "Speakers".into(),
                 delay_ms: Some(2500),
             },
+            Destination::Program {
+                output: "playback".into(),
+                delay_ms: Some(2500),
+            },
         ] {
             assert!(
                 validate_schedule_source(&source, &destination)
@@ -734,6 +868,10 @@ mod tests {
                 mode: TapMode::Mirror,
             };
             assert!(validate_schedule_source(&tap, &destination).is_ok());
+            let program = SourceSpec::Program {
+                input: "capture".into(),
+            };
+            assert!(validate_schedule_source(&program, &destination).is_ok());
         }
         assert!(
             validate_schedule_source(
@@ -764,7 +902,15 @@ mod tests {
     fn airplay_delay_rejections_happen_before_any_discovery_or_session() {
         for rate in [48000.0, 96000.0] {
             let mut router = Router::new();
-            let (source, _) = router.create_fixture_source(rate);
+            let _input = router.add_program_input("capture", rate).unwrap();
+            let source = router
+                .create_source(
+                    SourceSpec::Program {
+                        input: "capture".into(),
+                    },
+                    None,
+                )
+                .unwrap();
             for delay in [0, 1999, 2000, 2050] {
                 let error = router
                     .create_route(source, airplay("C4:38:75:04:5E:80", delay), 1.0)
