@@ -332,15 +332,18 @@ impl Playout {
     }
 
     pub fn minimum_delay(&self, render_ahead: f64) -> f64 {
-        let latency_frames = self.schedule.as_ref().map_or(0.0, |schedule| {
-            schedule.latency * self.source_frames_per_tick
-        });
         render_ahead
-            + (latency_frames
-                + self.delivery.frames()
+            + self.output_latency()
+            + (self.delivery.frames()
                 + self.resampler.input_frames_max() as f64
                 + self.margin_frames as f64)
                 / self.health.source_rate
+    }
+
+    pub fn output_latency(&self) -> f64 {
+        self.schedule.as_ref().map_or(0.0, |schedule| {
+            schedule.latency * self.source_frames_per_tick / self.health.source_rate
+        })
     }
 
     #[cfg(target_os = "macos")]

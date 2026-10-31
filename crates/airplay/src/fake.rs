@@ -1129,7 +1129,7 @@ pub(crate) mod tests {
             Stream::start_with(&browser, fake.id(), Ok(settings()), renders.renderer(None));
         assert_eq!(stream.status(), Status::Connecting);
         assert!(wait_until(Duration::from_secs(2), || fake.audio().len() >= 10));
-        stream.finish().wait();
+        stream.finish(Duration::ZERO).wait();
 
         assert_eq!(
             fake.methods(),
@@ -1377,6 +1377,78 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn finishing_with_playout_delay_preserves_the_tail() {
+        check_finish_playout_delay(Protocol::AirPlay1);
+    }
+
+    pub(crate) fn check_finish_playout_delay(protocol: Protocol) {
+        for delay in [Duration::ZERO, Duration::from_millis(200)] {
+            let fake = Fake::start(Behavior::default());
+            let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+            fake.advertise_airplay(&browser, AIRPLAY_2_RECORD);
+            let renders = Renders::default();
+            let settings = Settings {
+                protocol: Some(protocol),
+                answer_timeout: Duration::from_secs(3),
+                teardown_timeout: Duration::from_millis(100),
+                ..settings()
+            };
+            let bound = settings.latency + settings.teardown_timeout + delay;
+            let stream =
+                Stream::start_with(&browser, fake.id(), Ok(settings), renders.renderer(None));
+            assert!(wait_until(Duration::from_secs(10), || fake.audio().len() >= 40));
+            let finished_at = Instant::now();
+            let finishing = stream.finish(delay);
+            thread::sleep(if delay.is_zero() {
+                Duration::from_millis(100)
+            } else {
+                LATENCY + Duration::from_millis(50)
+            });
+            let audio = fake.audio();
+            let last = &audio.last().unwrap().1;
+            let packet_end = renders.play_at(call_of(last)) + PACKET_DURATION;
+            let played_out = packet_end + delay;
+            let bytes = fake.audio_bytes().last().unwrap().clone();
+            let requested_at = Instant::now();
+            if !delay.is_zero() {
+                assert!(requested_at >= packet_end);
+                assert!(requested_at < played_out);
+            }
+            fake.request_retransmission(last.seq, 1);
+            finishing.wait();
+            let returned_at = Instant::now();
+            let expected_teardowns = if protocol == Protocol::AirPlay2 { 2 } else { 1 };
+            assert!(wait_until(Duration::from_secs(1), || {
+                fake.methods().iter().filter(|m| *m == "TEARDOWN").count() == expected_teardowns
+            }));
+            let teardowns: Vec<_> = fake
+                .requests()
+                .into_iter()
+                .filter(|(_, _, r)| r.method == "TEARDOWN")
+                .map(|(at, _, _)| at)
+                .collect();
+            assert!(
+                teardowns[0] >= played_out,
+                "{protocol:?}, {delay:?}: TEARDOWN came {:?} early",
+                played_out.saturating_duration_since(teardowns[0])
+            );
+            assert!(teardowns.last().unwrap().duration_since(played_out) < PROMPT);
+            assert!(
+                returned_at >= played_out,
+                "{protocol:?}, {delay:?}: wait returned {:?} early",
+                played_out.saturating_duration_since(returned_at)
+            );
+            assert!(returned_at.duration_since(finished_at) <= bound + PROMPT);
+            assert!(
+                fake.control()
+                    .iter()
+                    .any(|b| b[1] == 0xD6 && b[4..] == bytes),
+                "{protocol:?}, {delay:?}: the tail retransmission was not byte-identical"
+            );
+        }
+    }
+
+    #[test]
     fn finishing_plays_out_answers_retransmissions_then_tears_down() {
         let fake = Fake::start(Behavior::default());
         let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
@@ -1384,7 +1456,7 @@ pub(crate) mod tests {
         let stream =
             Stream::start_with(&browser, fake.id(), Ok(settings()), renders.renderer(None));
         assert!(wait_until(Duration::from_secs(2), || fake.audio().len() >= 40));
-        let finishing = stream.finish();
+        let finishing = stream.finish(Duration::ZERO);
         let finished_at = Instant::now();
         assert!(!finishing.is_finished());
         let early = fake.audio_bytes()[5].clone();
@@ -1445,7 +1517,7 @@ pub(crate) mod tests {
         });
         assert!(wait_until(Duration::from_secs(2), || failing.load(Ordering::Acquire)));
         thread::sleep(Duration::from_millis(100));
-        let finishing = stream.finish();
+        let finishing = stream.finish(Duration::ZERO);
         thread::sleep(Duration::from_millis(20));
         failing.store(false, Ordering::Release);
         let received = fake.audio();
@@ -1499,7 +1571,7 @@ pub(crate) mod tests {
         );
         assert!(wait_until(Duration::from_secs(2), || fake.audio().len() >= 20));
         let started = Instant::now();
-        stream.finish().wait();
+        stream.finish(Duration::ZERO).wait();
         let waited = started.elapsed();
         assert!(
             waited <= LATENCY + settings().teardown_timeout + Duration::from_millis(150),
@@ -1618,7 +1690,7 @@ pub(crate) mod tests {
         let (waited, wait_returned) = mpsc::channel();
         let finishing = thread::spawn(move || {
             let started = Instant::now();
-            stream.finish().wait();
+            stream.finish(Duration::ZERO).wait();
             let _ = waited.send(started.elapsed());
         });
         let elapsed = wait_returned.recv_timeout(bound + PROMPT);
@@ -1721,7 +1793,7 @@ pub(crate) mod tests {
                 .iter()
                 .all(|(_, connection, _)| *connection == 0)
         );
-        first.finish().wait();
+        first.finish(Duration::ZERO).wait();
         assert!(wait_until(Duration::from_secs(2), || streaming(&second)));
 
         let requests = fake.requests();
@@ -1830,7 +1902,7 @@ pub(crate) mod tests {
         );
         thread::sleep(Duration::from_millis(50));
         let started = Instant::now();
-        stream.finish().wait();
+        stream.finish(Duration::ZERO).wait();
         assert!(
             started.elapsed() < PROMPT,
             "lookup cancelled after {:?}",
@@ -1873,7 +1945,7 @@ pub(crate) mod tests {
             .methods()
             .contains(&"ANNOUNCE".to_owned())));
         let started = Instant::now();
-        stream.finish().wait();
+        stream.finish(Duration::ZERO).wait();
         assert!(
             started.elapsed() < PROMPT,
             "handshake cancelled after {:?}",
@@ -1914,7 +1986,7 @@ pub(crate) mod tests {
         );
         thread::sleep(Duration::from_millis(50));
         let started = Instant::now();
-        waiting.finish().wait();
+        waiting.finish(Duration::ZERO).wait();
         assert!(
             started.elapsed() < PROMPT,
             "turn wait cancelled after {:?}",
@@ -1928,7 +2000,7 @@ pub(crate) mod tests {
         );
         thread::sleep(Duration::from_millis(50));
         drop(dropped);
-        first.finish().wait();
+        first.finish(Duration::ZERO).wait();
         thread::sleep(Duration::from_millis(200));
         assert!(
             fake.requests()
@@ -1954,7 +2026,7 @@ pub(crate) mod tests {
         thread::sleep(Duration::from_millis(300));
         assert_eq!(stream.status(), Status::Connecting);
         let started = Instant::now();
-        stream.finish().wait();
+        stream.finish(Duration::ZERO).wait();
         assert!(
             started.elapsed() < PROMPT,
             "retries cancelled after {:?}",
@@ -2196,7 +2268,7 @@ pub(crate) mod tests {
         thread::sleep(Duration::from_millis(100));
         assert_eq!(queued.status(), Status::Connecting);
         fake.advertise(&browser, &with_a_pin());
-        first.finish().wait();
+        first.finish(Duration::ZERO).wait();
         assert!(wait_until(Duration::from_secs(2), || queued.status()
             != Status::Connecting));
         assert_eq!(queued.status(), Status::Unreachable(REQUIRES_A_PIN.into()));
@@ -2223,7 +2295,7 @@ pub(crate) mod tests {
         );
         thread::sleep(Duration::from_millis(100));
         fake.withdraw(&browser, 1);
-        first.finish().wait();
+        first.finish(Duration::ZERO).wait();
         assert!(
             wait_until(Duration::from_secs(2), || streaming(&queued)),
             "a receiver gone from browsing is still tried as it was found: {:?}",
@@ -2253,7 +2325,7 @@ pub(crate) mod tests {
         );
         thread::sleep(Duration::from_millis(100));
         fake.withdraw(&browser, 1);
-        first.finish().wait();
+        first.finish(Duration::ZERO).wait();
         assert!(
             wait_until(Duration::from_secs(2), || streaming(&queued)),
             "a service gone from browsing is still tried as it was found: {:?}",

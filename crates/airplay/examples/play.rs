@@ -263,7 +263,7 @@ fn play(browser: &Browser, id: ReceiverId, options: Options) -> Result<(), Strin
             counters.packets_sent, counters.packets_retransmitted, counters.bytes_sent
         );
     }
-    stream.finish().wait();
+    stream.finish(Duration::ZERO).wait();
     eprintln!("done");
     Ok(())
 }

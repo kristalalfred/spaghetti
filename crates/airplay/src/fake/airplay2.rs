@@ -64,7 +64,7 @@ fn a_stream_pairs_sets_up_records_and_plays_audio_the_receiver_opens() {
     assert_eq!(reply[..4], [0x80, 0xD3, 0x00, 0x07]);
     let received = clock.instant(Ntp::from_be_bytes(reply[16..24].try_into().unwrap()));
     assert!(before <= received + Duration::from_micros(1) && received <= after);
-    stream.finish().wait();
+    stream.finish(Duration::ZERO).wait();
     assert!(wait_until(Duration::from_secs(1), || torn_down(&fake)));
 
     let requests: Vec<FakeRequest> = fake.requests().into_iter().map(|(_, _, r)| r).collect();
@@ -310,6 +310,11 @@ fn a_feedback_answered_with_an_error_still_keeps_the_session() {
 }
 
 #[test]
+fn finishing_with_playout_delay_preserves_the_tail() {
+    super::tests::check_finish_playout_delay(Protocol::AirPlay2);
+}
+
+#[test]
 fn finishing_plays_out_then_tears_the_stream_and_the_session_down() {
     let fake = Fake::start(Behavior::default());
     let browser = browser(&fake, false);
@@ -317,7 +322,7 @@ fn finishing_plays_out_then_tears_the_stream_and_the_session_down() {
     let stream = Stream::start_with(&browser, fake.id(), Ok(airplay_2()), renders.renderer(None));
     assert!(wait_until(HANDSHAKE, || fake.audio().len() >= 40));
     let finished_at = Instant::now();
-    stream.finish().wait();
+    stream.finish(Duration::ZERO).wait();
     let waited = finished_at.elapsed();
     assert!(wait_until(Duration::from_secs(1), || torn_down(&fake)));
     let audio = fake.audio();
@@ -429,7 +434,7 @@ fn finishing_or_dropping_at_each_handshake_step_is_prompt() {
         );
         assert!(wait_until(HANDSHAKE, || reached(0)), "{step:?}");
         let started = Instant::now();
-        stream.finish().wait();
+        stream.finish(Duration::ZERO).wait();
         assert!(
             started.elapsed() < PROMPT,
             "{step:?}: finish took {:?}",
@@ -738,7 +743,7 @@ fn an_airplay_service_resolved_while_a_stream_waits_its_turn_is_taken() {
     thread::sleep(automatic().lookup_window + Duration::from_millis(200));
     assert_eq!(next.status(), Status::Connecting);
     airplay.advertise_airplay(&browser, AIRPLAY_2_RECORD);
-    first.finish().wait();
+    first.finish(Duration::ZERO).wait();
     assert!(
         wait_until(HANDSHAKE, || streaming(&next)),
         "{:?}",
@@ -851,7 +856,7 @@ fn the_debug_log_of_a_whole_session_holds_no_key_or_pairing_value() {
     assert!(wait_until(HANDSHAKE, || fake.audio().len() >= 10));
     fake.send_event();
     assert!(wait_until(HANDSHAKE, || fake.event_answers().len() >= 3));
-    stream.finish().wait();
+    stream.finish(Duration::ZERO).wait();
 
     let text = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
     assert!(text.contains("SETUP"), "the session was logged");

@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -86,6 +86,7 @@ impl Stream {
             status: Mutex::new(Status::Connecting),
             command: AtomicU8::new(Command::Play as u8),
             clock: Clock::start(),
+            playout_delay: OnceLock::new(),
             finish_bound: settings
                 .as_ref()
                 .map_or(Duration::ZERO, |s| s.latency + s.teardown_timeout),
@@ -118,15 +119,16 @@ impl Stream {
             .clone()
     }
 
-    /// Claude: stops rendering and returns at once. The session keeps answering
-    /// the receiver until the end of the last packet it sent has played, then
-    /// tears down, within a bounded time.
-    pub fn finish(mut self) -> Finishing {
+    /// Codex: stops rendering and returns at once. The session keeps answering
+    /// the receiver through the last packet's end plus `playout_delay`, for a
+    /// receiver that sounds frames later than `Render::play_at`, then tears down.
+    pub fn finish(mut self, playout_delay: Duration) -> Finishing {
+        self.shared.playout_delay.set(playout_delay).unwrap();
         self.shared
             .command
             .store(Command::Finish as u8, Ordering::Release);
         Finishing {
-            deadline: Instant::now() + self.shared.finish_bound,
+            deadline: Instant::now() + self.shared.finish_bound + playout_delay,
             shared: self.shared.clone(),
             thread: self.thread.take(),
         }
@@ -161,9 +163,9 @@ impl Finishing {
         self.thread.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
-    /// Claude: blocks until the session has torn down, at most `LATENCY` plus
-    /// the teardown timeout from `finish`. A session still running then, held
-    /// up by its renderer, keeps the receiver taken until it ends.
+    /// Codex: blocks until the session has torn down, at most `LATENCY` plus
+    /// `playout_delay` and the teardown timeout from `finish`. A session still
+    /// running then, held up by its renderer, keeps the receiver taken until it ends.
     pub fn wait(mut self) {
         let Some(thread) = self.thread.take() else {
             return;
@@ -186,6 +188,7 @@ struct Shared {
     status: Mutex<Status>,
     command: AtomicU8,
     clock: Clock,
+    playout_delay: OnceLock<Duration>,
     finish_bound: Duration,
     ended: Mutex<bool>,
     ending: Condvar,
@@ -655,7 +658,8 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
                     let Some(last) = self.backlog.latest() else {
                         return End::Finished;
                     };
-                    let end = self.timeline.play_at(last + 1);
+                    let end =
+                        self.timeline.play_at(last + 1) + *self.shared.playout_delay.get().unwrap();
                     if Instant::now() >= end {
                         return End::Finished;
                     }
