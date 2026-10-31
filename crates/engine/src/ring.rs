@@ -531,6 +531,25 @@ impl Ring {
         frames
     }
 
+    /// Claude: consumer only. Drops the frames at the tail whose pushes carried
+    /// no capture time, up to the first dated frame of its run or all the run
+    /// holds, and returns how many. A push's date never changes, so a consumer
+    /// that plays only dated frames never plays these.
+    pub fn discard_undated(&self) -> usize {
+        let published = self.view();
+        let (start, readable) = self.readable(&published);
+        let end = start.wrapping_add(readable as u64);
+        let mut tail = start;
+        while let Some(push) = self.current(&published)
+            && push.captured == NO_TIME
+            && ahead(end, tail) > 0
+        {
+            tail = push.start.wrapping_add(push.len);
+            self.tail.store(tail, Ordering::Release);
+        }
+        ahead(tail, start) as usize
+    }
+
     /// Claude: consumer only.
     pub fn discard(&self, frames: usize) -> usize {
         let published = self.view();
@@ -621,6 +640,36 @@ mod tests {
         assert_eq!(dst[0], (4 * CHANNELS) as f32);
         assert_eq!(ring.discard(100), 5);
         assert_eq!(ring.available(), 0);
+    }
+
+    #[test]
+    fn discards_the_undated_frames_at_the_tail_up_to_the_first_dated_one() {
+        let ring = Ring::new(RATE);
+        assert!(push_counting(&ring, 0, 100));
+        assert!(push_counting(&ring, 100, 50));
+        assert!(push_measured(&ring, 1.0, 80, 0.5));
+        assert!(push_counting(&ring, 230, 30));
+        assert_eq!(
+            ring.discard_undated(),
+            0,
+            "discarded from a run it did not take"
+        );
+        assert!(ring.take_discontinuity().is_some());
+        assert_eq!(ring.discard(10), 10);
+        assert_eq!(ring.discard_undated(), 140);
+        assert_eq!(tail_seconds(&ring), Some(1.0));
+        assert_eq!(ring.discard_undated(), 0, "discarded dated frames");
+        assert_eq!(ring.discard(79), 79);
+        assert_eq!(ring.discard_undated(), 0, "discarded the last dated frame");
+        assert_eq!(front(&ring), 0.5);
+        assert_eq!(ring.discard_undated(), 30);
+        assert_eq!(ring.available(), 0);
+        assert!(push_counting(&ring, 260, 20));
+        ring.discontinuity();
+        assert!(push_counting(&ring, 280, 20));
+        assert_eq!(ring.discard_undated(), 20, "discarded past the run it took");
+        assert!(ring.take_discontinuity().is_some());
+        assert_eq!(ring.discard_undated(), 20);
     }
 
     #[test]

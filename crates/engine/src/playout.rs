@@ -436,13 +436,17 @@ impl Playout {
     }
 
     /// Claude: plays the frame at the ring's tail when the device makes it heard
-    /// `delay` after its capture. Unprimed, it drops the frames already too late
-    /// and starts the earliest one mid-render behind silence, so it plays on
-    /// schedule to the frame. Primed, the controller trims the ratio against
-    /// the lateness the way it trims a fill error.
+    /// `delay` after its capture. Unprimed, it drops the frames it cannot play,
+    /// undated or already too late, and starts the earliest one mid-render
+    /// behind silence, so it plays on schedule to the frame. Primed, the
+    /// controller trims the ratio against the lateness the way it trims a fill
+    /// error.
     fn render_scheduled(&mut self, ring: &Ring, out: &mut [&mut [f32]; CHANNELS], output: u64) {
         let frames = out[0].len();
         let need = self.resampler.input_frames_next();
+        if !self.primed {
+            ring.discard_undated();
+        }
         let schedule = self.schedule.as_ref().expect("a scheduled playout");
         let heard = output as f64
             + schedule.latency
@@ -756,8 +760,10 @@ mod tests {
         render_times: Vec<f64>,
         render_period: f64,
         worst_correction_ppm: f32,
-        /// Claude: whether pushes carry their media time as their capture time.
-        dated: bool,
+        /// Claude: the media frame from which on pushes carry their media time
+        /// as their capture time, as a WebRTC source dates its frames once it
+        /// knows its sender's clock.
+        dated_from: Option<usize>,
     }
 
     impl Sim {
@@ -811,7 +817,7 @@ mod tests {
                 render_times: Vec::new(),
                 render_period: RENDER_FRAMES as f64 / (device_rate * (1.0 + device_ppm * 1e-6)),
                 worst_correction_ppm: 0.0,
-                dated: false,
+                dated_from: None,
             }
         }
 
@@ -838,7 +844,7 @@ mod tests {
             };
             sim.playout =
                 Playout::new(&timing, device_rate, TICKS_PER_SECOND, Some(schedule)).unwrap();
-            sim.dated = true;
+            sim.dated_from = Some(0);
             sim.next_render = start;
             sim
         }
@@ -934,10 +940,11 @@ mod tests {
         fn push(&mut self, push: Push) {
             let rate = self.source_rate;
             let stamp = self.source.publish(&push, rate);
-            let captured = if self.dated {
-                Captured::Estimated((push.media as f64 / rate * TICKS_PER_SECOND) as u64)
-            } else {
-                Captured::Unknown
+            let captured = match self.dated_from {
+                Some(first) if push.media >= first => {
+                    Captured::Estimated((push.media as f64 / rate * TICKS_PER_SECOND) as u64)
+                }
+                _ => Captured::Unknown,
             };
             self.ring.push_with(
                 push.frames,
@@ -952,6 +959,14 @@ mod tests {
 
         fn first_sound(&self) -> usize {
             self.rendered.iter().position(|s| s.abs() > 1e-3).unwrap()
+        }
+
+        /// Claude: when the first sound the device output was heard, in seconds.
+        fn first_heard(&self, latency: f64) -> Option<f64> {
+            let sound = self.rendered.iter().position(|s| s.abs() > 1e-3)?;
+            let frame = self.render_period / RENDER_FRAMES as f64;
+            let output = self.render_times[sound / RENDER_FRAMES];
+            Some(output + (sound % RENDER_FRAMES) as f64 * frame + latency)
         }
     }
 
@@ -1530,6 +1545,95 @@ mod tests {
         let error = sim.schedule_error(SCHEDULE, 2.0);
         assert!(error.abs() < 20e-6, "{} µs off", error * 1e6);
     }
+
+    /// Claude: a WebRTC source passes its first frames on undated, until it
+    /// knows its sender's clock. A route on a schedule can never play them, so
+    /// it plays the first dated frame on time, also after more undated frames
+    /// than its ring holds.
+    #[test]
+    fn plays_the_first_dated_frame_on_schedule_after_undated_ones() {
+        let longer_than_the_ring = (CAPACITY_FRAMES as f64 / 48000.0).ceil() + 1.0;
+        for undated in [0.2, longer_than_the_ring] {
+            let pushes = on_time(48000.0, 960, 100.0);
+            let mut sim = Sim::scheduled(48000.0, 48000.0, 0.0, SCHEDULE, pushes, 0.0013);
+            sim.dated_from = Some((undated * 48000.0) as usize);
+            sim.run(undated + 3.0);
+            let due = undated + SCHEDULE.delay;
+            let heard = sim.first_heard(SCHEDULE.latency);
+            assert!(
+                heard.is_some_and(|heard| (heard - due).abs() < 0.001),
+                "{undated} s undated: first heard at {heard:?} s, due at {due} s, \
+                 gaps, resyncs and overflows {:?}",
+                sim.glitches()
+            );
+            let error = sim.schedule_error(SCHEDULE, 2.0);
+            assert!(
+                error.abs() < 50e-6,
+                "{undated} s undated: {} µs off",
+                error * 1e6
+            );
+            assert_eq!(sim.glitches(), [0; 3], "{undated} s undated");
+        }
+    }
+
+    /// Claude: renders 480 frames, the first heard at `heard` seconds, and
+    /// returns the left channel.
+    fn render_heard(playout: &mut Playout, ring: &Ring, heard: f64) -> Vec<f32> {
+        let to_output = playout.delay_frames() as f64 / 48000.0;
+        let output = ((heard - to_output) * TICKS_PER_SECOND) as u64;
+        let (mut left, mut right) = (vec![0.0; 480], vec![0.0; 480]);
+        playout.render(ring, &mut [&mut left, &mut right], output, output);
+        left
+    }
+
+    /// Claude: a playing route that meets an undated frame at its tail has
+    /// lost its place on its schedule. It goes silent and primes again, with
+    /// a fresh resampler and a fade-in, rather than skip the frame and splice
+    /// what follows onto what it played.
+    #[test]
+    fn a_playing_route_that_meets_an_undated_frame_primes_again_rather_than_skip_it() {
+        let timing = SourceTiming {
+            sample_rate: 48000.0,
+            delivery: Arc::new(DeliverySpan::new(0.0)),
+        };
+        let schedule = Schedule {
+            delay: 0.1,
+            latency: 0.0,
+        };
+        let mut playout = Playout::new(&timing, 48000.0, TICKS_PER_SECOND, Some(schedule)).unwrap();
+        let ring = Ring::new(48000.0);
+        let dated = |seconds: f64| Captured::Estimated((seconds * TICKS_PER_SECOND) as u64);
+        for block in 0..10 {
+            let captured = 100.0 + block as f64 * 0.01;
+            ring.push_with(480, 0, dated(captured), |_, _| 0.5);
+        }
+        for render in 0..4 {
+            render_heard(&mut playout, &ring, 100.1 + render as f64 * 0.01);
+        }
+        assert!(playout.is_playing());
+        ring.discard(ring.available());
+
+        let heard = 100.14;
+        ring.push_with(1, 0, Captured::Unknown, |_, _| 0.5);
+        let after = heard - schedule.delay + 1.0 / 48000.0;
+        ring.push_with(2048, 0, dated(after), |_, _| 0.5);
+        let played = render_heard(&mut playout, &ring, heard);
+        assert!(
+            played.iter().all(|sample| *sample == 0.0),
+            "played on: playing {}, {} frames left, {} resyncs",
+            playout.is_playing(),
+            ring.available(),
+            playout.health().report().resyncs
+        );
+        assert!(!playout.is_playing());
+        assert_eq!(ring.available(), 2049);
+        assert_eq!(playout.health().report().resyncs, 1);
+
+        let played = render_heard(&mut playout, &ring, heard + 0.01);
+        assert!(playout.is_playing());
+        assert!(played.iter().any(|sample| *sample != 0.0));
+    }
+
     /// Claude: the output's peak over `frames` frames from `at`.
     fn peak(samples: &[f32], at: usize, frames: usize) -> f32 {
         samples[at..at + frames]
