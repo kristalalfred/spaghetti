@@ -8,6 +8,9 @@ check:
     cargo clippy --workspace --all-targets
     cargo test --workspace
 
+airplay-interop:
+    ./scripts/airplay-interop.sh
+
 install:
     ./scripts/install.sh
 
