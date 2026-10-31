@@ -133,9 +133,10 @@ impl Receiver {
         Ok(raop)
     }
 
-    /// Claude: AirPlay 2 needs a receiver that takes AirPlay audio and pairs
-    /// transiently, as pyatv decides from the same feature bits, and whose
-    /// access control lets any sender pair.
+    /// Claude: AirPlay 2 needs a receiver that takes AirPlay audio, pairs
+    /// transiently and encrypts, as OwnTone decides from the same feature bit
+    /// since receivers that pair without encrypting failed it, and whose access
+    /// control lets any sender pair.
     fn airplay2_service(&self) -> Result<&Service, String> {
         let Some(airplay) = &self.airplay else {
             return Err("it does not offer AirPlay 2".into());
@@ -149,7 +150,7 @@ impl Receiver {
                 advertised()
             ));
         }
-        if features & (CORE_UTILS_PAIRING | SYSTEM_PAIRING) == 0 {
+        if features & CORE_UTILS_PAIRING_AND_ENCRYPTION == 0 {
             return Err(format!(
                 "it does not pair transiently over AirPlay 2 (features={})",
                 advertised()
@@ -184,8 +185,7 @@ impl std::fmt::Display for Protocol {
 }
 
 const AUDIO: u64 = 1 << 9;
-const SYSTEM_PAIRING: u64 = 1 << 43;
-const CORE_UTILS_PAIRING: u64 = 1 << 48;
+const CORE_UTILS_PAIRING_AND_ENCRYPTION: u64 = 1 << 48;
 const PIN_REQUIRED: u64 = 0x8;
 const PASSWORD_REQUIRED: u64 = 0x80;
 const PAIRING_REQUIRED: u64 = 0x200;
@@ -350,11 +350,11 @@ pub(crate) mod tests {
         };
         assert!(reason(&without(9)).contains("audio"));
         assert!(reason(&without(48)).contains("transiently"));
-        let system_pairing = "deviceid=C4:30:18:6E:41:2D features=0x200,0x800 flags=0x4";
+        let system_pairing_only = "deviceid=C4:30:18:6E:41:2D features=0x200,0x800 flags=0x4";
         assert!(
-            receiver(None, Some(system_pairing))
+            receiver(None, Some(system_pairing_only))
                 .service(Protocol::AirPlay2)
-                .is_ok()
+                .is_err()
         );
         assert!(reason(&CITATION_AIRPLAY.replace("acl=0", "acl=1")).contains("acl=1"));
         assert!(reason(&CITATION_AIRPLAY.replace("flags=0x4", "flags=0x8")).contains("PIN"));
