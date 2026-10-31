@@ -39,6 +39,12 @@ fn browser(fake: &Fake, raop: bool) -> Browser {
     browser
 }
 
+/// Claude: whether the fake has seen both TEARDOWNs, which may come after a
+/// bounded `Finishing::wait` returns on a loaded machine.
+fn torn_down(fake: &Fake) -> bool {
+    fake.methods().iter().filter(|m| *m == "TEARDOWN").count() == 2
+}
+
 fn uris(fake: &Fake) -> Vec<String> {
     fake.requests()
         .into_iter()
@@ -59,6 +65,7 @@ fn a_stream_pairs_sets_up_records_and_plays_audio_the_receiver_opens() {
     let received = clock.instant(Ntp::from_be_bytes(reply[16..24].try_into().unwrap()));
     assert!(before <= received + Duration::from_micros(1) && received <= after);
     stream.finish().wait();
+    assert!(wait_until(Duration::from_secs(1), || torn_down(&fake)));
 
     let requests: Vec<FakeRequest> = fake.requests().into_iter().map(|(_, _, r)| r).collect();
     assert_eq!(uris(&fake)[0], "GET /info");
@@ -312,6 +319,7 @@ fn finishing_plays_out_then_tears_the_stream_and_the_session_down() {
     let finished_at = Instant::now();
     stream.finish().wait();
     let waited = finished_at.elapsed();
+    assert!(wait_until(Duration::from_secs(1), || torn_down(&fake)));
     let audio = fake.audio();
     let last = audio.iter().max_by_key(|(at, _)| *at).unwrap();
     let played_out = renders.play_at(call_of(&last.1)) + PACKET_DURATION;
