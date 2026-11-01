@@ -481,7 +481,11 @@ impl Router {
                             Arc::clone(&volume),
                         ))
                     }
-                    Destination::Program { output, delay_ms } => {
+                    Destination::Program {
+                        output,
+                        delay_ms,
+                        latency_offset_ms,
+                    } => {
                         let delay = delay_ms.map(|ms| f64::from(ms) / 1000.0);
                         Output::Program(ProgramRoute::open(
                             &self.programs.output(output)?,
@@ -489,6 +493,7 @@ impl Router {
                             Arc::clone(&ring),
                             Arc::clone(&volume),
                             delay,
+                            *latency_offset_ms,
                         )?)
                     }
                     Destination::Srt(socket) => Output::Srt(SrtOutput::open(
@@ -761,18 +766,20 @@ fn airplay_browser() -> &'static airplay::Browser {
 }
 
 fn validate_schedule_source(source: &SourceSpec, destination: &Destination) -> Result<(), String> {
-    if matches!(
-        destination,
+    let scheduled = match destination {
         Destination::Device {
-            delay_ms: None,
-            latency_offset_ms: Some(_),
+            delay_ms,
+            latency_offset_ms,
             ..
         }
-    ) {
-        return Err("a latency offset requires a delay".into());
-    }
-    let scheduled = match destination {
-        Destination::Device { delay_ms, .. } | Destination::Program { delay_ms, .. } => {
+        | Destination::Program {
+            delay_ms,
+            latency_offset_ms,
+            ..
+        } => {
+            if delay_ms.is_none() && latency_offset_ms.is_some() {
+                return Err("a latency offset requires a delay".into());
+            }
             delay_ms.is_some()
         }
         Destination::AirPlay { .. } => true,
@@ -879,6 +886,7 @@ mod tests {
             Destination::Program {
                 output: "playback".into(),
                 delay_ms: Some(2500),
+                latency_offset_ms: None,
             },
         ] {
             assert!(
@@ -922,13 +930,21 @@ mod tests {
             )
             .unwrap();
         for offset in [-47, 0, 83] {
-            let destination = Destination::Device {
-                uid: "absent".into(),
-                delay_ms: None,
-                latency_offset_ms: Some(offset),
-            };
-            let error = router.create_route(source, destination, 1.0).unwrap_err();
-            assert!(error.contains("latency offset requires a delay"), "{error}");
+            for destination in [
+                Destination::Device {
+                    uid: "absent".into(),
+                    delay_ms: None,
+                    latency_offset_ms: Some(offset),
+                },
+                Destination::Program {
+                    output: "absent".into(),
+                    delay_ms: None,
+                    latency_offset_ms: Some(offset),
+                },
+            ] {
+                let error = router.create_route(source, destination, 1.0).unwrap_err();
+                assert!(error.contains("latency offset requires a delay"), "{error}");
+            }
         }
         assert_eq!(router.route_count(), 0);
     }

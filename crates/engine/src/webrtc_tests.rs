@@ -1388,6 +1388,7 @@ async fn a_delayed_route_made_as_the_link_comes_up_plays_once_frames_are_dated()
             Destination::Program {
                 output: "speaker".into(),
                 delay_ms: Some((delay * 1000.0) as u32),
+                latency_offset_ms: None,
             },
             1.0,
         )

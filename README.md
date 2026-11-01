@@ -87,7 +87,11 @@ fn example(captured: &[f32], left: &mut [f32], right: &mut [f32]) -> Result<(), 
     let mut speaker = router.add_program_output("speaker", 48_000.0, Duration::from_millis(10))?;
 
     let source = router.create_source(SourceSpec::Program { input: "microphone".into() }, None)?;
-    let speaker_route = Destination::Program { output: "speaker".into(), delay_ms: Some(300) };
+    let speaker_route = Destination::Program {
+        output: "speaker".into(),
+        delay_ms: Some(300),
+        latency_offset_ms: None,
+    };
     router.create_route(source, speaker_route, 1.0)?;
 
     // In the capture callback, dated by when the buffer's first frame was captured:
@@ -105,7 +109,7 @@ fn example(captured: &[f32], left: &mut [f32], right: &mut [f32]) -> Result<(), 
 | `ProgramOutput::render` | Real-time safe. Fills two planes at the output's rate with every route to the output, mixed and clamped to [-1, 1]. `heard` is the host time the first frame is heard, output latency included. |
 | Buffer size | At most `MAX_CALLBACK_FRAMES` (4096) frames per push or render. `Frames` refuses longer buffers, half-filled interleaved frames and planes of unequal length with a `BufferError`. `render` refuses unequal or longer planes and fills them with silence. |
 | Rates | Each input and output has its own rate. Every route resamples from its source's rate to its output's rate. |
-| Delay | With `delay_ms`, a route plays each frame that long after it was captured, as on a device. A delay is refused when the route would have to hold more audio than its 262144-frame buffer can hold beside the resampler's maximum input and 20 ms of scheduling slack: the delay less the output's declared latency, at the source's rate. SRT sources do not date their frames and cannot play on a delay. |
+| Delay | With `delay_ms`, a route plays each frame that long after it was captured, as on a device. `latency_offset_ms` corrects an output heard later (positive) or earlier (negative) than the `heard` it renders by, and requires a delay. A delay is refused when the route would have to hold more audio than its 262144-frame buffer can hold beside the resampler's maximum input and 20 ms of scheduling slack: the delay less the output's declared latency and the latency offset, at the source's rate. SRT sources do not date their frames and cannot play on a delay. |
 | Discontinuities | A push dated more than 1 ms off where the previous one ended, a push a route had no room for, and a push after `ProgramInput::discontinuity` each start a new run. A route drops what it still holds from before the new run and primes again. |
 | Several routes | One output mixes up to `MAX_PROGRAM_ROUTES` (8) routes. One input feeds up to 8 routes. |
 | Removal | `remove_program_input` destroys the sources made from the input. `remove_program_output` fades out and destroys the routes to the output. The real-time ends keep working: an input feeds nothing, an output renders silence. Drop them outside the real-time thread. |

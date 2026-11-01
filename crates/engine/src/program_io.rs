@@ -409,16 +409,19 @@ impl ProgramRoute {
     /// Claude: with a delay, each frame is heard that long after its capture.
     /// The program passes the time each render is heard, so the output's
     /// latency only bounds how long the route holds a frame before it renders.
+    /// A latency offset renders each frame that much earlier, for an output
+    /// heard later than the program says.
     pub(crate) fn open(
         output: &Arc<OutputShared>,
         source: SourceTiming,
         ring: Arc<Ring>,
         volume: Arc<AtomicU32>,
         delay: Option<f64>,
+        latency_offset_ms: Option<i32>,
     ) -> Result<Self, String> {
         let schedule = delay.map(|delay| Schedule {
             delay,
-            latency: output.latency,
+            latency: output.latency + f64::from(latency_offset_ms.unwrap_or(0)) / 1000.0,
         });
         let playout = Playout::new(
             &source,
@@ -517,9 +520,18 @@ mod tests {
     }
 
     fn to(output: &str, delay_ms: Option<u32>) -> Destination {
+        offset_to(output, delay_ms, None)
+    }
+
+    fn offset_to(
+        output: &str,
+        delay_ms: Option<u32>,
+        latency_offset_ms: Option<i32>,
+    ) -> Destination {
         Destination::Program {
             output: output.into(),
             delay_ms,
+            latency_offset_ms,
         }
     }
 
@@ -617,6 +629,38 @@ mod tests {
                 (heard - 0.3).abs() < 2.0 / RATE,
                 "{latency:?}: the click was heard at {heard} s, not 0.3 s"
             );
+        }
+    }
+
+    #[test]
+    fn a_latency_offset_makes_each_frame_heard_that_much_earlier() {
+        for latency in [Duration::ZERO, Duration::from_millis(50)] {
+            for offset_ms in [-47, 0, 83] {
+                let mut router = Router::new();
+                let mut input = router.add_program_input("mic", RATE).unwrap();
+                let mut output = router.add_program_output("speaker", RATE, latency).unwrap();
+                let source = program_source(&mut router, "mic");
+                router
+                    .create_route(
+                        source,
+                        offset_to("speaker", Some(200), Some(offset_ms)),
+                        1.0,
+                    )
+                    .unwrap();
+
+                let origin = HostTime::now();
+                let click = (0.2 * RATE) as usize;
+                push_mono(&mut input, origin, RATE, 0..(0.6 * RATE) as usize, |f| {
+                    if f == click { 1.0 } else { 0.0 }
+                });
+                let played = render(&mut output, at(origin, 0.05), 100);
+                let heard = heard_click(&played, RATE, 0.05);
+                let expected = 0.4 - f64::from(offset_ms) / 1000.0;
+                assert!(
+                    (heard - expected).abs() < 2.0 / RATE,
+                    "{latency:?}, {offset_ms} ms: the click was heard at {heard} s, not {expected} s"
+                );
+            }
         }
     }
 
@@ -1159,20 +1203,23 @@ mod tests {
             .unwrap();
         let mic = program_source(&mut router, "mic");
         let fast = program_source(&mut router, "fast");
-        for (source, output, delay_ms, fits) in [
-            (mic, "speaker", 2500, true),
-            (mic, "speaker", 5300, true),
-            (mic, "speaker", 5500, false),
-            (mic, "speaker", 10_000, false),
-            (mic, "late", 10_000, true),
-            (fast, "speaker", 1200, true),
-            (fast, "speaker", 1400, false),
+        for (source, output, delay_ms, offset_ms, fits) in [
+            (mic, "speaker", 2500, None, true),
+            (mic, "speaker", 5300, None, true),
+            (mic, "speaker", 5300, Some(-300), false),
+            (mic, "speaker", 5500, None, false),
+            (mic, "speaker", 5500, Some(300), true),
+            (mic, "speaker", 10_000, None, false),
+            (mic, "late", 10_000, None, true),
+            (fast, "speaker", 1200, None, true),
+            (fast, "speaker", 1400, None, false),
         ] {
-            let created = router.create_route(source, to(output, Some(delay_ms)), 1.0);
+            let created =
+                router.create_route(source, offset_to(output, Some(delay_ms), offset_ms), 1.0);
             assert_eq!(
                 created.is_ok(),
                 fits,
-                "{delay_ms} ms to {output}: {created:?}"
+                "{delay_ms} ms with a {offset_ms:?} ms offset to {output}: {created:?}"
             );
         }
     }

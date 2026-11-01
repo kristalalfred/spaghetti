@@ -39,10 +39,12 @@ pub enum Destination {
     WebRtc(WebRtcPeer),
     /// Claude: the program output registered under this name, mixed with the
     /// other routes to it. With `delay_ms`, each frame is heard that long
-    /// after its source captured it.
+    /// after its source captured it, by the `heard` times the program passes,
+    /// corrected by `latency_offset_ms` as a device's latency is.
     Program {
         output: String,
         delay_ms: Option<u32>,
+        latency_offset_ms: Option<i32>,
     },
 }
 
@@ -299,6 +301,7 @@ mod tests {
             destination: Destination::Program {
                 output: "speaker".into(),
                 delay_ms: None,
+                latency_offset_ms: None,
             },
             volume: 1.0,
             status: FlowStatus {
