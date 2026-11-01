@@ -448,6 +448,8 @@ fn a_destinations_lateness_and_travel_are_recovered() {
 /// Claude: in the room as `Setup::new` places it, with 300 ms delays, the
 /// output's second probe has sounded and the next starts 400 ms later.
 const BETWEEN_OUTPUT_PROBES: f64 = 8.15;
+/// Claude: the output's fourth probe is scheduled at 8.405 s and heard 11 ms later.
+const IN_THE_OUTPUTS_FOURTH_PROBE: f64 = 8.5;
 
 fn failure(setup: &Setup) -> CalibrationFailure {
     run(setup, |_, _| {}).result.unwrap_err()
@@ -601,6 +603,13 @@ fn a_clipped_or_corrupt_recording_fails() {
         (
             Fault::Clipped {
                 at: BETWEEN_OUTPUT_PROBES,
+                frames: 3,
+            },
+            RecordingFailure::Clipped,
+        ),
+        (
+            Fault::Clipped {
+                at: IN_THE_OUTPUTS_FOURTH_PROBE,
                 frames: 3,
             },
             RecordingFailure::Clipped,
