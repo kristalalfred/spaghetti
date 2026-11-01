@@ -11,22 +11,18 @@ use spaghetti_common::ipc_protocol::{
 use crate::airplay_sender::AirPlayOutput;
 use crate::audio;
 use crate::bus::DeviceBus;
-use crate::device_output::DeviceOutput;
 use crate::flow::{FlowMeter, Link};
 use crate::input::InputSource;
 use crate::mixer::{Cycles, FADE_LIMIT, IDLE};
-use crate::program_io::{
-    InputShared, OutputShared, ProgramInput, ProgramOutput, ProgramRoute, ProgramSource,
-};
+use crate::program_io::{InputShared, OutputShared, ProgramInput, ProgramOutput, ProgramSource};
 use crate::ring::Ring;
+use crate::route_output::{Output, Target};
 use crate::sinks::SourceTiming;
 use crate::spec::{Destination, Playback, RouteInfo, SourceInfo, SourceSpec};
 use crate::srt_receiver::SrtSource;
-use crate::srt_sender::SrtOutput;
 use crate::tap::TapSource;
 use crate::webrtc::PeerLink;
 use crate::webrtc_receiver::WebRtcSource;
-use crate::webrtc_sender::WebRtcOutput;
 
 enum Source {
     Tap(TapSource),
@@ -112,68 +108,6 @@ impl Source {
         match self {
             Self::WebRtc(webrtc) => Some(webrtc.peer()),
             _ => None,
-        }
-    }
-}
-
-enum Output {
-    Device(DeviceOutput),
-    AirPlay(AirPlayOutput),
-    Srt(SrtOutput),
-    WebRtc(WebRtcOutput),
-    Program(ProgramRoute),
-}
-
-impl Output {
-    fn start(&self) -> Result<(), String> {
-        match self {
-            Self::Device(device) => device.start(),
-            Self::AirPlay(_) | Self::Srt(_) | Self::WebRtc(_) | Self::Program(_) => Ok(()),
-        }
-    }
-
-    fn status(&self) -> FlowStatus {
-        match self {
-            Self::Device(device) => device.status(),
-            Self::AirPlay(airplay) => airplay.status(),
-            Self::Srt(srt) => srt.status(),
-            Self::WebRtc(webrtc) => webrtc.status(),
-            Self::Program(program) => program.status(),
-        }
-    }
-
-    fn log_health(&mut self, route_id: u32, ring: &Ring) {
-        match self {
-            Self::Device(device) => device.log_health(route_id, ring),
-            Self::AirPlay(airplay) => airplay.log_health(route_id, ring),
-            Self::Srt(srt) => srt.log_health(route_id, ring),
-            Self::WebRtc(webrtc) => webrtc.log_health(route_id, ring),
-            Self::Program(program) => program.log_health(route_id, ring),
-        }
-    }
-
-    fn peer(&self) -> Option<&PeerLink> {
-        match self {
-            Self::WebRtc(webrtc) => Some(webrtc.peer()),
-            _ => None,
-        }
-    }
-
-    fn playing_cycles(&self) -> Option<&Cycles> {
-        match self {
-            Self::Device(device) => Some(device.cycles()).filter(|cycles| cycles.running(IDLE)),
-            Self::AirPlay(airplay) => airplay.is_playing().then(|| airplay.cycles()),
-            Self::Program(program) => Some(program.cycles()).filter(|cycles| cycles.running(IDLE)),
-            Self::Srt(_) | Self::WebRtc(_) => None,
-        }
-    }
-
-    fn playback(&self) -> Option<Playback> {
-        match self {
-            Self::Device(device) => Some(device.playback()),
-            Self::Program(program) => Some(program.playback()),
-            Self::AirPlay(_) => None,
-            Self::Srt(_) | Self::WebRtc(_) => None,
         }
     }
 }
@@ -457,87 +391,15 @@ impl Router {
             _ => {
                 let source = &mut entry.source;
                 let timing = source.timing()?;
-                let (output, ring) = match &mut destination {
-                    Destination::Device {
-                        uid,
-                        delay_ms,
-                        latency_offset_ms,
-                    } => {
-                        let device = audio::find_device_by_uid(uid)
-                            .ok_or_else(|| format!("device '{uid}' not found"))?;
-                        let delay = delay_ms.map(|ms| f64::from(ms) / 1000.0);
-                        let (output, ring) = unsafe {
-                            DeviceOutput::open(
-                                device,
-                                timing,
-                                Arc::clone(&volume),
-                                delay,
-                                *latency_offset_ms,
-                            )
-                        }?;
-                        (Output::Device(output), ring)
-                    }
-                    Destination::AirPlay {
-                        receiver,
-                        delay_ms,
-                        latency_offset_ms,
-                    } => {
-                        let playout =
-                            AirPlayOutput::playout(&timing, *delay_ms, *latency_offset_ms)?;
-                        let id: airplay::ReceiverId = receiver.parse().map_err(|reason| {
-                            format!("invalid AirPlay receiver id '{receiver}': {reason}")
-                        })?;
-                        validate_receiver_available(
-                            id.as_str(),
-                            self.routes
-                                .iter()
-                                .map(|(&id, route)| (id, &route.destination)),
-                        )?;
-                        *receiver = id.to_string();
-                        let (output, ring) = AirPlayOutput::open(
-                            airplay_browser(),
-                            id,
-                            playout,
-                            Arc::clone(&volume),
-                        );
-                        (Output::AirPlay(output), ring)
-                    }
-                    Destination::Program {
-                        output,
-                        delay_ms,
-                        latency_offset_ms,
-                    } => {
-                        let delay = delay_ms.map(|ms| f64::from(ms) / 1000.0);
-                        let (output, ring) = ProgramRoute::open(
-                            &self.programs.output(output)?,
-                            timing,
-                            Arc::clone(&volume),
-                            delay,
-                            *latency_offset_ms,
-                        )?;
-                        (Output::Program(output), ring)
-                    }
-                    Destination::Srt(socket) => {
-                        let ring = Arc::new(Ring::new(timing.sample_rate));
-                        let output = SrtOutput::open(
-                            socket,
-                            timing,
-                            Arc::clone(&ring),
-                            Arc::clone(&volume),
-                        )?;
-                        (Output::Srt(output), ring)
-                    }
-                    Destination::WebRtc(peer) => {
-                        let ring = Arc::new(Ring::new(timing.sample_rate));
-                        let output = WebRtcOutput::open(
-                            peer,
-                            timing,
-                            Arc::clone(&ring),
-                            Arc::clone(&volume),
-                        )?;
-                        (Output::WebRtc(output), ring)
-                    }
-                };
+                let target = resolve(
+                    &mut destination,
+                    &timing,
+                    &self.programs,
+                    self.routes
+                        .iter()
+                        .map(|(&id, route)| (id, &route.destination)),
+                )?;
+                let (output, ring) = Output::open(target, timing, Arc::clone(&volume))?;
                 let sink_slot = source.add_sink(Arc::clone(&ring))?;
                 if let Err(e) = output.start() {
                     source.remove_sink(sink_slot);
@@ -789,7 +651,58 @@ pub fn list_airplay_receivers() -> Result<Vec<AirPlayReceiverInfo>, String> {
     Ok(receivers)
 }
 
-fn airplay_browser() -> &'static airplay::Browser {
+/// Claude: where `destination` plays for a source of `timing`, beside the
+/// routes the router has. An AirPlay receiver's ID is written back the way
+/// the route lists it.
+fn resolve<'a>(
+    destination: &mut Destination,
+    timing: &SourceTiming,
+    programs: &Programs,
+    routes: impl Iterator<Item = (u32, &'a Destination)>,
+) -> Result<Target, String> {
+    let delay = |ms: &Option<u32>| ms.map(|ms| f64::from(ms) / 1000.0);
+    Ok(match destination {
+        Destination::Device {
+            uid,
+            delay_ms,
+            latency_offset_ms,
+        } => Target::Device {
+            device: audio::find_device_by_uid(uid)
+                .ok_or_else(|| format!("device '{uid}' not found"))?,
+            delay: delay(delay_ms),
+            latency_offset_ms: *latency_offset_ms,
+        },
+        Destination::AirPlay {
+            receiver,
+            delay_ms,
+            latency_offset_ms,
+        } => {
+            let playout = AirPlayOutput::playout(timing, *delay_ms, *latency_offset_ms)?;
+            let id: airplay::ReceiverId = receiver
+                .parse()
+                .map_err(|reason| format!("invalid AirPlay receiver id '{receiver}': {reason}"))?;
+            validate_receiver_available(id.as_str(), routes)?;
+            *receiver = id.to_string();
+            Target::AirPlay {
+                receiver: id,
+                playout: Box::new(playout),
+            }
+        }
+        Destination::Program {
+            output,
+            delay_ms,
+            latency_offset_ms,
+        } => Target::Program {
+            output: programs.output(output)?,
+            delay: delay(delay_ms),
+            latency_offset_ms: *latency_offset_ms,
+        },
+        Destination::Srt(socket) => Target::Srt(socket.clone()),
+        Destination::WebRtc(peer) => Target::WebRtc(peer.clone()),
+    })
+}
+
+pub(crate) fn airplay_browser() -> &'static airplay::Browser {
     static BROWSER: OnceLock<airplay::Browser> = OnceLock::new();
     BROWSER.get_or_init(airplay::Browser::start)
 }

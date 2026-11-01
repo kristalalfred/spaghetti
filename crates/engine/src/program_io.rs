@@ -410,7 +410,7 @@ pub(crate) struct ProgramRoute {
     meter: Arc<FlowMeter>,
     cycles: Arc<Cycles>,
     scheduled: bool,
-    reported_glitches: [u32; 5],
+    reported_glitches: [u32; 6],
 }
 
 impl ProgramRoute {
@@ -469,7 +469,7 @@ impl ProgramRoute {
             meter,
             cycles,
             scheduled: schedule.is_some(),
-            reported_glitches: [0; 5],
+            reported_glitches: [0; 6],
         };
         Ok((route, ring))
     }

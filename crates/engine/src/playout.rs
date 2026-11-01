@@ -158,6 +158,9 @@ pub struct PlayoutHealth {
     underruns: AtomicU32,
     reprimes: AtomicU32,
     resyncs: AtomicU32,
+    /// Claude: renders whose output time stamp was invalid, so that the
+    /// output played them by when they ran.
+    unstamped: AtomicU32,
     glitch_span: AtomicU32,
     glitch_target: AtomicU32,
     lateness: AtomicU32,
@@ -177,6 +180,7 @@ pub struct HealthReport {
     /// Claude: re-primes on purpose, after the span grew under a playing route.
     pub reprimes: u32,
     pub resyncs: u32,
+    pub unstamped_renders: u32,
     /// Claude: the span and the target at the latest underrun, re-prime or resync.
     pub glitch_span_frames: u32,
     pub glitch_target_frames: u32,
@@ -194,6 +198,7 @@ impl PlayoutHealth {
             underruns: self.underruns.load(Ordering::Relaxed),
             reprimes: self.reprimes.load(Ordering::Relaxed),
             resyncs: self.resyncs.load(Ordering::Relaxed),
+            unstamped_renders: self.unstamped.load(Ordering::Relaxed),
             glitch_span_frames: self.glitch_span.load(Ordering::Relaxed),
             glitch_target_frames: self.glitch_target.load(Ordering::Relaxed),
             lateness_frames: f32::from_bits(self.lateness.load(Ordering::Relaxed)),
@@ -217,7 +222,7 @@ impl PlayoutHealth {
         route_id: u32,
         ring: &Ring,
         scheduled: bool,
-        reported_glitches: &mut [u32; 5],
+        reported_glitches: &mut [u32; 6],
     ) {
         let report = self.report();
         let glitches = [
@@ -226,6 +231,7 @@ impl PlayoutHealth {
             report.resyncs,
             ring.overflows(),
             ring.discontinuities(),
+            report.unstamped_renders,
         ];
         let to_ms = |frames: f64| frames * 1000.0 / self.source_rate;
         tracing::debug!(
@@ -241,6 +247,7 @@ impl PlayoutHealth {
             resyncs = glitches[2],
             overflows = glitches[3],
             discontinuities = glitches[4],
+            unstamped_renders = glitches[5],
             "route playout health"
         );
         if glitches != *reported_glitches {
@@ -251,6 +258,7 @@ impl PlayoutHealth {
                 resyncs = glitches[2] - reported_glitches[2],
                 overflows = glitches[3] - reported_glitches[3],
                 discontinuities = glitches[4] - reported_glitches[4],
+                unstamped_renders = glitches[5] - reported_glitches[5],
                 glitch_delivery_ms = to_ms(report.glitch_span_frames as f64),
                 glitch_target_ms = to_ms(report.glitch_target_frames as f64),
                 "route playout glitched since the last report"
@@ -324,6 +332,7 @@ impl Playout {
                 underruns: AtomicU32::new(0),
                 reprimes: AtomicU32::new(0),
                 resyncs: AtomicU32::new(0),
+                unstamped: AtomicU32::new(0),
                 glitch_span: AtomicU32::new(0),
                 glitch_target: AtomicU32::new(0),
                 lateness: AtomicU32::new(0),
@@ -347,6 +356,13 @@ impl Playout {
 
     pub fn health(&self) -> Arc<PlayoutHealth> {
         Arc::clone(&self.health)
+    }
+
+    /// Claude: real-time safe. Counts a render its output could not date,
+    /// which it renders by when it runs instead.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn count_unstamped_render(&self) {
+        self.health.unstamped.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Claude: a scheduled playout pops each frame `delay - latency` after its
@@ -1616,6 +1632,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn renders_played_by_when_they_ran_are_counted() {
+        let timing = SourceTiming {
+            sample_rate: 48000.0,
+            delivery: Arc::new(DeliverySpan::new(480.0)),
+        };
+        let playout = Playout::new(&timing, 48000.0, TICKS_PER_SECOND, None).unwrap();
+        let health = playout.health();
+        assert_eq!(health.report().unstamped_renders, 0);
+        playout.count_unstamped_render();
+        playout.count_unstamped_render();
+        assert_eq!(health.report().unstamped_renders, 2);
     }
 
     #[test]

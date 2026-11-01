@@ -19,6 +19,7 @@ mod program_io;
 mod ring;
 #[cfg(test)]
 mod ring_model;
+mod route_output;
 mod router;
 mod rt_slots;
 mod sinks;

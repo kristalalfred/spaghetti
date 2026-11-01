@@ -22,7 +22,7 @@ pub struct DeviceOutput {
     health: Arc<PlayoutHealth>,
     meter: Arc<FlowMeter>,
     cycles: Arc<Cycles>,
-    reported_glitches: [u32; 5],
+    reported_glitches: [u32; 6],
     scheduled: bool,
 }
 
@@ -105,7 +105,7 @@ impl DeviceOutput {
                 health,
                 meter,
                 cycles,
-                reported_glitches: [0; 5],
+                reported_glitches: [0; 6],
                 scheduled: schedule.is_some(),
             },
             ring,
@@ -358,9 +358,13 @@ unsafe extern "C" fn route_render_callback(
         return 0;
     };
 
-    let output = unsafe { in_time_stamp.as_ref() }
+    let stamped = unsafe { in_time_stamp.as_ref() }
         .filter(|time| time.mFlags & kAudioTimeStampHostTimeValid != 0)
-        .map_or(now, |time| time.mHostTime);
+        .map(|time| time.mHostTime);
+    let output = stamped.unwrap_or_else(|| {
+        state.playout.count_unstamped_render();
+        now
+    });
     state.playout.render(&state.ring, &mut out, now, output);
     if state.playout.is_playing() {
         state.meter.record(

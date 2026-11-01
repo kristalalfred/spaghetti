@@ -8,6 +8,8 @@ use crate::{abl, tap};
 use std::mem;
 use std::ptr;
 
+pub type DeviceId = AudioObjectID;
+
 /// Find a CoreAudio device by its UID string.
 pub fn find_device_by_uid(target_uid: &str) -> Option<AudioObjectID> {
     let device_ids = get_all_devices()?;

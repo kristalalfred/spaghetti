@@ -18,7 +18,7 @@ pub struct AirPlayOutput {
     health: Arc<PlayoutHealth>,
     meter: Arc<FlowMeter>,
     cycles: Arc<Cycles>,
-    reported_glitches: [u32; 5],
+    reported_glitches: [u32; 6],
     reported_state: Option<FlowState>,
 }
 
@@ -90,7 +90,7 @@ impl AirPlayOutput {
             health,
             meter,
             cycles,
-            reported_glitches: [0; 5],
+            reported_glitches: [0; 6],
             reported_state: None,
         };
         (output, ring)
