@@ -209,7 +209,13 @@ enum Path {
 impl Path {
     fn status(&self) -> FlowStatus {
         match self {
-            Self::Ring { output, .. } => output.status(),
+            Self::Ring { ring, output, .. } => {
+                let mut status = output.status();
+                if ring.has_ended() {
+                    status.state = FlowState::Lost;
+                }
+                status
+            }
             Self::Bus { meter, .. } => meter.status(Link::Connected {
                 peer: None,
                 packets_lost: 0,
@@ -1011,6 +1017,38 @@ mod tests {
             }
         }
         assert_eq!(router.route_count(), 0);
+    }
+
+    #[test]
+    fn a_route_whose_source_ended_is_lost() {
+        let mut router = Router::new();
+        let _input = router.add_program_input("capture", 48000.0).unwrap();
+        let _output = router
+            .add_program_output("playback", 48000.0, Duration::ZERO)
+            .unwrap();
+        let source = router
+            .create_source(
+                SourceSpec::Program {
+                    input: "capture".into(),
+                },
+                None,
+            )
+            .unwrap();
+        let route = router
+            .create_route(
+                source,
+                Destination::Program {
+                    output: "playback".into(),
+                    delay_ms: None,
+                    latency_offset_ms: None,
+                },
+                1.0,
+            )
+            .unwrap();
+        let state = |router: &Router| router.list_routes()[0].status.state;
+        assert_eq!(state(&router), FlowState::Connected);
+        router.route_ring(route).end();
+        assert_eq!(state(&router), FlowState::Lost);
     }
 
     #[test]

@@ -25,7 +25,7 @@
 //! captured over it, once.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use coreaudio_sys::*;
 use spaghetti_common::ipc_protocol::{FlowState, FlowStatus};
@@ -221,6 +221,77 @@ struct Shared {
     /// Claude: why capture ended, set once by a change to the device. Nothing
     /// is pushed after it, and the source does not capture again.
     ended: OnceLock<String>,
+    /// Claude: the rings in `sinks` by slot, which an end marks ended, so their
+    /// consumers learn of it whether or not the IOProc runs again.
+    consumers: Mutex<Vec<(usize, Arc<Ring>)>>,
+}
+
+impl Shared {
+    fn new() -> Self {
+        Self {
+            sinks: Sinks::new(),
+            delivery: Arc::new(DeliverySpan::new(0.0)),
+            meter: FlowMeter::new(),
+            ended: OnceLock::new(),
+            consumers: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn consumers(&self) -> MutexGuard<'_, Vec<(usize, Arc<Ring>)>> {
+        self.consumers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Claude: refused once capture ended, so every ring attached is either
+    /// marked by the end or never fed.
+    fn attach(&self, ring: Arc<Ring>) -> Result<usize, String> {
+        let mut consumers = self.consumers();
+        if let Some(reason) = self.ended.get() {
+            return Err(reason.clone());
+        }
+        let slot = self
+            .sinks
+            .insert(Box::new(Arc::clone(&ring)))
+            .map_err(|_| format!("a source can feed at most {MAX_SINKS} routes"))?;
+        consumers.push((slot, ring));
+        Ok(slot)
+    }
+
+    fn detach(&self, slot: usize) {
+        self.consumers().retain(|(attached, _)| *attached != slot);
+        drop(self.sinks.remove(slot));
+    }
+
+    fn end(&self, reason: String) {
+        let consumers = self.consumers();
+        if self.ended.set(reason.clone()).is_ok() {
+            tracing::warn!(%reason, "input capture ended");
+            for (_, ring) in consumers.iter() {
+                ring.end();
+            }
+        }
+    }
+}
+
+/// Claude: why capture that started as `started` must end, if it must: the
+/// device is gone, or it no longer reads as it did.
+fn ended_reason(
+    started: &InputFormat,
+    alive: bool,
+    now: Result<InputFormat, String>,
+) -> Option<String> {
+    if !alive {
+        return Some("the input device is gone".into());
+    }
+    match now {
+        Err(reason) => Some(format!("the input device changed: {reason}")),
+        Ok(now) if now != *started => Some(format!(
+            "the input device changed: {}",
+            started.change(&now)
+        )),
+        Ok(_) => None,
+    }
 }
 
 /// Claude: what the IOProc and the property listeners read. The listeners'
@@ -246,19 +317,9 @@ impl Watcher for Running {
             kAudioDevicePropertyDeviceIsAlive,
             kAudioObjectPropertyScopeGlobal,
         ) == Some(1);
-        let reason = if alive {
-            match InputFormat::read(self.device) {
-                Err(reason) => format!("the input device changed: {reason}"),
-                Ok(now) if now != self.format => {
-                    format!("the input device changed: {}", self.format.change(&now))
-                }
-                Ok(_) => return,
-            }
-        } else {
-            "the input device is gone".to_string()
-        };
-        tracing::warn!(%reason, "input capture ended");
-        let _ = self.shared.ended.set(reason);
+        if let Some(reason) = ended_reason(&self.format, alive, InputFormat::read(self.device)) {
+            self.shared.end(reason);
+        }
     }
 }
 
@@ -455,12 +516,7 @@ impl InputSource {
             .map_err(|reason| format!("input device '{device_uid}': {reason}"))?;
         Ok(Self {
             device_uid: device_uid.to_string(),
-            shared: Arc::new(Shared {
-                sinks: Sinks::new(),
-                delivery: Arc::new(DeliverySpan::new(0.0)),
-                meter: FlowMeter::new(),
-                ended: OnceLock::new(),
-            }),
+            shared: Arc::new(Shared::new()),
             format: None,
             capture: None,
             refused: None,
@@ -488,11 +544,7 @@ impl InputSource {
 
     pub fn add_sink(&mut self, ring: Arc<Ring>) -> Result<usize, String> {
         let format = self.format()?.clone();
-        let slot = self
-            .shared
-            .sinks
-            .insert(Box::new(ring))
-            .map_err(|_| format!("a source can feed at most {MAX_SINKS} routes"))?;
+        let slot = self.shared.attach(ring)?;
         if self.capture.is_none() {
             let started = device(&self.device_uid)
                 .and_then(|device| Capture::start(device, format, Arc::clone(&self.shared)));
@@ -503,7 +555,7 @@ impl InputSource {
                     self.refused = None;
                 }
                 Err(reason) => {
-                    drop(self.shared.sinks.remove(slot));
+                    self.shared.detach(slot);
                     self.format = None;
                     self.refused = Some(reason.clone());
                     return Err(reason);
@@ -514,7 +566,7 @@ impl InputSource {
     }
 
     pub fn remove_sink(&mut self, slot: usize) {
-        drop(self.shared.sinks.remove(slot));
+        self.shared.detach(slot);
         if self.shared.sinks.is_empty() {
             if self.capture.take().is_some() {
                 tracing::info!(label = self.label, "stopped input capture");
@@ -579,6 +631,65 @@ mod tests {
     }
 
     const BOTH: u32 = kAudioTimeStampHostTimeValid | kAudioTimeStampSampleTimeValid;
+
+    fn format(sample_rate: f64, layout: Layout, latency_frames: u32) -> InputFormat {
+        InputFormat {
+            stream: 7,
+            sample_rate,
+            layout,
+            latency_frames,
+            buffers: vec![2],
+        }
+    }
+
+    #[test]
+    fn capture_ends_when_the_device_goes_or_reads_otherwise() {
+        let stereo = Layout::Interleaved { channels: 2 };
+        let started = format(48_000.0, stereo, 32);
+        assert_eq!(ended_reason(&started, true, Ok(started.clone())), None);
+        for (alive, now, expected) in [
+            (false, Ok(started.clone()), "the input device is gone"),
+            (
+                true,
+                Ok(format(44_100.0, stereo, 32)),
+                "its rate changed from 48000 Hz to 44100 Hz",
+            ),
+            (
+                true,
+                Ok(format(48_000.0, stereo, 64)),
+                "its input latency changed from 32 to 64 frames",
+            ),
+            (
+                true,
+                Ok(format(48_000.0, Layout::Planar { channels: 2 }, 32)),
+                "its input format changed",
+            ),
+            (true, Err("the device has no input".into()), "has no input"),
+        ] {
+            let reason = ended_reason(&started, alive, now).unwrap();
+            assert!(reason.contains(expected), "{reason}");
+        }
+    }
+
+    #[test]
+    fn an_end_reaches_consumers_with_frames_queued_and_refuses_new_ones() {
+        let shared = Shared::new();
+        let ring = Arc::new(Ring::new(48_000.0));
+        let slot = shared.attach(Arc::clone(&ring)).unwrap();
+        unsafe {
+            shared.sinks.for_each(|ring| {
+                ring.push_with(480, 0, Captured::Unknown, |_, _| 0.25);
+            })
+        };
+        shared.end("the input device is gone".into());
+        assert!(ring.take_discontinuity().is_some());
+        assert!(ring.has_ended());
+        assert_eq!(ring.available(), 480);
+        let refused = shared.attach(Arc::new(Ring::new(48_000.0))).unwrap_err();
+        assert_eq!(refused, "the input device is gone");
+        shared.detach(slot);
+        assert!(shared.sinks.is_empty());
+    }
 
     #[test]
     fn a_device_that_is_not_there_is_refused() {
@@ -954,6 +1065,7 @@ mod tests {
         router.destroy_route(route).unwrap();
         assert_eq!(listed(&router).status.state, FlowState::Idle);
         let route = router.create_route(input, to_sink(), 1.0).unwrap();
+        let ring = router.route_ring(route);
 
         let destroyed = std::process::Command::new("spaghetti")
             .args(["devices", "destroy", &uid])
@@ -971,6 +1083,7 @@ mod tests {
         }
         let failure = listed(&router).failure.unwrap();
         println!("ended: {failure}");
+        assert!(ring.has_ended());
         router.destroy_route(route).unwrap();
         assert_eq!(listed(&router).status.state, FlowState::Lost);
         let refused = router.create_route(input, to_sink(), 1.0).unwrap_err();

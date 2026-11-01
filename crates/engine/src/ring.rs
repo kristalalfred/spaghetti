@@ -230,6 +230,8 @@ pub struct Ring {
     tolerance_ticks: f64,
     overflows: AtomicU32,
     discontinuities: AtomicU32,
+    /// Claude: set once the producer will push nothing more.
+    ended: AtomicBool,
 }
 
 /// Claude: what the consumer can see of the latest push.
@@ -303,6 +305,7 @@ impl Ring {
             tolerance_ticks: RUN_TOLERANCE_SECONDS * ticks_per_second,
             overflows: AtomicU32::new(0),
             discontinuities: AtomicU32::new(0),
+            ended: AtomicBool::new(false),
         }
     }
 
@@ -313,6 +316,18 @@ impl Ring {
     /// Claude: how many runs the producer started after the first.
     pub fn discontinuities(&self) -> u32 {
         self.discontinuities.load(Ordering::Relaxed)
+    }
+
+    /// Claude: from any thread. The producer will push nothing more: what the
+    /// ring holds is all its consumer gets.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn end(&self) {
+        self.ended.store(true, Ordering::Release);
+    }
+
+    /// Claude: whether the producer ended.
+    pub fn has_ended(&self) -> bool {
+        self.ended.load(Ordering::Acquire)
     }
 
     fn segment(&self, index: u64) -> &Segment {
