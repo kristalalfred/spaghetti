@@ -5,7 +5,10 @@
 #      recovers its true offset, 0, within 2 ms, and again with that offset;
 #   2. a private shairport-sync receiver, played onto the device by
 #      examples/shairport_to_device at the times it plans, calibrated against
-#      the device, then again with the recommended offset: within 2 ms;
+#      the device, then again with the recommended offset: within 2 ms. It
+#      covers AirPlay 1 only: shairport-sync takes no AirPlay 2 stream timed
+#      by NTP, as spaghetti's are, and the check prints what each session
+#      spoke;
 #   3. Ctrl-C ends a calibration of the device, and 4. one of the receiver,
 #      both timed.
 # Nothing plays on a real output, no real microphone records, and no stream
@@ -53,14 +56,21 @@ uid=$(spaghetti --json devices create "$name" \
     | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["uid"])')
 
 # Claude: prints "late_ms of the output, late_ms of the reference, offset",
-# and both spreads on standard error.
+# and on standard error both spreads, any error or warning, and the protocol
+# and timing an AirPlay session spoke.
 measure() {
-    "$cli" --json calibrate "$@" --microphone "$uid" | python3 -I -c '
+    local status=0
+    RUST_LOG=warn,airplay=info "$cli" --json calibrate "$@" --microphone "$uid" \
+        > "$work/calibrate.json" 2> "$work/calibrate.log" || status=$?
+    grep -E "^error|WARN" "$work/calibrate.log" >&2 || true
+    grep -o 'protocol=AirPlay [12] timing="[A-Z]*"' "$work/calibrate.log" | sed "s/^/spoke: /" >&2 || true
+    [[ $status -eq 0 ]] || return "$status"
+    python3 -I -c '
 import json, sys
 r = json.load(sys.stdin)
 print("spreads: output {:.4f} ms, reference {:.4f} ms".format(
     r["output"]["spread_ms"], r["reference"]["spread_ms"]), file=sys.stderr)
-print(r["output"]["late_ms"], r["reference"]["late_ms"], r["latency_offset_ms"])'
+print(r["output"]["late_ms"], r["reference"]["late_ms"], r["latency_offset_ms"])' < "$work/calibrate.json"
 }
 
 # Claude: fails unless |$1 - $2| <= $3, labelled $4.
