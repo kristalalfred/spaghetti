@@ -17,7 +17,7 @@ use crate::{audio, device_output};
 
 use super::detect::Detector;
 use super::emitter::{self, Emitter};
-use super::probe::{TRAIN, TRAIN_SECONDS};
+use super::probe::{MIN_RECORDING_RATE, TRAIN, TRAIN_SECONDS};
 use super::recorder::Recorder;
 use super::{Calibrated, CalibrationFailure, CalibrationState, RecordingFailure, Residual, Role};
 
@@ -316,13 +316,25 @@ impl Job {
         if cancelled() {
             return Err(CalibrationFailure::Cancelled);
         }
+        let unavailable =
+            |reason| CalibrationFailure::Recording(RecordingFailure::Unavailable(reason));
         if let Feed::Input { device_uid, source } = &mut self.feed
             && source.is_none()
         {
-            let created = InputSource::create(device_uid).map_err(|reason| {
-                CalibrationFailure::Recording(RecordingFailure::Unavailable(reason))
-            })?;
-            *source = Some(created);
+            *source = Some(InputSource::create(device_uid).map_err(unavailable)?);
+        }
+        let sample_rate = match &mut self.feed {
+            Feed::Input {
+                source: Some(input),
+                ..
+            } => input.timing().map_err(unavailable)?.sample_rate,
+            Feed::Input { source: None, .. } => unreachable!("created above"),
+            Feed::Program(input) => input.sample_rate(),
+        };
+        if sample_rate < MIN_RECORDING_RATE {
+            return Err(unavailable(format!(
+                "it records at {sample_rate} Hz, below the {MIN_RECORDING_RATE} Hz the probes need"
+            )));
         }
         Ok(())
     }

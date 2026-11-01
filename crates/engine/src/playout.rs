@@ -34,6 +34,9 @@ const RESCHEDULE_SECONDS: f64 = 0.02;
 /// from any other source holds at least the delay that one does at its rate.
 const HELD_FRAMES: usize = 1 << 18;
 const HELD_RATE: f64 = 48_000.0;
+/// Claude: the rates a route's source and output may run at.
+pub const MIN_RATE: f64 = 8_000.0;
+pub const MAX_RATE: f64 = 768_000.0;
 
 /// Claude: the most frames the resampler asks for in one render, as rubato
 /// sizes an `Async` sinc resampler with a fixed output.
@@ -51,12 +54,13 @@ fn reserve_frames(source_rate: f64, device_rate: f64) -> usize {
 
 /// Claude: the fewest frames, in a power of two, a route's ring needs to hold
 /// at least the delay a 48 kHz source's does in `HELD_FRAMES` at this device
-/// rate, beside its reserve.
-fn ring_capacity(source_rate: f64, device_rate: f64) -> usize {
-    let held = (HELD_FRAMES - reserve_frames(HELD_RATE, device_rate)) as f64;
-    let needed = (held * (source_rate / HELD_RATE)).ceil() as usize
-        + reserve_frames(source_rate, device_rate);
-    needed.next_power_of_two()
+/// rate, beside its reserve. None where a 48 kHz source's reserve alone
+/// would not fit.
+fn ring_capacity(source_rate: f64, device_rate: f64) -> Option<usize> {
+    let held = HELD_FRAMES.checked_sub(reserve_frames(HELD_RATE, device_rate))? as f64;
+    ((held * (source_rate / HELD_RATE)).ceil() as usize)
+        .checked_add(reserve_frames(source_rate, device_rate))?
+        .checked_next_power_of_two()
 }
 
 /// Claude: a route that plays each frame `delay` seconds after the source
@@ -90,6 +94,8 @@ pub struct Playout {
     input: Vec<f32>,
     indexing: Indexing,
     device_rate: f64,
+    /// Claude: the frames a ring for it holds.
+    capacity: usize,
     source_frames_per_tick: f64,
     margin_frames: usize,
     delivery: Arc<DeliverySpan>,
@@ -302,6 +308,16 @@ impl Playout {
         schedule: Option<Schedule>,
     ) -> Result<Self, String> {
         let source_rate = source.sample_rate;
+        for (end, rate) in [("source", source_rate), ("output", device_rate)] {
+            if !(MIN_RATE..=MAX_RATE).contains(&rate) {
+                return Err(format!(
+                    "a {end} at {rate} Hz is outside the {MIN_RATE} to {MAX_RATE} Hz a route plays between"
+                ));
+            }
+        }
+        let capacity = ring_capacity(source_rate, device_rate).ok_or_else(|| {
+            format!("a {device_rate} Hz output has no room for a delay beside what it resamples")
+        })?;
         let params = SincInterpolationParameters::new(SINC_LEN, WindowFunction::BlackmanHarris2);
         let resampler = Async::<f32>::new_sinc(
             device_rate / source_rate,
@@ -318,6 +334,7 @@ impl Playout {
             input,
             indexing: Indexing::default(),
             device_rate,
+            capacity,
             source_frames_per_tick: source_rate / ticks_per_second,
             margin_frames: (MARGIN_SECONDS * source_rate).ceil() as usize,
             delivery: Arc::clone(&source.delivery),
@@ -381,18 +398,14 @@ impl Playout {
     /// plus one render's input and the lateness it tolerates before rescheduling.
     pub fn max_held_seconds(&self) -> f64 {
         let rate = self.health.source_rate;
-        (ring_capacity(rate, self.device_rate) - reserve_frames(rate, self.device_rate)) as f64
-            / rate
+        (self.capacity - reserve_frames(rate, self.device_rate)) as f64 / rate
     }
 
     /// Claude: a ring for this playout to read, sized for the longest delay it
     /// holds.
     pub fn ring(&self) -> Arc<Ring> {
         let rate = self.health.source_rate;
-        Arc::new(Ring::with_capacity(
-            rate,
-            ring_capacity(rate, self.device_rate),
-        ))
+        Arc::new(Ring::with_capacity(rate, self.capacity))
     }
 
     pub fn minimum_delay(&self, render_ahead: f64) -> f64 {
@@ -1620,7 +1633,11 @@ mod tests {
             Playout::new(&timing, device, TICKS_PER_SECOND, schedule)
         };
         for device in [8000.0, 44100.0, 48000.0, 96000.0] {
-            assert_eq!(ring_capacity(48000.0, device), HELD_FRAMES, "{device} Hz");
+            assert_eq!(
+                ring_capacity(48000.0, device),
+                Some(HELD_FRAMES),
+                "{device} Hz"
+            );
             let at_48_khz = playout(48000.0, device, None).unwrap().max_held_seconds();
             for rate in [
                 8000.0, 11025.0, 12000.0, 16000.0, 22050.0, 24000.0, 32000.0, 44100.0, 48000.0,
@@ -1642,6 +1659,39 @@ mod tests {
                     assert!(playout(rate, device, Some(within)).is_ok(), "{label}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn rates_outside_the_supported_range_are_refused_rather_than_sized() {
+        let playout = |rate: f64, device: f64| {
+            let timing = SourceTiming {
+                sample_rate: rate,
+                delivery: Arc::new(DeliverySpan::new(0.0)),
+            };
+            Playout::new(&timing, device, TICKS_PER_SECOND, None)
+        };
+        assert_eq!(ring_capacity(48000.0, 500.0), None);
+        for (rate, device) in [
+            (48000.0, 500.0),
+            (500.0, 48000.0),
+            (48000.0, MIN_RATE - 1.0),
+            (MAX_RATE + 1.0, 48000.0),
+            (48000.0, 0.0),
+            (f64::NAN, 48000.0),
+            (48000.0, f64::INFINITY),
+        ] {
+            let refused = playout(rate, device).err();
+            assert!(
+                refused
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("outside")),
+                "{rate} Hz to {device} Hz: {refused:?}"
+            );
+        }
+        for (rate, device) in [(MIN_RATE, MAX_RATE), (MAX_RATE, MIN_RATE)] {
+            let playout = playout(rate, device).unwrap();
+            assert!(playout.max_held_seconds() > 1.0, "{rate} Hz to {device} Hz");
         }
     }
 

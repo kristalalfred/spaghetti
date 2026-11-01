@@ -11,6 +11,9 @@ pub const TRAIN_SECONDS: f64 = 2.8;
 const PROBE_SECONDS: f64 = 0.2;
 const LOW_HZ: f64 = 500.0;
 const HIGH_HZ: f64 = 6000.0;
+/// Claude: the lowest rate a recording may run at, the lowest common rate
+/// above twice `HIGH_HZ`, so that it holds the whole probe unaliased.
+pub const MIN_RECORDING_RATE: f64 = 16_000.0;
 const TAPER_SECONDS: f64 = 0.01;
 /// Claude: -20 dBFS. A built-in microphone beside built-in speakers at high
 /// volume clipped on probes at -6 dBFS, where probes stood 79 to 90 dB over

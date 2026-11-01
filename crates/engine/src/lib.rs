@@ -70,8 +70,8 @@ pub use calibration::{
 };
 pub use host_time::HostTime;
 pub use program_io::{
-    BufferError, Frames, MAX_CALLBACK_FRAMES, MAX_PROGRAM_RATE, MAX_PROGRAM_ROUTES, ProgramInput,
-    ProgramOutput,
+    BufferError, Frames, MAX_CALLBACK_FRAMES, MAX_PROGRAM_RATE, MAX_PROGRAM_ROUTES,
+    MIN_PROGRAM_RATE, ProgramInput, ProgramOutput,
 };
 pub use router::{Router, list_airplay_receivers};
 pub use spec::{Destination, InProcess, Playback, RouteInfo, SourceInfo, SourceSpec};

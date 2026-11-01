@@ -25,7 +25,7 @@ use crate::flow::{FlowMeter, Link};
 use crate::host_time::{self, HostTime};
 use crate::leases::Leases;
 use crate::mixer::{Cycles, Fader};
-use crate::playout::{MAX_RENDER_FRAMES, Playout, PlayoutHealth, Schedule};
+use crate::playout::{self, MAX_RENDER_FRAMES, Playout, PlayoutHealth, Schedule};
 use crate::ring::{CHANNELS, Captured, Ring};
 use crate::sinks::{MAX_SINKS, SourceTiming};
 use crate::spec::Playback;
@@ -141,14 +141,19 @@ impl<'a> Frames<'a> {
     }
 }
 
-/// Claude: the highest rate a program input or output may run at. A route
-/// holds the same time at any rate, in memory that grows with it.
-pub const MAX_PROGRAM_RATE: f64 = 768_000.0;
+/// Claude: the rates a program input or output may run at, those a route
+/// plays between. A route holds the same time at any rate, in memory that
+/// grows with it.
+pub const MIN_PROGRAM_RATE: f64 = playout::MIN_RATE;
+pub const MAX_PROGRAM_RATE: f64 = playout::MAX_RATE;
 
-/// Claude: a program's audio rate must be a rate, at most `MAX_PROGRAM_RATE`.
 fn checked_rate(sample_rate: f64) -> Result<f64, String> {
     if !(sample_rate.is_finite() && sample_rate > 0.0) {
         Err(format!("{sample_rate} Hz is not a sample rate"))
+    } else if sample_rate < MIN_PROGRAM_RATE {
+        Err(format!(
+            "{sample_rate} Hz is below the {MIN_PROGRAM_RATE} Hz a program may run at"
+        ))
     } else if sample_rate > MAX_PROGRAM_RATE {
         Err(format!(
             "{sample_rate} Hz is above the {MAX_PROGRAM_RATE} Hz a program may run at"
@@ -1398,9 +1403,15 @@ mod tests {
     }
 
     #[test]
-    fn rates_past_the_highest_a_program_may_run_at_are_refused() {
+    fn rates_outside_those_a_program_may_run_at_are_refused() {
         let mut router = Router::new();
-        for (name, rate) in [("a", -1.0), ("b", f64::INFINITY), ("c", 768_001.0)] {
+        for (name, rate) in [
+            ("a", -1.0),
+            ("b", f64::INFINITY),
+            ("c", 768_001.0),
+            ("e", 7999.0),
+            ("f", 500.0),
+        ] {
             assert!(router.add_program_input(name, rate).is_err(), "{rate} Hz");
             assert!(
                 router
@@ -1417,6 +1428,37 @@ mod tests {
         router
             .create_route(source, to("d", Some(5300)), 1.0)
             .unwrap();
+    }
+
+    #[test]
+    fn routes_at_the_lowest_rate_a_program_may_run_at_play_each_frame_on_schedule() {
+        for (input_rate, output_rate) in [
+            (RATE, MIN_PROGRAM_RATE),
+            (MIN_PROGRAM_RATE, RATE),
+            (MIN_PROGRAM_RATE, MIN_PROGRAM_RATE),
+        ] {
+            let mut router = Router::new();
+            let mut input = router.add_program_input("mic", input_rate).unwrap();
+            let mut output = router
+                .add_program_output("speaker", output_rate, Duration::ZERO)
+                .unwrap();
+            let source = program_source(&mut router, "mic");
+            program_route(&mut router, source, "speaker", Some(100));
+
+            let origin = HostTime::now();
+            let click = (0.2 * input_rate) as usize;
+            let frames = 0..(0.5 * input_rate) as usize;
+            push_mono(&mut input, origin, input_rate, frames, |f| {
+                if f == click { 1.0 } else { 0.0 }
+            });
+            let buffers = (0.4 * output_rate) as usize / BUFFER;
+            let (played, _) = render_at(&mut output, output_rate, at(origin, 0.05), buffers);
+            let heard = heard_click(&played, output_rate, 0.05);
+            assert!(
+                (heard - 0.3).abs() < 2.0 / MIN_PROGRAM_RATE,
+                "{input_rate} Hz to {output_rate} Hz: the click was heard at {heard} s, not 0.3 s"
+            );
+        }
     }
 
     #[test]

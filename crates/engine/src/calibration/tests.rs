@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::job::{Phase, RECORDING_LAG, Step};
+use super::probe::MIN_RECORDING_RATE;
 use super::*;
 use crate::program_io::{Frames, ProgramInput, ProgramOutput};
 use crate::route_output::Output;
@@ -650,13 +651,41 @@ fn rates_of_the_outputs_and_the_microphone_do_not_move_the_result() {
     output.rate = 44_100.0;
     let mut reference = Place::at(2.2, 0.4);
     reference.rate = 96_000.0;
-    for mic_rate in [16_000.0, 44_100.0] {
+    for mic_rate in [MIN_RECORDING_RATE, 44_100.0] {
         let setup = Setup {
             mic_rate,
             ..Setup::new(output.clone(), reference.clone())
         };
         assert_measures(&setup, &calibrated(&setup));
     }
+}
+
+#[test]
+fn an_output_at_the_lowest_rate_a_program_may_run_at_is_measured() {
+    let mut output = Place::at(23.3, 1.7);
+    output.rate = crate::MIN_PROGRAM_RATE;
+    let setup = Setup::new(output, Place::at(2.2, 0.4));
+    assert_measures(&setup, &calibrated(&setup));
+}
+
+#[test]
+fn a_recording_too_slow_to_hold_the_probes_fails_before_anything_plays() {
+    let setup = Setup {
+        mic_rate: crate::MIN_PROGRAM_RATE,
+        ..Setup::new(Place::at(23.3, 1.7), Place::at(2.2, 0.4))
+    };
+    let run = run(&setup, |_, _| {});
+    let Err(CalibrationFailure::Recording(RecordingFailure::Unavailable(reason))) = run.result
+    else {
+        panic!("{:?}", run.result)
+    };
+    assert!(reason.contains("below the 16000 Hz"), "{reason}");
+    assert!(
+        run.room
+            .speakers
+            .iter()
+            .all(|(_, speaker)| speaker.sounding_bursts() == 0)
+    );
 }
 
 #[test]
