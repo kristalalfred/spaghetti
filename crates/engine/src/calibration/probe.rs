@@ -12,7 +12,10 @@ const PROBE_SECONDS: f64 = 0.2;
 const LOW_HZ: f64 = 500.0;
 const HIGH_HZ: f64 = 6000.0;
 const TAPER_SECONDS: f64 = 0.01;
-pub const LEVEL: f64 = 0.5;
+/// Claude: -20 dBFS. A built-in microphone beside built-in speakers at high
+/// volume clipped on probes at -6 dBFS, where probes stood 79 to 90 dB over
+/// the background.
+pub const LEVEL: f64 = 0.1;
 
 /// Claude: the probe at `t` seconds from its start: a sweep from `LOW_HZ` to
 /// `HIGH_HZ` over `PROBE_SECONDS` with raised-cosine ends, peaking at `LEVEL`,

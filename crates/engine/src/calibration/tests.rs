@@ -615,7 +615,7 @@ fn trains_found_with_different_probes_still_cancel_a_drifting_bias() {
 #[test]
 fn a_clipped_or_corrupt_recording_fails() {
     let mut loud = Place::at(10.0, 1.0);
-    loud.paths[0].1 = 2.5;
+    loud.paths[0].1 = 12.0;
     assert_eq!(
         failure(&Setup::new(loud, Place::at(2.0, 1.0))),
         CalibrationFailure::Recording(RecordingFailure::Clipped)
