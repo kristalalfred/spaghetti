@@ -205,6 +205,17 @@ impl PlayoutHealth {
         }
     }
 
+    pub fn count_unstamped_render(&self) {
+        self.unstamped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Claude: every underrun, re-prime, resync and unstamped render so far:
+    /// each a moment the output did not play the route on its own schedule.
+    pub fn glitches(&self) -> u32 {
+        let report = self.report();
+        report.underruns + report.reprimes + report.resyncs + report.unstamped_renders
+    }
+
     /// Claude: whether the output plays the route as of its latest render,
     /// which `cycles` counts.
     pub fn playback(&self, cycles: &Cycles) -> Playback {
@@ -362,7 +373,7 @@ impl Playout {
     /// which it renders by when it runs instead.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn count_unstamped_render(&self) {
-        self.health.unstamped.fetch_add(1, Ordering::Relaxed);
+        self.health.count_unstamped_render();
     }
 
     /// Claude: a scheduled playout pops each frame `delay - latency` after its

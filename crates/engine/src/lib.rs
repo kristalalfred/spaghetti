@@ -8,16 +8,17 @@
 mod abl;
 mod adts;
 mod airplay_sender;
-#[cfg(test)]
 mod calibration;
 mod clock;
 mod codec;
 mod delivery;
 mod flow;
 mod host_time;
+mod leases;
 mod mixer;
 mod playout;
 mod program_io;
+mod reservations;
 mod ring;
 #[cfg(test)]
 mod ring_model;
@@ -61,6 +62,10 @@ mod no_hal;
 #[cfg(not(target_os = "macos"))]
 use no_hal::{audio, bus, device_output, input, tap};
 
+pub use calibration::{
+    Calibrated, Calibrating, Calibration, CalibrationFailure, CalibrationState, ProbeFailure,
+    Recording, RecordingFailure, Residual, Role,
+};
 pub use host_time::HostTime;
 pub use program_io::{
     BufferError, Frames, MAX_CALLBACK_FRAMES, MAX_PROGRAM_RATE, MAX_PROGRAM_ROUTES, ProgramInput,

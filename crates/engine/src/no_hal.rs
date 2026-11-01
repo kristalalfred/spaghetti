@@ -146,11 +146,21 @@ pub mod device_output {
 
     use super::audio::DeviceId;
     use crate::mixer::Cycles;
+    use crate::playout::PlayoutHealth;
     use crate::ring::Ring;
     use crate::sinks::SourceTiming;
     use crate::spec::Playback;
 
     pub struct DeviceOutput(Infallible);
+
+    pub fn check_schedule(
+        device: DeviceId,
+        _source: &SourceTiming,
+        _delay: f64,
+        _latency_offset_ms: Option<i32>,
+    ) -> Result<(), String> {
+        match device {}
+    }
 
     impl DeviceOutput {
         /// # Safety
@@ -175,6 +185,10 @@ pub mod device_output {
         }
 
         pub fn cycles(&self) -> &Cycles {
+            match self.0 {}
+        }
+
+        pub fn health(&self) -> &PlayoutHealth {
             match self.0 {}
         }
 

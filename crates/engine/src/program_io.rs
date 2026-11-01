@@ -23,11 +23,11 @@ use spaghetti_common::ipc_protocol::FlowStatus;
 use crate::delivery::DeliverySpan;
 use crate::flow::{FlowMeter, Link};
 use crate::host_time::{self, HostTime};
+use crate::leases::Leases;
 use crate::mixer::{Cycles, Fader};
 use crate::playout::{MAX_RENDER_FRAMES, Playout, PlayoutHealth, Schedule};
 use crate::ring::{CHANNELS, Captured, Ring};
-use crate::rt_slots::RtSlots;
-use crate::sinks::{MAX_SINKS, Sinks, SourceTiming};
+use crate::sinks::{MAX_SINKS, SourceTiming};
 use crate::spec::Playback;
 
 /// Claude: how many routes one program output mixes.
@@ -162,19 +162,55 @@ fn checked_rate(sample_rate: f64) -> Result<f64, String> {
 pub(crate) struct InputShared {
     name: String,
     sample_rate: f64,
-    sinks: Sinks,
+    sinks: Leases<Arc<Ring>, MAX_SINKS>,
     delivery: Arc<DeliverySpan>,
     meter: FlowMeter,
 }
 
 impl InputShared {
+    pub(crate) fn sample_rate(&self) -> f64 {
+        self.sample_rate
+    }
+
+    /// Claude: feeds `ring` too, under the lease returned, until withdrawn.
+    pub(crate) fn lease_sink(&self, ring: Arc<Ring>) -> Result<u64, String> {
+        self.sinks.lease(Box::new(ring)).ok_or_else(|| {
+            if self.sinks.ended() {
+                format!("program input '{}' was removed", self.name)
+            } else {
+                format!("a program input can feed at most {MAX_SINKS} routes")
+            }
+        })
+    }
+
+    pub(crate) fn withdraw_sink(&self, lease: u64) {
+        drop(self.sinks.withdraw(lease));
+    }
+
+    /// Claude: withdraws every sink, whose consumers see their rings end, and
+    /// takes no more.
+    pub(crate) fn end(&self) {
+        for ring in self.sinks.end() {
+            ring.end();
+        }
+    }
+
+    pub(crate) fn ended(&self) -> bool {
+        self.sinks.ended()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_idle(&self) -> bool {
+        self.sinks.is_empty()
+    }
+
     pub(crate) fn new(name: &str, sample_rate: f64) -> Result<Arc<Self>, String> {
         let sample_rate = checked_rate(sample_rate)?;
         host_time::ticks_per_second();
         Ok(Arc::new(Self {
             name: name.to_string(),
             sample_rate,
-            sinks: Sinks::new(),
+            sinks: Leases::new(),
             delivery: Arc::new(DeliverySpan::new(0.0)),
             meter: FlowMeter::new(),
         }))
@@ -256,14 +292,11 @@ impl ProgramSource {
     }
 
     pub(crate) fn add_sink(&mut self, ring: Arc<Ring>) -> Result<usize, String> {
-        self.shared
-            .sinks
-            .insert(Box::new(ring))
-            .map_err(|_| format!("a program input can feed at most {MAX_SINKS} routes"))
+        self.shared.lease_sink(ring).map(|lease| lease as usize)
     }
 
     pub(crate) fn remove_sink(&mut self, slot: usize) {
-        drop(self.shared.sinks.remove(slot));
+        self.shared.withdraw_sink(slot as u64);
     }
 
     /// Claude: `Idle` without routes; with them, `Connected` until the input
@@ -298,7 +331,7 @@ pub(crate) struct OutputShared {
     /// in seconds and in host ticks.
     latency: f64,
     latency_ticks: u64,
-    routes: RtSlots<RouteRender, MAX_PROGRAM_ROUTES>,
+    routes: Leases<RouteRender, MAX_PROGRAM_ROUTES>,
 }
 
 impl OutputShared {
@@ -308,8 +341,50 @@ impl OutputShared {
             sample_rate,
             latency: latency.as_secs_f64(),
             latency_ticks: host_time::from_nanos(latency.as_nanos() as u64),
-            routes: RtSlots::new(),
+            routes: Leases::new(),
         }))
+    }
+
+    /// Claude: playing `delay` after capture by the times the program says
+    /// it is heard, corrected by `latency_offset_ms`.
+    fn schedule(&self, delay: f64, latency_offset_ms: Option<i32>) -> Schedule {
+        Schedule {
+            delay,
+            latency: self.latency + f64::from(latency_offset_ms.unwrap_or(0)) / 1000.0,
+        }
+    }
+
+    /// Claude: refused as opening a route from `source` to the output would
+    /// be for its delay, without opening anything.
+    pub(crate) fn check_schedule(
+        &self,
+        source: &SourceTiming,
+        delay: f64,
+        latency_offset_ms: Option<i32>,
+    ) -> Result<(), String> {
+        let schedule = self.schedule(delay, latency_offset_ms);
+        Playout::new(
+            source,
+            self.sample_rate,
+            host_time::ticks_per_second(),
+            Some(schedule),
+        )
+        .map(|_| ())
+    }
+
+    /// Claude: withdraws every route still mixed in, which then renders
+    /// nothing more, and takes no more.
+    pub(crate) fn end(&self) {
+        drop(self.routes.end());
+    }
+
+    pub(crate) fn ended(&self) -> bool {
+        self.routes.ended()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_idle(&self) -> bool {
+        self.routes.is_empty()
     }
 }
 
@@ -405,7 +480,7 @@ impl ProgramOutput {
 /// the route out of the output's mix once no render is reading it.
 pub(crate) struct ProgramRoute {
     output: Arc<OutputShared>,
-    slot: usize,
+    lease: u64,
     health: Arc<PlayoutHealth>,
     meter: Arc<FlowMeter>,
     cycles: Arc<Cycles>,
@@ -427,10 +502,7 @@ impl ProgramRoute {
         delay: Option<f64>,
         latency_offset_ms: Option<i32>,
     ) -> Result<(Self, Arc<Ring>), String> {
-        let schedule = delay.map(|delay| Schedule {
-            delay,
-            latency: output.latency + f64::from(latency_offset_ms.unwrap_or(0)) / 1000.0,
-        });
+        let schedule = delay.map(|delay| output.schedule(delay, latency_offset_ms));
         let playout = Playout::new(
             &source,
             output.sample_rate,
@@ -458,13 +530,16 @@ impl ProgramRoute {
             meter: Arc::clone(&meter),
             cycles: Arc::clone(&cycles),
         };
-        let slot = output
-            .routes
-            .insert(Box::new(render))
-            .map_err(|_| format!("a program output mixes at most {MAX_PROGRAM_ROUTES} routes"))?;
+        let lease = output.routes.lease(Box::new(render)).ok_or_else(|| {
+            if output.ended() {
+                "the program output was removed".to_string()
+            } else {
+                format!("a program output mixes at most {MAX_PROGRAM_ROUTES} routes")
+            }
+        })?;
         let route = Self {
             output: Arc::clone(output),
-            slot,
+            lease,
             health,
             meter,
             cycles,
@@ -491,6 +566,10 @@ impl ProgramRoute {
         &self.cycles
     }
 
+    pub(crate) fn health(&self) -> &PlayoutHealth {
+        &self.health
+    }
+
     pub(crate) fn log_health(&mut self, route_id: u32, ring: &Ring) {
         self.health
             .log(route_id, ring, self.scheduled, &mut self.reported_glitches);
@@ -499,7 +578,7 @@ impl ProgramRoute {
 
 impl Drop for ProgramRoute {
     fn drop(&mut self) {
-        drop(self.output.routes.remove(self.slot));
+        drop(self.output.routes.withdraw(self.lease));
     }
 }
 

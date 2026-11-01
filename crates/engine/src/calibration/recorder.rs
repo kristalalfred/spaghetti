@@ -93,6 +93,11 @@ impl Recorder {
     pub fn track(&self) -> &Track {
         &self.track
     }
+
+    /// Claude: whether the recording's source will deliver nothing more.
+    pub fn has_ended(&self) -> bool {
+        self.ring.has_ended()
+    }
 }
 
 pub struct Track {

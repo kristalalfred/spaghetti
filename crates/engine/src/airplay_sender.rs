@@ -100,6 +100,24 @@ impl AirPlayOutput {
         self.stream.finish(self.playout_delay)
     }
 
+    /// Claude: stops the stream without letting the receiver play out what
+    /// it holds.
+    pub fn stop(self) -> airplay::Finishing {
+        self.stream.stop()
+    }
+
+    /// Claude: why the stream will never play, once it is unreachable or lost.
+    pub fn unavailable(&self) -> Option<String> {
+        match self.stream.status() {
+            airplay::Status::Unreachable(reason) | airplay::Status::Lost(reason) => Some(reason),
+            airplay::Status::Connecting | airplay::Status::Streaming(_) => None,
+        }
+    }
+
+    pub fn health(&self) -> &PlayoutHealth {
+        &self.health
+    }
+
     pub fn cycles(&self) -> &Cycles {
         &self.cycles
     }

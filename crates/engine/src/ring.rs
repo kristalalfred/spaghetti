@@ -234,7 +234,6 @@ pub struct Ring {
     ended: AtomicBool,
 }
 
-#[cfg(test)]
 /// Claude: one push's record as the consumer reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PushRecord {
@@ -247,7 +246,6 @@ pub struct PushRecord {
     pub position: Option<u64>,
 }
 
-#[cfg(test)]
 /// Claude: frames `pop_push` read: how many, how far into their push they
 /// start, and the push's record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -610,7 +608,6 @@ impl Ring {
         frames
     }
 
-    #[cfg(test)]
     /// Claude: consumer only. Fills `dst`, which holds at least one frame,
     /// with frames from the tail up to the end of the push the first came in
     /// at most, and returns them with that push's record. None when it may

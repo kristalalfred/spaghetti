@@ -26,6 +26,35 @@ pub struct DeviceOutput {
     scheduled: bool,
 }
 
+/// Claude: playing `delay` after capture on a device running at `rate`, its
+/// own and its first output stream's latency counted, corrected by
+/// `latency_offset_ms`.
+fn schedule(
+    device: AudioObjectID,
+    rate: f64,
+    delay: f64,
+    latency_offset_ms: Option<i32>,
+) -> Schedule {
+    Schedule {
+        delay,
+        latency: f64::from(audio::output_latency_frames(device)) / rate
+            + f64::from(latency_offset_ms.unwrap_or(0)) / 1000.0,
+    }
+}
+
+/// Claude: refused as opening a route from `source` to the device would be
+/// for its delay, without opening anything.
+pub fn check_schedule(
+    device: AudioObjectID,
+    source: &SourceTiming,
+    delay: f64,
+    latency_offset_ms: Option<i32>,
+) -> Result<(), String> {
+    let rate = audio::nominal_rate(device).ok_or("could not read the device's rate")?;
+    let schedule = schedule(device, rate, delay, latency_offset_ms);
+    Playout::new(source, rate, host_time::ticks_per_second(), Some(schedule)).map(|_| ())
+}
+
 impl DeviceOutput {
     /// Claude: and the ring the route's source feeds it through.
     pub unsafe fn open(
@@ -57,11 +86,8 @@ impl DeviceOutput {
         );
         unsafe { unit.set_client_format(&dst_asbd) }?;
 
-        let schedule = delay.map(|delay| Schedule {
-            delay,
-            latency: f64::from(audio::output_latency_frames(device)) / device_format.mSampleRate
-                + f64::from(latency_offset_ms.unwrap_or(0)) / 1000.0,
-        });
+        let schedule = delay
+            .map(|delay| schedule(device, device_format.mSampleRate, delay, latency_offset_ms));
         if let Some(schedule) = schedule {
             tracing::info!(
                 delay_ms = schedule.delay * 1000.0,
@@ -126,6 +152,10 @@ impl DeviceOutput {
     }
 
     /// Claude: the render callback's cycles.
+    pub fn health(&self) -> &PlayoutHealth {
+        &self.health
+    }
+
     pub fn cycles(&self) -> &Cycles {
         &self.cycles
     }

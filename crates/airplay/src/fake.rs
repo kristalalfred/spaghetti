@@ -1741,6 +1741,46 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_stopped_stream_releases_its_session_within_its_bound() {
+        let fake = Fake::start(Behavior::default());
+        let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+        let stream = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(settings()),
+            Renders::default().renderer(None),
+        );
+        assert!(wait_until(Duration::from_secs(2), || fake.audio().len() >= 20));
+        let stopped_at = Instant::now();
+        let stopping = stream.stop();
+        let sent = fake.audio().len();
+        stopping.wait();
+        let bound = settings().teardown_timeout + Duration::from_millis(40);
+        assert!(stopped_at.elapsed() <= bound, "{:?}", stopped_at.elapsed());
+        assert!(fake.methods().iter().any(|method| method == "TEARDOWN"));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(fake.audio().len() <= sent + 1);
+    }
+
+    #[test]
+    fn a_stream_stopped_while_finding_its_receiver_ends_at_once() {
+        let fake = Fake::start(Behavior::default());
+        let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+        let elsewhere: ReceiverId = "02:00:00:00:00:01".parse().unwrap();
+        let stream = Stream::start_with(
+            &browser,
+            elsewhere,
+            Ok(settings()),
+            Renders::default().renderer(None),
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        let stopped_at = Instant::now();
+        stream.stop().wait();
+        assert!(stopped_at.elapsed() < Duration::from_millis(100));
+        assert!(fake.requests().is_empty());
+    }
+
+    #[test]
     fn dropping_a_stream_tears_down_at_once() {
         let fake = Fake::start(Behavior::default());
         let browser = fake.browser(SHAIRPORT_SYNC_RAOP);

@@ -4,13 +4,24 @@
 
 use std::sync::Arc;
 
+use crate::delivery::DeliverySpan;
 use crate::host_time;
 use crate::ring::{Captured, Ring};
+use crate::sinks::SourceTiming;
 
 use super::probe::{TRAIN, probe};
 
 pub const RATE: f64 = 48_000.0;
 const BLOCK: u64 = 480;
+
+/// Claude: how the emitter feeds a route: at `RATE`, each frame landing at
+/// most two blocks after its capture.
+pub fn timing() -> SourceTiming {
+    SourceTiming {
+        sample_rate: RATE,
+        delivery: Arc::new(DeliverySpan::new(2.0 * BLOCK as f64)),
+    }
+}
 
 pub struct Emitter {
     ring: Arc<Ring>,

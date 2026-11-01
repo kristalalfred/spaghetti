@@ -90,6 +90,9 @@ impl Stream {
             finish_bound: settings
                 .as_ref()
                 .map_or(Duration::ZERO, |s| s.latency + s.teardown_timeout),
+            stop_bound: settings
+                .as_ref()
+                .map_or(Duration::ZERO, |s| s.teardown_timeout + 2 * POLL_SLICE),
             ended: Mutex::new(false),
             ending: Condvar::new(),
         });
@@ -129,6 +132,21 @@ impl Stream {
             .store(Command::Finish as u8, Ordering::Release);
         Finishing {
             deadline: Instant::now() + self.shared.finish_bound + playout_delay,
+            shared: self.shared.clone(),
+            thread: self.thread.take(),
+        }
+    }
+
+    /// Claude: stops rendering and sending and tears the session down without
+    /// letting the receiver play out what it holds, which it may still play.
+    /// Waiting on the result returns once the session's thread released its
+    /// sockets, at most the teardown timeout and two poll slices from now.
+    pub fn stop(mut self) -> Finishing {
+        self.shared
+            .command
+            .store(Command::Stop as u8, Ordering::Release);
+        Finishing {
+            deadline: Instant::now() + self.shared.stop_bound,
             shared: self.shared.clone(),
             thread: self.thread.take(),
         }
@@ -190,6 +208,7 @@ struct Shared {
     clock: Clock,
     playout_delay: OnceLock<Duration>,
     finish_bound: Duration,
+    stop_bound: Duration,
     ended: Mutex<bool>,
     ending: Condvar,
 }

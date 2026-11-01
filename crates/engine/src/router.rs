@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -11,10 +11,15 @@ use spaghetti_common::ipc_protocol::{
 use crate::airplay_sender::AirPlayOutput;
 use crate::audio;
 use crate::bus::DeviceBus;
+use crate::calibration::{
+    Calibrating, Calibration, Feed, Job, Leg, Recording, Role, emitter_timing,
+};
+use crate::device_output;
 use crate::flow::{FlowMeter, Link};
 use crate::input::InputSource;
 use crate::mixer::{Cycles, FADE_LIMIT, IDLE};
 use crate::program_io::{InputShared, OutputShared, ProgramInput, ProgramOutput, ProgramSource};
+use crate::reservations::{Endpoint, Reservations};
 use crate::ring::Ring;
 use crate::route_output::{Output, Target};
 use crate::sinks::SourceTiming;
@@ -216,6 +221,9 @@ pub struct Router {
     buses: HashMap<String, DeviceBus>,
     finishing: Vec<airplay::Finishing>,
     programs: Programs,
+    reservations: Arc<Reservations>,
+    /// Claude: cleared when the router drops, which ends every calibration.
+    alive: Arc<AtomicBool>,
     next_source_id: u32,
     next_route_id: u32,
 }
@@ -228,6 +236,8 @@ impl Router {
             buses: HashMap::new(),
             finishing: Vec::new(),
             programs: Programs::default(),
+            reservations: Arc::default(),
+            alive: Arc::new(AtomicBool::new(true)),
             next_source_id: 1,
             next_route_id: 1,
         }
@@ -395,6 +405,7 @@ impl Router {
                     &mut destination,
                     &timing,
                     &self.programs,
+                    &self.reservations,
                     self.routes
                         .iter()
                         .map(|(&id, route)| (id, &route.destination)),
@@ -543,6 +554,112 @@ impl Router {
             .unwrap_or(status)
     }
 
+    /// Claude: starts measuring how much later than `calibration.reference`
+    /// its output sounds where the recording is made, and returns at once.
+    /// It checks the destinations as `create_route` would for a source of
+    /// the calibration's own, and holds an AirPlay receiver or program output
+    /// it plays to against other routes until it ends; everything that can
+    /// block opens on its own thread.
+    pub fn calibrate(&mut self, calibration: Calibration) -> Result<Calibrating, String> {
+        Calibrating::start(self.calibration_job(calibration)?)
+    }
+
+    pub(crate) fn calibration_job(&mut self, calibration: Calibration) -> Result<Job, String> {
+        let Calibration {
+            output,
+            reference,
+            recording,
+        } = calibration;
+        let (reference, reference_endpoint) = self.calibration_leg(Role::Reference, reference)?;
+        let (output, output_endpoint) = self.calibration_leg(Role::Output, output)?;
+        let endpoints: Vec<Endpoint> = [reference_endpoint, output_endpoint]
+            .into_iter()
+            .flatten()
+            .collect();
+        if let [a, b] = &endpoints[..]
+            && a == b
+        {
+            return Err(format!("the output and the reference are both {a}"));
+        }
+        let feed = match recording {
+            Recording::Input { device_uid } => Feed::Input(InputSource::create(&device_uid)?),
+            Recording::Program { input } => Feed::Program(self.programs.input(&input)?),
+        };
+        let reservation = self.reservations.reserve(endpoints)?;
+        Ok(Job::new(
+            reference,
+            output,
+            feed,
+            reservation,
+            Arc::clone(&self.alive),
+        ))
+    }
+
+    /// Claude: a calibration's leg to `destination`, which must play on a
+    /// delay, and the endpoint the calibration holds for it, if any.
+    fn calibration_leg(
+        &self,
+        role: Role,
+        mut destination: Destination,
+    ) -> Result<(Leg, Option<Endpoint>), String> {
+        let (delay_ms, latency_offset_ms) = match &destination {
+            Destination::Device {
+                delay_ms: Some(delay_ms),
+                latency_offset_ms,
+                ..
+            }
+            | Destination::Program {
+                delay_ms: Some(delay_ms),
+                latency_offset_ms,
+                ..
+            }
+            | Destination::AirPlay {
+                delay_ms,
+                latency_offset_ms,
+                ..
+            } => (*delay_ms, *latency_offset_ms),
+            _ => {
+                return Err(format!(
+                    "the {role} must play on a delay: a device or program output with one, or an \
+                     AirPlay receiver"
+                ));
+            }
+        };
+        if let Destination::Program { output, .. } = &destination
+            && let Some((route_id, _)) = self.routes.iter().find(|(_, route)| {
+                matches!(&route.destination, Destination::Program { output: used, .. } if used == output)
+            })
+        {
+            return Err(format!("program output '{output}' already has route {route_id}"));
+        }
+        let timing = emitter_timing();
+        let target = resolve(
+            &mut destination,
+            &timing,
+            &self.programs,
+            &self.reservations,
+            self.routes
+                .iter()
+                .map(|(&id, route)| (id, &route.destination)),
+        )?;
+        let delay = f64::from(delay_ms) / 1000.0;
+        match &target {
+            Target::Device { device, .. } => {
+                device_output::check_schedule(*device, &timing, delay, latency_offset_ms)?
+            }
+            Target::Program { output, .. } => {
+                output.check_schedule(&timing, delay, latency_offset_ms)?
+            }
+            Target::AirPlay { .. } | Target::Srt(_) | Target::WebRtc(_) => {}
+        }
+        let endpoint = match destination {
+            Destination::AirPlay { receiver, .. } => Some(Endpoint::AirPlay(receiver)),
+            Destination::Program { output, .. } => Some(Endpoint::ProgramOutput(output)),
+            _ => None,
+        };
+        Ok((Leg::new(role, target, delay, latency_offset_ms), endpoint))
+    }
+
     /// Return every route ID currently targeting the given device UID.
     pub fn routes_targeting(&self, device_uid: &str) -> Vec<u32> {
         self.routes
@@ -606,7 +723,9 @@ impl Router {
         for source_id in sources {
             self.destroy_source(source_id)?;
         }
-        self.programs.inputs.remove(name);
+        if let Some(input) = self.programs.inputs.remove(name) {
+            input.end();
+        }
         Ok(())
     }
 
@@ -625,7 +744,9 @@ impl Router {
         for route_id in routes {
             self.destroy_route(route_id)?;
         }
-        self.programs.outputs.remove(name);
+        if let Some(output) = self.programs.outputs.remove(name) {
+            output.end();
+        }
         Ok(())
     }
 }
@@ -658,6 +779,7 @@ fn resolve<'a>(
     destination: &mut Destination,
     timing: &SourceTiming,
     programs: &Programs,
+    reservations: &Reservations,
     routes: impl Iterator<Item = (u32, &'a Destination)>,
 ) -> Result<Target, String> {
     let delay = |ms: &Option<u32>| ms.map(|ms| f64::from(ms) / 1000.0);
@@ -682,6 +804,7 @@ fn resolve<'a>(
                 .parse()
                 .map_err(|reason| format!("invalid AirPlay receiver id '{receiver}': {reason}"))?;
             validate_receiver_available(id.as_str(), routes)?;
+            reservations.check(&Endpoint::AirPlay(id.to_string()))?;
             *receiver = id.to_string();
             Target::AirPlay {
                 receiver: id,
@@ -692,11 +815,14 @@ fn resolve<'a>(
             output,
             delay_ms,
             latency_offset_ms,
-        } => Target::Program {
-            output: programs.output(output)?,
-            delay: delay(delay_ms),
-            latency_offset_ms: *latency_offset_ms,
-        },
+        } => {
+            reservations.check(&Endpoint::ProgramOutput(output.clone()))?;
+            Target::Program {
+                output: programs.output(output)?,
+                delay: delay(delay_ms),
+                latency_offset_ms: *latency_offset_ms,
+            }
+        }
         Destination::Srt(socket) => Target::Srt(socket.clone()),
         Destination::WebRtc(peer) => Target::WebRtc(peer.clone()),
     })
@@ -760,9 +886,16 @@ fn validate_receiver_available<'a>(
 
 impl Drop for Router {
     fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
         let routes: Vec<_> = self.routes.keys().copied().collect();
         for route in routes {
             let _ = self.destroy_route(route);
+        }
+        for output in self.programs.outputs.values() {
+            output.end();
+        }
+        for input in self.programs.inputs.values() {
+            input.end();
         }
         for finishing in self.finishing.drain(..) {
             finishing.wait();
@@ -790,6 +923,16 @@ impl Router {
         let ring = Arc::new(Ring::new(timing.sample_rate));
         source.add_sink(Arc::clone(&ring)).expect("a free sink");
         (ring, timing)
+    }
+
+    /// Claude: whether nothing, route or calibration, plays to the output.
+    pub fn program_output_idle(&self, name: &str) -> bool {
+        self.programs.outputs[name].is_idle()
+    }
+
+    /// Claude: whether nothing, source or calibration, takes the input.
+    pub fn program_input_idle(&self, name: &str) -> bool {
+        self.programs.inputs[name].is_idle()
     }
 
     pub fn route_ring(&self, route_id: u32) -> Arc<Ring> {

@@ -4,14 +4,14 @@
 //! opens it.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use spaghetti_common::ipc_protocol::{FlowStatus, SrtSocket, WebRtcPeer};
 
 use crate::airplay_sender::AirPlayOutput;
 use crate::audio::DeviceId;
 use crate::device_output::DeviceOutput;
-use crate::mixer::{Cycles, IDLE};
+use crate::mixer::{Cycles, FADE_LIMIT, IDLE};
 use crate::playout::Playout;
 use crate::program_io::{OutputShared, ProgramRoute};
 use crate::ring::Ring;
@@ -146,6 +146,43 @@ impl Output {
             Self::Program(program) => Some(program.playback()),
             Self::AirPlay(_) => None,
             Self::Srt(_) | Self::WebRtc(_) => None,
+        }
+    }
+
+    /// Claude: for an output that plays the route itself, every moment it did
+    /// not play it on its own schedule so far: underruns, re-primes, resyncs
+    /// and unstamped renders, and `ring`'s overflows and new runs.
+    pub(crate) fn glitches(&self, ring: &Ring) -> Option<u32> {
+        let health = match self {
+            Self::Device(device) => device.health(),
+            Self::AirPlay(airplay) => airplay.health(),
+            Self::Program(program) => program.health(),
+            Self::Srt(_) | Self::WebRtc(_) => return None,
+        };
+        Some(health.glitches() + ring.overflows() + ring.discontinuities())
+    }
+
+    /// Claude: why the output will never play, once that is so.
+    pub(crate) fn unavailable(&self) -> Option<String> {
+        match self {
+            Self::AirPlay(airplay) => airplay.unavailable(),
+            Self::Device(_) | Self::Program(_) | Self::Srt(_) | Self::WebRtc(_) => None,
+        }
+    }
+
+    /// Claude: fades out what the output plays and closes it, except an
+    /// AirPlay stream, which stops at once without playing out what its
+    /// receiver holds. Returns once its sockets and device are released.
+    pub(crate) fn close(self, volume: &AtomicU32) {
+        if let Some(cycles) = self.playing_cycles() {
+            volume.store(0f32.to_bits(), Ordering::Release);
+            if !matches!(self, Self::AirPlay(_)) {
+                cycles.wait_fade(3, FADE_LIMIT);
+            }
+        }
+        match self {
+            Self::AirPlay(airplay) => airplay.stop().wait(),
+            output => drop(output),
         }
     }
 }
