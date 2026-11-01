@@ -7,9 +7,11 @@
 
 use std::cell::Cell;
 use std::f64::consts::PI;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::job::{RECORDING_LAG, Step};
+use super::job::{Phase, RECORDING_LAG, Step};
 use super::*;
 use crate::program_io::{Frames, ProgramInput, ProgramOutput};
 use crate::route_output::Output;
@@ -340,6 +342,15 @@ struct Setup {
     drift: f64,
     noise: f64,
     faults: Vec<Fault>,
+    interrupted: Option<(Phase, Interruption)>,
+}
+
+/// Claude: what happens to a calibration as it reaches a phase.
+#[derive(Debug, Clone, Copy)]
+enum Interruption {
+    Cancelled,
+    Removed(&'static str),
+    RouterDropped,
 }
 
 impl Setup {
@@ -353,6 +364,7 @@ impl Setup {
             drift: 0.0,
             noise: 1e-4,
             faults: Vec::new(),
+            interrupted: None,
         }
     }
 }
@@ -423,6 +435,31 @@ fn run(setup: &Setup, hook: impl Fn(f64, &Job)) -> Run {
             },
         })
         .unwrap();
+    let router = Arc::new(Mutex::new(Some(router)));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    if let Some((phase, interruption)) = setup.interrupted {
+        let (router, cancelled) = (Arc::clone(&router), Arc::clone(&cancelled));
+        job.at = Some(Box::new(move |now| {
+            if now != phase {
+                return;
+            }
+            let mut router = router.lock().unwrap();
+            match interruption {
+                Interruption::Cancelled => cancelled.store(true, Ordering::Release),
+                Interruption::Removed("microphone") => router
+                    .as_mut()
+                    .unwrap()
+                    .remove_program_input("microphone")
+                    .unwrap(),
+                Interruption::Removed(output) => router
+                    .as_mut()
+                    .unwrap()
+                    .remove_program_output(output)
+                    .unwrap(),
+                Interruption::RouterDropped => drop(router.take()),
+            }
+        }));
+    }
     let result = (|| {
         job.open(room.ticks(0.0), &|| false)?;
         let mut t = 0.0;
@@ -436,7 +473,7 @@ fn run(setup: &Setup, hook: impl Fn(f64, &Job)) -> Run {
             assert!(t < 60.0, "the calibration ran for a minute");
         }
     })();
-    job.release();
+    let result = job.conclude(result, &|| cancelled.load(Ordering::Acquire));
     Run { result, room }
 }
 
@@ -786,6 +823,51 @@ fn a_recording_flooding_undated_audio_fails_before_it_holds_much() {
         "{} s held",
         held.most
     );
+}
+
+/// Claude: none of these ever gives a calibration that would otherwise
+/// succeed `Done(Ok)` once it happens as the calibration reaches `phase`.
+fn interrupted_while(phase: Phase) {
+    let room = Setup::new(Place::at(10.0, 1.0), Place::at(2.0, 1.0));
+    for (interruption, failure) in [
+        (Interruption::Cancelled, CalibrationFailure::Cancelled),
+        (
+            Interruption::Removed("microphone"),
+            CalibrationFailure::EndpointRemoved,
+        ),
+        (
+            Interruption::Removed("output"),
+            CalibrationFailure::EndpointRemoved,
+        ),
+        (
+            Interruption::Removed("reference"),
+            CalibrationFailure::EndpointRemoved,
+        ),
+        (
+            Interruption::RouterDropped,
+            CalibrationFailure::EndpointRemoved,
+        ),
+    ] {
+        let setup = Setup {
+            interrupted: Some((phase, interruption)),
+            ..room.clone()
+        };
+        assert_eq!(
+            run(&setup, |_, _| {}).result,
+            Err(failure),
+            "{interruption:?} while {phase:?}"
+        );
+    }
+}
+
+#[test]
+fn a_calibration_cancelled_or_left_without_an_endpoint_as_it_analyzes_fails() {
+    interrupted_while(Phase::Analyzing);
+}
+
+#[test]
+fn a_calibration_cancelled_or_left_without_an_endpoint_as_it_releases_fails() {
+    interrupted_while(Phase::Releasing);
 }
 
 #[test]

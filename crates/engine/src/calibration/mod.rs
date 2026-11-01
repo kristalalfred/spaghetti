@@ -248,12 +248,11 @@ impl Calibrating {
             .name("spaghetti-calibration".into())
             .spawn(move || {
                 let mut job = job;
-                let result = job.run(
-                    &|| worker.is_cancelled(),
-                    &|state| *worker.state() = state,
-                    &|timeout| worker.pause(timeout),
-                );
-                job.release();
+                let cancelled = || worker.is_cancelled();
+                let result = job.run(&cancelled, &|state| *worker.state() = state, &|timeout| {
+                    worker.pause(timeout)
+                });
+                let result = job.conclude(result, &cancelled);
                 *worker.state() = CalibrationState::Done(result);
             })
             .map_err(|e| format!("could not start the calibration's thread: {e}"))?;

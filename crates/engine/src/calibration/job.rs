@@ -146,6 +146,14 @@ pub enum Step {
     Done(Result<Calibrated, CalibrationFailure>),
 }
 
+/// Claude: where a test can hold the job up, each passed once.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Analyzing,
+    Releasing,
+}
+
 pub struct Job {
     /// Claude: the reference and the output, in that order.
     legs: [Leg; 2],
@@ -159,6 +167,8 @@ pub struct Job {
     /// Claude: while set, opening waits, as for a device slow to open.
     #[cfg(test)]
     pub hold: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
+    pub at: Option<Box<dyn Fn(Phase) + Send>>,
 }
 
 impl Job {
@@ -180,6 +190,8 @@ impl Job {
             reservation: Some(reservation),
             #[cfg(test)]
             hold: None,
+            #[cfg(test)]
+            at: None,
         }
     }
 
@@ -286,10 +298,7 @@ impl Job {
     fn advance(&mut self, now: u64) -> Result<Option<CalibrationState>, CalibrationFailure> {
         let ticks = host_time::ticks_per_second();
         let seconds = |from: u64| now.saturating_sub(from) as f64 / ticks;
-        let removed = !self.alive.load(Ordering::Acquire)
-            || self.legs.iter().any(Leg::removed)
-            || matches!(&self.feed, Feed::Program(input) if input.ended());
-        if removed {
+        if self.removed() {
             return Err(CalibrationFailure::EndpointRemoved);
         }
         for playing in self.legs.iter_mut().filter_map(|leg| leg.playing.as_mut()) {
@@ -410,7 +419,19 @@ impl Job {
         Ok((!recorded).then_some(CalibrationState::Analyzing))
     }
 
+    /// Claude: whether the router, or a program endpoint the job uses, went
+    /// away.
+    fn removed(&self) -> bool {
+        !self.alive.load(Ordering::Acquire)
+            || self.legs.iter().any(Leg::removed)
+            || matches!(&self.feed, Feed::Program(input) if input.ended())
+    }
+
     fn analyze(&self) -> Result<Calibrated, CalibrationFailure> {
+        #[cfg(test)]
+        if let Some(at) = &self.at {
+            at(Phase::Analyzing);
+        }
         let listening = self.listening.as_ref().expect("opened before analyzing");
         let mut detector = Detector::new(listening.sample_rate);
         let mut measured = Vec::with_capacity(self.trains.len());
@@ -449,15 +470,34 @@ impl Job {
         })
     }
 
+    /// Claude: releases everything, then gives `result`, unless by then the
+    /// calibration was cancelled or something it used went away.
+    pub fn conclude(
+        &mut self,
+        result: Result<Calibrated, CalibrationFailure>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Calibrated, CalibrationFailure> {
+        self.release();
+        match result {
+            Ok(_) if cancelled() => Err(CalibrationFailure::Cancelled),
+            Ok(_) if self.removed() => Err(CalibrationFailure::EndpointRemoved),
+            result => result,
+        }
+    }
+
     /// Claude: stops the recording and the emitters, withdraws the legs from
     /// program outputs, closes device outputs and stops AirPlay streams, then
     /// lets go of what the job reserved.
-    pub fn release(&mut self) {
+    fn release(&mut self) {
         if let Some(listening) = self.listening.take() {
             match &mut self.feed {
                 Feed::Input(input) => input.remove_sink(listening.sink as usize),
                 Feed::Program(input) => input.withdraw_sink(listening.sink),
             }
+        }
+        #[cfg(test)]
+        if let Some(at) = &self.at {
+            at(Phase::Releasing);
         }
         let order = |output: &Output| match output {
             Output::Program(_) => 0,
