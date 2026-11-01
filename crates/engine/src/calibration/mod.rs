@@ -61,11 +61,23 @@ impl std::fmt::Display for Role {
     }
 }
 
+/// Claude: where a calibration is. `train` counts its trains from 1, the
+/// reference's odd and the output's even; it plays
+/// `Calibrating::FEWEST_TRAINS` when its output settles at once and at most
+/// `Calibrating::MOST_TRAINS`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CalibrationState {
-    /// Claude: waiting for this destination to play before probing it.
-    Waiting(Role),
-    Probing(Role),
+    /// Claude: waiting for this destination to play train number `train`.
+    Waiting {
+        role: Role,
+        train: usize,
+    },
+    /// Claude: playing train number `train` through this destination and
+    /// recording it.
+    Probing {
+        role: Role,
+        train: usize,
+    },
     Analyzing,
     Done(Result<Calibrated, CalibrationFailure>),
 }
@@ -346,6 +358,13 @@ pub struct Calibrating {
 }
 
 impl Calibrating {
+    /// Claude: how many trains a calibration plays when its output settles
+    /// at once: two of the output's, and the reference's around them.
+    pub const FEWEST_TRAINS: usize = job::FEWEST_TRAINS;
+    /// Claude: the most trains a calibration plays before it fails
+    /// `Unsettled`.
+    pub const MOST_TRAINS: usize = job::MOST_TRAINS;
+
     pub(crate) fn start(job: Job) -> Result<Self, String> {
         let progress = Arc::new(Progress {
             state: Mutex::new(job.state()),

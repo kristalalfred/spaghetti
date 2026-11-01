@@ -240,8 +240,8 @@ fn wait(
 
 fn progress(state: &CalibrationState) -> String {
     match state {
-        CalibrationState::Waiting(role) => format!("{role}: starting"),
-        CalibrationState::Probing(role) => format!("{role}: probing"),
+        CalibrationState::Waiting { role, train } => format!("{role}: train {train}, waiting"),
+        CalibrationState::Probing { role, train } => format!("{role}: train {train}, probing"),
         CalibrationState::Analyzing => "analyzing".into(),
         CalibrationState::Done(_) => "done".into(),
     }

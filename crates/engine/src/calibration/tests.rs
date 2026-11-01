@@ -415,6 +415,8 @@ impl Setup {
 struct Run {
     result: Result<Calibrated, CalibrationFailure>,
     room: Room,
+    /// Claude: each state the calibration reached, in turn.
+    states: Vec<CalibrationState>,
 }
 
 /// Claude: runs a calibration of `setup` to its end, in the room's time.
@@ -504,6 +506,7 @@ fn run(setup: &Setup, hook: impl Fn(f64, &Job)) -> Run {
             }
         }));
     }
+    let mut states = vec![job.state()];
     let result = (|| {
         job.prepare(&|| false)?;
         job.open(room.ticks(0.0), &|| false)?;
@@ -517,15 +520,24 @@ fn run(setup: &Setup, hook: impl Fn(f64, &Job)) -> Run {
                 return Err(CalibrationFailure::Cancelled);
             }
             hook(t, &job);
-            if let Step::Done(result) = job.tick(room.ticks(t)) {
-                return result;
+            match job.tick(room.ticks(t)) {
+                Step::Done(result) => return result,
+                Step::Running(state) => {
+                    if states.last() != Some(&state) {
+                        states.push(state);
+                    }
+                }
             }
             room.step(t);
             assert!(t < 90.0, "the calibration ran for a minute and a half");
         }
     })();
     let result = job.conclude(result, &|| cancelled.load(Ordering::Acquire));
-    Run { result, room }
+    Run {
+        result,
+        room,
+        states,
+    }
 }
 
 fn calibrated(setup: &Setup) -> Calibrated {
@@ -1141,6 +1153,49 @@ fn reflections_of_different_probes_do_not_line_up_as_an_earlier_train() {
     }
 }
 
+/// Claude: a calibration says which train it waits for or plays, counted
+/// from 1, the reference's odd and the output's even, one after another:
+/// `Calibrating::FEWEST_TRAINS` when its output settles at once, and
+/// `Calibrating::MOST_TRAINS` before it fails `Unsettled` when it never does.
+#[test]
+fn a_calibration_counts_the_trains_it_plays() {
+    let still = Setup::new(Place::at(23.3, 1.7), Place::at(2.2, 0.4));
+    let mut drifting = still.clone();
+    drifting.output.moving = Some(Moving::Drifting { per_second: 0.0003 });
+    for (setup, played) in [
+        (still, Calibrating::FEWEST_TRAINS),
+        (drifting, Calibrating::MOST_TRAINS),
+    ] {
+        let run = run(&setup, |_, _| {});
+        let mut expected = Vec::new();
+        for train in 1..=played {
+            let role = if train % 2 == 1 {
+                Role::Reference
+            } else {
+                Role::Output
+            };
+            if train == 1 {
+                expected.push(CalibrationState::Waiting { role, train });
+            }
+            expected.push(CalibrationState::Probing { role, train });
+        }
+        if played == Calibrating::MOST_TRAINS {
+            expected.push(CalibrationState::Analyzing);
+        }
+        assert_eq!(run.states, expected, "{:?}", run.result);
+        assert_eq!(
+            run.result.is_ok(),
+            played == Calibrating::FEWEST_TRAINS,
+            "{:?}",
+            run.result
+        );
+    }
+    assert_eq!(
+        (Calibrating::FEWEST_TRAINS, Calibrating::MOST_TRAINS),
+        (5, 11)
+    );
+}
+
 #[test]
 fn a_calibration_waiting_for_its_output_to_settle_cancels() {
     let mut output = Place::at(23.3, 1.7);
@@ -1358,7 +1413,10 @@ mod lifecycle {
         assert!(started.elapsed() < Duration::from_millis(50));
         assert_eq!(
             calibrating.state(),
-            CalibrationState::Waiting(Role::Reference)
+            CalibrationState::Waiting {
+                role: Role::Reference,
+                train: 1,
+            }
         );
         assert!(router.program_output_idle("output") && router.program_output_idle("reference"));
         assert!(router.program_input_idle("microphone"));
@@ -1436,7 +1494,13 @@ mod lifecycle {
             assert!(returned < Duration::from_millis(50), "{returned:?}");
             assert!(!threads.is_empty(), "the device was never looked up");
             assert!(!threads.contains(&std::thread::current().id()));
-            assert_eq!(while_stalled, CalibrationState::Waiting(Role::Reference));
+            assert_eq!(
+                while_stalled,
+                CalibrationState::Waiting {
+                    role: Role::Reference,
+                    train: 1,
+                }
+            );
             assert_eq!(done(&calibrating, Duration::from_secs(2)), Err(failure));
             assert!(
                 router.program_output_idle("output") && router.program_output_idle("reference")
@@ -1467,7 +1531,7 @@ mod lifecycle {
         let calibrating = router.calibrate(calibration()).unwrap();
         let live = Live::start(outputs, microphone, tone);
         wait_for(&calibrating, |state| {
-            matches!(state, CalibrationState::Probing(_))
+            matches!(state, CalibrationState::Probing { .. })
         });
         drop(live);
         assert_eq!(
@@ -1488,11 +1552,23 @@ mod lifecycle {
                 let live = probing.then(|| Live::start(outputs, microphone, tone));
                 if probing {
                     wait_for(&calibrating, |state| {
-                        matches!(state, CalibrationState::Probing(Role::Reference))
+                        matches!(
+                            state,
+                            CalibrationState::Probing {
+                                role: Role::Reference,
+                                train: 1,
+                            }
+                        )
                     });
                 } else {
                     wait_for(&calibrating, |state| {
-                        matches!(state, CalibrationState::Waiting(Role::Reference))
+                        matches!(
+                            state,
+                            CalibrationState::Waiting {
+                                role: Role::Reference,
+                                train: 1,
+                            }
+                        )
                     });
                     std::thread::sleep(Duration::from_millis(50));
                 }

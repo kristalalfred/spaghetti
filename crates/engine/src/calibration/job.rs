@@ -62,7 +62,10 @@ pub(super) const OUTPUT_TRAINS_APART: f64 = 2.0 * (EARLY + TRAIN_SECONDS + LATE)
 /// Claude: how many output trains, each between two reference trains, a
 /// calibration plays before it stops waiting for the output to settle.
 const MOST_OUTPUT_TRAINS: usize = 5;
-const MOST_TRAINS: usize = 2 * MOST_OUTPUT_TRAINS + 1;
+pub(super) const MOST_TRAINS: usize = 2 * MOST_OUTPUT_TRAINS + 1;
+/// Claude: the trains a calibration's result rests on: its latest two output
+/// trains and the reference trains around them.
+pub(super) const FEWEST_TRAINS: usize = 5;
 
 /// Claude: reference and output trains take turns, a reference first.
 fn role_of(train: usize) -> Role {
@@ -318,7 +321,10 @@ impl Job {
     }
 
     pub fn state(&self) -> CalibrationState {
-        CalibrationState::Waiting(role_of(0))
+        CalibrationState::Waiting {
+            role: role_of(0),
+            train: 1,
+        }
     }
 
     fn leg(&self, role: Role) -> &Leg {
@@ -582,19 +588,19 @@ impl Job {
             }
         }
 
-        if let Some(train) = self.trains.iter().find(|train| train.to > now) {
-            return Ok(Advance::Running(if now < train.from {
-                CalibrationState::Waiting(train.role)
-            } else {
-                CalibrationState::Probing(train.role)
-            }));
+        if self.trains.len() == MOST_TRAINS && self.trains.iter().all(|train| train.to <= now) {
+            return Ok(Advance::Running(CalibrationState::Analyzing));
         }
-        if self.trains.len() < MOST_TRAINS {
-            return Ok(Advance::Running(CalibrationState::Waiting(role_of(
-                self.trains.len(),
-            ))));
-        }
-        Ok(Advance::Running(CalibrationState::Analyzing))
+        let number = self
+            .trains
+            .iter()
+            .position(|train| train.outcome.is_none())
+            .unwrap_or(self.trains.len());
+        let (role, train) = (role_of(number), number + 1);
+        Ok(Advance::Running(match self.trains.get(number) {
+            Some(scheduled) if now >= scheduled.from => CalibrationState::Probing { role, train },
+            _ => CalibrationState::Waiting { role, train },
+        }))
     }
 
     /// Claude: measures each train once the recording passed its end, in
@@ -640,8 +646,8 @@ impl Job {
             .map_while(|train| train.outcome.as_ref())
             .collect();
         let output = match measured.len() {
-            n if n >= 5 && n % 2 == 1 => n - 2,
-            n if n >= 5 => n - 3,
+            n if n >= FEWEST_TRAINS && n % 2 == 1 => n - 2,
+            n if n >= FEWEST_TRAINS => n - 3,
             _ => return None,
         };
         let window: Option<Vec<&Measured>> = (output - 3..=output + 1)
