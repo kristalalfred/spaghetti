@@ -173,6 +173,7 @@ impl Detector {
         if samples.len() < self.template.len() {
             return Err(ProbeFailure::NotFound {
                 heard: 0,
+                required: AGREEING,
                 above_background_db: 0.0,
             });
         }
@@ -219,6 +220,7 @@ impl Detector {
             debug!(heard = heard.len(), "calibration train not found");
             return Err(ProbeFailure::NotFound {
                 heard: heard.len(),
+                required: AGREEING,
                 above_background_db: db(loudest_unheard / background),
             });
         }
@@ -291,7 +293,17 @@ impl Detector {
             "calibration train agreement"
         );
         if agreeing.len() < AGREEING {
-            return Err(self.moved(&arrivals).unwrap_or(ProbeFailure::Ambiguous));
+            return Err(if arrivals.len() < AGREEING {
+                ProbeFailure::Ambiguous {
+                    ambiguous: heard.len() - arrivals.len(),
+                    measurable: arrivals.len(),
+                    required: AGREEING,
+                }
+            } else {
+                self.moved(&arrivals).unwrap_or(ProbeFailure::Disagree {
+                    spread_ms: (arrivals[arrivals.len() - 1].1 - arrivals[0].1) / self.rate * 1e3,
+                })
+            });
         }
 
         let mut probes: Vec<(f64, f64)> = agreeing
@@ -614,6 +626,7 @@ mod tests {
         match measure(48_000.0, &[(0.02, gain)], noise) {
             Err(ProbeFailure::NotFound {
                 heard: 0,
+                required: 4,
                 above_background_db,
             }) => assert!(above_background_db < 20.0, "{above_background_db}"),
             other => panic!("{other:?}"),
@@ -642,6 +655,7 @@ mod tests {
             .unwrap_err();
         let ProbeFailure::NotFound {
             heard: 1,
+            required: 4,
             above_background_db,
         } = failure
         else {
@@ -649,7 +663,39 @@ mod tests {
         };
         assert!(above_background_db < 20.0, "{above_background_db}");
         let said = failure.to_string();
-        assert!(said.contains("1 of the 5 stood 20 dB above"), "{said}");
+        assert!(
+            said.contains("1 of the 5 stood 20 dB above the background, where 4 must"),
+            "{said}"
+        );
+    }
+
+    /// Claude: probes heard more than once on all but three, so too few to
+    /// agree can be measured, are ambiguous, and say how many were.
+    #[test]
+    fn too_few_measurable_probes_left_by_ambiguity_are_ambiguous_not_moved() {
+        let mut taps = paths(&[(0.032, 0.3)]);
+        taps.push(Path {
+            delay: 0.012,
+            gain: 0.3 * db(-18.0),
+            probes: Some(vec![0, 1]),
+        });
+        let (span, sound_at) = recorded(48_000.0, &taps, 1e-5);
+        let failure = Detector::new(48_000.0)
+            .measure(&span, sound_at)
+            .unwrap_err();
+        assert_eq!(
+            failure,
+            ProbeFailure::Ambiguous {
+                ambiguous: 2,
+                measurable: 3,
+                required: 4,
+            }
+        );
+        let said = failure.to_string();
+        assert!(
+            said.contains("leaving 3 measurable where 4 must agree"),
+            "{said}"
+        );
     }
 
     /// Claude: a train played by a receiver that slews its clock 2.3 ms a
@@ -726,7 +772,14 @@ mod tests {
                         (measured.residual - 0.012 - late).abs() < 2e-5,
                         "{label}: {measured:?}"
                     ),
-                    (Err(ProbeFailure::Ambiguous), None) => {}
+                    (
+                        Err(ProbeFailure::Ambiguous {
+                            ambiguous: 5,
+                            measurable: 0,
+                            required: 4,
+                        }),
+                        None,
+                    ) => {}
                     (result, _) => panic!("{label}: {result:?}"),
                 }
             }
@@ -740,8 +793,11 @@ mod tests {
         assert!((measured.residual - 0.012).abs() <= 0.0035, "{measured:?}");
     }
 
+    /// Claude: an earlier path heard on some probes only gives arrivals that
+    /// scatter rather than drift: the probes disagree, and their timing did
+    /// not move.
     #[test]
-    fn a_near_equal_earlier_arrival_on_some_probes_only_is_ambiguous() {
+    fn a_near_equal_earlier_arrival_on_some_probes_only_disagrees() {
         let mut taps = paths(&[(0.012, 0.3)]);
         taps.push(Path {
             delay: 0.002,
@@ -749,10 +805,14 @@ mod tests {
             probes: Some(vec![0, 2]),
         });
         let (span, sound_at) = recorded(48_000.0, &taps, 1e-4);
-        assert_eq!(
-            Detector::new(48_000.0).measure(&span, sound_at),
-            Err(ProbeFailure::Ambiguous)
-        );
+        let failure = Detector::new(48_000.0)
+            .measure(&span, sound_at)
+            .unwrap_err();
+        let ProbeFailure::Disagree { spread_ms } = failure else {
+            panic!("{failure:?}")
+        };
+        assert!((spread_ms - 10.0).abs() < 0.05, "{spread_ms}");
+        assert!(failure.to_string().contains("not as one train"));
         taps[1].probes = Some(vec![3]);
         let (span, sound_at) = recorded(48_000.0, &taps, 1e-4);
         let measured = Detector::new(48_000.0).measure(&span, sound_at).unwrap();

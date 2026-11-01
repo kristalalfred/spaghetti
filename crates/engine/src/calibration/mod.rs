@@ -134,19 +134,29 @@ impl std::error::Error for CalibrationFailure {}
 /// Claude: why a train was not measured.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProbeFailure {
-    /// Claude: fewer than four probes stood 20 dB above the background:
+    /// Claude: fewer probes than `required` stood 20 dB above the background:
     /// `heard` did, and the loudest of the others stood this far above it.
     NotFound {
         heard: usize,
+        required: usize,
         above_background_db: f64,
     },
-    /// Claude: something matched the train before the arrival, too faint to
-    /// measure and too clear to ignore.
-    Ambiguous,
-    /// Claude: enough probes arrived, each unambiguously, but not together:
-    /// drifting `ms_per_second` a second against their schedules, `spread_ms`
-    /// in all, where one train's agree within 1 ms. The destination's timing
-    /// moved while it played them.
+    /// Claude: enough probes were heard, but `ambiguous` of them matched
+    /// something before their arrival too faintly to measure and too clearly
+    /// to ignore, leaving `measurable` where `required` must agree.
+    Ambiguous {
+        ambiguous: usize,
+        measurable: usize,
+        required: usize,
+    },
+    /// Claude: enough probes arrived, each unambiguously, but scattered up to
+    /// `spread_ms` apart against their schedules, as probes heard by different
+    /// paths arrive.
+    Disagree { spread_ms: f64 },
+    /// Claude: enough probes arrived, each unambiguously, on a line through
+    /// their schedules: drifting `ms_per_second` a second, `spread_ms` in all,
+    /// where one train's agree within 1 ms. The destination's timing moved
+    /// while it played them.
     Moved { spread_ms: f64, ms_per_second: f64 },
 }
 
@@ -155,15 +165,28 @@ impl std::fmt::Display for ProbeFailure {
         match self {
             Self::NotFound {
                 heard,
+                required,
                 above_background_db,
             } => write!(
                 f,
                 "the probes were not heard: {heard} of the {} stood 20 dB above the background, \
-                 where 4 must; the loudest of the others stood {above_background_db:.0} dB above it",
+                 where {required} must; the loudest of the others stood {above_background_db:.0} \
+                 dB above it",
                 probe::TRAIN.len()
             ),
-            Self::Ambiguous => f.write_str(
-                "the probes were heard more than once, the earliest too faintly to measure",
+            Self::Ambiguous {
+                ambiguous,
+                measurable,
+                required,
+            } => write!(
+                f,
+                "{ambiguous} of the probes were heard more than once, the earliest too faintly to \
+                 measure, leaving {measurable} measurable where {required} must agree"
+            ),
+            Self::Disagree { spread_ms } => write!(
+                f,
+                "the probes arrived up to {spread_ms:.1} ms apart against their schedules, not as \
+                 one train, as when they are heard by different paths"
             ),
             Self::Moved {
                 spread_ms,
