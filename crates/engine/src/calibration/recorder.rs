@@ -113,6 +113,16 @@ pub struct Span {
 }
 
 impl Span {
+    /// Claude: `samples` captured one every `ticks_per_frame` from `origin`.
+    #[cfg(test)]
+    pub fn linear(samples: Vec<f32>, origin: f64, ticks_per_frame: f64) -> Self {
+        Self {
+            samples,
+            dates: vec![(0, origin)],
+            ticks_per_frame,
+        }
+    }
+
     /// Claude: when the sample at fractional `index` was captured, in host ticks.
     pub fn date(&self, index: f64) -> f64 {
         let at = self

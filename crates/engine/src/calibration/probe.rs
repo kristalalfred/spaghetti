@@ -14,23 +14,28 @@ const HIGH_HZ: f64 = 6000.0;
 const TAPER_SECONDS: f64 = 0.01;
 const LEVEL: f64 = 0.5;
 
-/// Claude: one probe at `rate`: a sweep from `LOW_HZ` to `HIGH_HZ` over
-/// `PROBE_SECONDS` with raised-cosine ends, peaking at `LEVEL`.
+/// Claude: the probe at `t` seconds from its start: a sweep from `LOW_HZ` to
+/// `HIGH_HZ` over `PROBE_SECONDS` with raised-cosine ends, peaking at `LEVEL`,
+/// and silence outside it.
+pub fn probe_at(t: f64) -> f64 {
+    if !(0.0..PROBE_SECONDS).contains(&t) {
+        return 0.0;
+    }
+    let edge = t.min(PROBE_SECONDS - t);
+    let taper = if edge < TAPER_SECONDS {
+        0.5 * (1.0 - (PI * edge / TAPER_SECONDS).cos())
+    } else {
+        1.0
+    };
+    let sweep = (HIGH_HZ - LOW_HZ) / PROBE_SECONDS;
+    LEVEL * taper * (2.0 * PI * (LOW_HZ * t + 0.5 * sweep * t * t)).sin()
+}
+
+/// Claude: one probe sampled at `rate`.
 pub fn probe(rate: f64) -> Vec<f32> {
     let frames = (PROBE_SECONDS * rate).round() as usize;
-    let sweep = (HIGH_HZ - LOW_HZ) / PROBE_SECONDS;
     (0..frames)
-        .map(|frame| {
-            let t = frame as f64 / rate;
-            let edge = t.min(PROBE_SECONDS - t);
-            let taper = if edge < TAPER_SECONDS {
-                0.5 * (1.0 - (PI * edge / TAPER_SECONDS).cos())
-            } else {
-                1.0
-            };
-            let phase = 2.0 * PI * (LOW_HZ * t + 0.5 * sweep * t * t);
-            (LEVEL * taper * phase.sin()) as f32
-        })
+        .map(|frame| probe_at(frame as f64 / rate) as f32)
         .collect()
 }
 

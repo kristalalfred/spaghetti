@@ -17,6 +17,7 @@ tracing = "0.1"
 libc = "0.2"
 uuid = { version = "1", features = ["v4", "fast-rng"] }
 rubato = { version = "5.0.1", default-features = false }
+rustfft = "6.4"
 srt-tokio = "0.4.4"
 bytes = "1"
 futures = "0.3"
