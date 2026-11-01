@@ -315,11 +315,20 @@ pub fn write_message<W: Write>(writer: &mut W, msg: &impl Serialize) -> IoResult
     writer.flush()
 }
 
+/// Claude: the longest message either end reads, far beyond any real one.
+pub const MAX_MESSAGE_BYTES: usize = 16 << 20;
+
 /// Read a length-prefixed JSON message.
 pub fn read_message<R: Read, T: serde::de::DeserializeOwned>(reader: &mut R) -> IoResult<T> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_MESSAGE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("a message of {len} bytes is longer than any this protocol sends"),
+        ));
+    }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf)?;
     serde_json::from_slice(&buf)
@@ -329,6 +338,19 @@ pub fn read_message<R: Read, T: serde::de::DeserializeOwned>(reader: &mut R) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_longer_than_any_the_protocol_sends_is_refused_unread() {
+        let length = ((MAX_MESSAGE_BYTES + 1) as u32).to_be_bytes();
+        let read = read_message::<_, Response>(&mut &length[..]).unwrap_err();
+        assert_eq!(read.kind(), std::io::ErrorKind::InvalidData);
+        let mut fits = Vec::new();
+        write_message(&mut fits, &Response::Ok).unwrap();
+        assert!(matches!(
+            read_message::<_, Response>(&mut &fits[..]),
+            Ok(Response::Ok)
+        ));
+    }
 
     /// Claude: `value` serializes to exactly `json`, and `json` reads back to it.
     fn golden<T: Serialize + serde::de::DeserializeOwned>(value: &T, json: &str) {

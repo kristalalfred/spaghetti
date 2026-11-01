@@ -3,7 +3,9 @@
 //! is needed.
 
 use std::error::Error;
+use std::io::ErrorKind;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::Duration;
 
 use clap::Args;
@@ -18,9 +20,8 @@ use spaghetti_engine::{
 use crate::output::Output;
 use crate::{SrtArgs, client, route_destination};
 
-/// Claude: how long a running daemon may take to list its routes before the
-/// command goes on without asking it.
-const PREFLIGHT: Duration = Duration::from_millis(250);
+/// Claude: how long a running daemon may take to say what it routes.
+const PREFLIGHT: Duration = Duration::from_secs(2);
 
 #[derive(Args)]
 pub struct CalibrateArgs {
@@ -89,7 +90,7 @@ pub fn run(args: CalibrateArgs, out: Output) -> Result<(), Box<dyn Error>> {
         &plain,
         receivers,
     )?;
-    refuse_receivers_in_use([&output, &reference], &daemon_routes())?;
+    preflight([&output, &reference], Path::new(SOCKET_PATH))?;
     let microphone = match args.microphone {
         Some(uid) => uid,
         None => spaghetti_engine::default_input_device()
@@ -116,18 +117,44 @@ pub fn run(args: CalibrateArgs, out: Output) -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// Claude: what a running daemon routes, or nothing when none answers within
-/// `PREFLIGHT`.
-fn daemon_routes() -> Vec<RouteInfo> {
-    let Ok(mut stream) = UnixStream::connect(SOCKET_PATH) else {
-        return Vec::new();
+/// Claude: refuses to calibrate an AirPlay receiver the daemon listening on
+/// `socket` plays to. Without an AirPlay destination it asks nothing; with
+/// one, a daemon that does not answer within `PREFLIGHT`, or answers badly,
+/// refuses it too.
+fn preflight(destinations: [&Destination; 2], socket: &Path) -> Result<(), String> {
+    let airplay = destinations
+        .iter()
+        .any(|destination| matches!(destination, Destination::AirPlay { .. }));
+    if !airplay {
+        return Ok(());
+    }
+    refuse_receivers_in_use(destinations, &daemon_routes(socket)?)
+}
+
+/// Claude: what the daemon listening on `socket` routes, or nothing when no
+/// daemon listens there.
+fn daemon_routes(socket: &Path) -> Result<Vec<RouteInfo>, String> {
+    let unanswered = |reason: String| {
+        format!(
+            "the daemon did not say whether it plays to the AirPlay receiver ({reason}); \
+             try again, or stop it with: spaghetti daemon stop"
+        )
     };
-    let bounded = stream
+    let mut stream = match UnixStream::connect(socket) {
+        Ok(stream) => stream,
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
+            return Ok(Vec::new());
+        }
+        Err(e) => return Err(unanswered(e.to_string())),
+    };
+    stream
         .set_read_timeout(Some(PREFLIGHT))
-        .and_then(|()| stream.set_write_timeout(Some(PREFLIGHT)));
-    match bounded.map(|()| client::request(&mut stream, &Request::ListRoutes)) {
-        Ok(Ok(Response::Routes(routes))) => routes,
-        _ => Vec::new(),
+        .and_then(|()| stream.set_write_timeout(Some(PREFLIGHT)))
+        .map_err(|e| unanswered(e.to_string()))?;
+    match client::request(&mut stream, &Request::ListRoutes) {
+        Ok(Response::Routes(routes)) => Ok(routes),
+        Ok(_) => Err(unanswered(client::UNEXPECTED.into())),
+        Err(reason) => Err(unanswered(reason)),
     }
 }
 
@@ -286,6 +313,109 @@ mod tests {
             refuse_receivers_in_use([&airplay("c4:38:75:04:5e:80"), &device], &routes).unwrap_err();
         assert!(refused.contains("spaghetti unroute 4"), "{refused}");
         assert!(refuse_receivers_in_use([&airplay("C4:38:75:04:5E:81"), &device], &routes).is_ok());
+    }
+
+    /// Claude: a socket path of its own in the temporary directory, removed
+    /// when dropped.
+    struct Socket(std::path::PathBuf);
+
+    impl Socket {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "spaghetti-preflight-{}-{name}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            Self(path)
+        }
+
+        /// Claude: a daemon that answers each request with `answer`'s bytes,
+        /// or never answers when there are none.
+        fn daemon(&self, answer: Option<Vec<u8>>) -> std::thread::JoinHandle<()> {
+            use std::io::Write;
+            use std::os::unix::net::UnixListener;
+
+            let listener = UnixListener::bind(&self.0).unwrap();
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _: Request = spaghetti_common::ipc_protocol::read_message(&mut stream).unwrap();
+                match answer {
+                    Some(bytes) => stream.write_all(&bytes).unwrap(),
+                    None => std::thread::sleep(PREFLIGHT + Duration::from_secs(1)),
+                }
+            })
+        }
+    }
+
+    impl Drop for Socket {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn message(response: &Response) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        spaghetti_common::ipc_protocol::write_message(&mut bytes, response).unwrap();
+        bytes
+    }
+
+    fn device() -> Destination {
+        Destination::Device {
+            uid: "Speakers".into(),
+            delay_ms: Some(3000),
+            latency_offset_ms: None,
+        }
+    }
+
+    #[test]
+    fn no_daemon_lets_a_receiver_be_calibrated() {
+        let receiver = airplay("C4:38:75:04:5E:80");
+        let missing = Socket::new("missing");
+        assert_eq!(preflight([&receiver, &device()], &missing.0), Ok(()));
+        let stale = Socket::new("stale");
+        drop(std::os::unix::net::UnixListener::bind(&stale.0).unwrap());
+        assert!(stale.0.exists());
+        assert_eq!(preflight([&receiver, &device()], &stale.0), Ok(()));
+    }
+
+    #[test]
+    fn a_daemon_that_answers_late_or_badly_refuses_a_receivers_calibration() {
+        let receiver = airplay("C4:38:75:04:5E:80");
+        let answers = [
+            ("late", None),
+            ("garbled", Some(b"\0\0\0\x05nope!".to_vec())),
+            ("endless", Some(vec![0xFF; 4])),
+            ("other", Some(message(&Response::Ok))),
+        ];
+        for (name, answer) in answers {
+            let socket = Socket::new(name);
+            let daemon = socket.daemon(answer);
+            let started = std::time::Instant::now();
+            let refused = preflight([&receiver, &device()], &socket.0).unwrap_err();
+            let took = started.elapsed();
+            assert!(refused.contains("did not say"), "{name}: {refused}");
+            assert!(
+                took < PREFLIGHT + Duration::from_millis(500),
+                "{name}: {took:?}"
+            );
+            daemon.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_daemon_is_asked_only_about_a_receiver_and_its_answer_is_used() {
+        let socket = Socket::new("asked");
+        let _never_accepting = std::os::unix::net::UnixListener::bind(&socket.0).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(preflight([&device(), &device()], &socket.0), Ok(()));
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        let routes = vec![route(4, airplay("C4:38:75:04:5E:80"))];
+        let socket = Socket::new("routes");
+        let daemon = socket.daemon(Some(message(&Response::Routes(routes))));
+        let refused = preflight([&device(), &airplay("c4:38:75:04:5e:80")], &socket.0);
+        assert!(refused.unwrap_err().contains("spaghetti unroute 4"));
+        daemon.join().unwrap();
     }
 
     #[test]
