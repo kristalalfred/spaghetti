@@ -1,5 +1,5 @@
 use std::marker::PhantomData;
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 /// Claude: a fixed set of items shared with a single real-time reader. Writers
@@ -41,17 +41,31 @@ impl<T, const N: usize> RtSlots<T, N> {
 
     /// Claude: returns only after any reader pass that may still hold the item has finished.
     pub fn remove(&self, index: usize) -> Option<Box<T>> {
-        let item = self.slots.get(index)?.swap(ptr::null_mut(), Ordering::SeqCst);
-        if item.is_null() {
-            return None;
-        }
-        let observed = self.passes.load(Ordering::SeqCst);
-        if observed % 2 == 1 {
-            while self.passes.load(Ordering::SeqCst) == observed {
-                std::thread::yield_now();
+        let mut retired = self.take(index)?;
+        loop {
+            match self.reclaim(retired) {
+                Ok(item) => return Some(item),
+                Err(still) => retired = still,
             }
+            std::thread::yield_now();
         }
-        Some(unsafe { Box::from_raw(item) })
+    }
+
+    /// Claude: empties the slot at once. The reader pass under way, if any,
+    /// may still hold the item until `reclaim` hands it back.
+    pub fn take(&self, index: usize) -> Option<Retired<T>> {
+        let item = NonNull::new(self.slots.get(index)?.swap(ptr::null_mut(), Ordering::SeqCst))?;
+        let observed = self.passes.load(Ordering::SeqCst);
+        Some(Retired { item, pass: (observed % 2 == 1).then_some(observed) })
+    }
+
+    /// Claude: the item once the reader pass that may have held it is over,
+    /// or the item still retired.
+    pub fn reclaim(&self, retired: Retired<T>) -> Result<Box<T>, Retired<T>> {
+        match retired.pass {
+            Some(pass) if self.passes.load(Ordering::SeqCst) == pass => Err(retired),
+            _ => Ok(unsafe { retired.into_box() }),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -70,6 +84,27 @@ impl<T, const N: usize> RtSlots<T, N> {
             }
         }
         self.passes.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Claude: an item out of its slot that a reader pass may still hold.
+/// Dropping it leaks the item.
+pub struct Retired<T> {
+    item: NonNull<T>,
+    pass: Option<usize>,
+}
+
+// Claude: like the slots it came from, a retired item is only touched by one
+// thread at a time once its pass is over.
+unsafe impl<T: Send> Send for Retired<T> {}
+
+impl<T> Retired<T> {
+    /// # Safety
+    ///
+    /// Claude: no reader pass may still hold the item: its pass is over, or
+    /// its slots are borrowed exclusively.
+    pub unsafe fn into_box(self) -> Box<T> {
+        unsafe { Box::from_raw(self.item.as_ptr()) }
     }
 }
 
@@ -133,6 +168,34 @@ mod tests {
         assert_eq!(Arc::strong_count(&tracker), 3);
         drop(slots);
         assert_eq!(Arc::strong_count(&tracker), 1);
+    }
+
+    #[test]
+    fn a_taken_item_is_reclaimed_only_once_the_pass_that_held_it_is_over() {
+        let slots = Arc::new(RtSlots::<u32, 4>::new());
+        let index = slots.insert(Box::new(7)).unwrap();
+        let free = slots.take(slots.insert(Box::new(8)).unwrap()).unwrap();
+        assert_eq!(slots.reclaim(free).ok().as_deref(), Some(&8));
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let reader = {
+            let slots = Arc::clone(&slots);
+            std::thread::spawn(move || unsafe {
+                slots.for_each(|_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                });
+            })
+        };
+        entered_rx.recv().unwrap();
+
+        let retired = slots.take(index).unwrap();
+        assert!(slots.is_empty());
+        let retired = slots.reclaim(retired).unwrap_err();
+        release_tx.send(()).unwrap();
+        reader.join().unwrap();
+        assert_eq!(slots.reclaim(retired).ok().as_deref(), Some(&7));
     }
 
     #[test]

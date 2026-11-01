@@ -14,8 +14,8 @@
 //! hold from before it and prime again, as they do after a push the input
 //! marks with `discontinuity` and after one a route had no room for.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use spaghetti_common::ipc_protocol::FlowStatus;
@@ -163,6 +163,8 @@ pub(crate) struct InputShared {
     name: String,
     sample_rate: f64,
     sinks: Leases<Arc<Ring>, MAX_SINKS>,
+    /// Claude: the ring under each lease, which ending the input ends.
+    rings: Mutex<Vec<(u64, Arc<Ring>)>>,
     delivery: Arc<DeliverySpan>,
     meter: FlowMeter,
 }
@@ -174,25 +176,39 @@ impl InputShared {
 
     /// Claude: feeds `ring` too, under the lease returned, until withdrawn.
     pub(crate) fn lease_sink(&self, ring: Arc<Ring>) -> Result<u64, String> {
-        self.sinks.lease(Box::new(ring)).ok_or_else(|| {
-            if self.sinks.ended() {
-                format!("program input '{}' was removed", self.name)
-            } else {
-                format!("a program input can feed at most {MAX_SINKS} routes")
-            }
-        })
+        let mut rings = self.rings();
+        let lease = self
+            .sinks
+            .lease(Box::new(Arc::clone(&ring)))
+            .ok_or_else(|| {
+                if self.sinks.ended() {
+                    format!("program input '{}' was removed", self.name)
+                } else {
+                    format!("a program input can feed at most {MAX_SINKS} routes")
+                }
+            })?;
+        rings.push((lease, ring));
+        Ok(lease)
     }
 
     pub(crate) fn withdraw_sink(&self, lease: u64) {
-        drop(self.sinks.withdraw(lease));
+        let mut rings = self.rings();
+        self.sinks.withdraw(lease);
+        rings.retain(|(held, _)| *held != lease);
     }
 
     /// Claude: withdraws every sink, whose consumers see their rings end, and
-    /// takes no more.
+    /// takes no more. It does not wait for a push under way.
     pub(crate) fn end(&self) {
-        for ring in self.sinks.end() {
+        let mut rings = self.rings();
+        self.sinks.end();
+        for (_, ring) in rings.drain(..) {
             ring.end();
         }
+    }
+
+    fn rings(&self) -> MutexGuard<'_, Vec<(u64, Arc<Ring>)>> {
+        self.rings.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn ended(&self) -> bool {
@@ -211,6 +227,7 @@ impl InputShared {
             name: name.to_string(),
             sample_rate,
             sinks: Leases::new(),
+            rings: Mutex::new(Vec::new()),
             delivery: Arc::new(DeliverySpan::new(0.0)),
             meter: FlowMeter::new(),
         }))
@@ -385,9 +402,10 @@ impl OutputShared {
     }
 
     /// Claude: withdraws every route still mixed in, which then renders
-    /// nothing more, and takes no more.
+    /// nothing more, and takes no more. It does not wait for a render under
+    /// way.
     pub(crate) fn end(&self) {
-        drop(self.routes.end());
+        self.routes.end();
     }
 
     pub(crate) fn ended(&self) -> bool {
@@ -590,7 +608,7 @@ impl ProgramRoute {
 
 impl Drop for ProgramRoute {
     fn drop(&mut self) {
-        drop(self.output.routes.withdraw(self.lease));
+        self.output.routes.withdraw(self.lease);
     }
 }
 
@@ -1531,5 +1549,68 @@ mod tests {
             HostTime::now() - Duration::from_millis(1),
         );
         assert_eq!(listed(&router).status.state, FlowState::Flowing);
+    }
+
+    /// Claude: a thread inside a pass, parked in it as a real-time callback
+    /// the system stopped would be, until the returned sender sends.
+    fn parked(
+        pass: impl FnOnce(&mut dyn FnMut()) + Send + 'static,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let reader = std::thread::spawn(move || {
+            let mut once = Some((entered_tx, release_rx));
+            pass(&mut || {
+                if let Some((entered, release)) = once.take() {
+                    entered.send(()).unwrap();
+                    let _ = release.recv();
+                }
+            });
+        });
+        entered_rx.recv().unwrap();
+        (release_tx, reader)
+    }
+
+    #[test]
+    fn removing_endpoints_never_waits_for_their_callbacks_parked_in_a_pass() {
+        let mut router = Router::new();
+        let input = router.add_program_input("mic", RATE).unwrap();
+        let output = router
+            .add_program_output("speaker", RATE, Duration::ZERO)
+            .unwrap();
+        let source = program_source(&mut router, "mic");
+        program_route(&mut router, source, "speaker", None);
+        let (ring, _) = router.attach_raw_sink(source);
+
+        let sinks = Arc::clone(&input.shared);
+        let (release_input, input_reader) =
+            parked(move |park| unsafe { sinks.sinks.for_each(|_| park()) });
+        let routes = Arc::clone(&output.shared);
+        let (release_output, output_reader) =
+            parked(move |park| unsafe { routes.routes.for_each(|_| park()) });
+        let (removed, watched) = std::sync::mpsc::channel::<()>();
+        let watchdog = {
+            let (input, output) = (release_input.clone(), release_output.clone());
+            std::thread::spawn(move || {
+                if watched.recv_timeout(Duration::from_secs(2)).is_err() {
+                    let _ = (input.send(()), output.send(()));
+                }
+            })
+        };
+
+        let started = Instant::now();
+        router.remove_program_output("speaker").unwrap();
+        router.remove_program_input("mic").unwrap();
+        let took = started.elapsed();
+        let _ = removed.send(());
+        assert!(took < Duration::from_millis(500), "removal took {took:?}");
+        assert!(ring.has_ended());
+        assert!(router.list_routes().is_empty() && router.list_sources().is_empty());
+
+        let _ = (release_input.send(()), release_output.send(()));
+        input_reader.join().unwrap();
+        output_reader.join().unwrap();
+        watchdog.join().unwrap();
+        assert!(input.shared.ended() && output.shared.ended());
     }
 }
