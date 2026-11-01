@@ -478,15 +478,6 @@ fn run_command(cmd: Command, out: Output) -> Result<(), Box<dyn Error>> {
             }
         },
 
-        Command::SystemDevices => {
-            let Response::SystemDevices(devices) =
-                client::request(&mut stream, &Request::ListSystemDevices)?
-            else {
-                return Err(UNEXPECTED.into());
-            };
-            out.emit(&devices, || print_system_devices(&devices))?;
-        }
-
         Command::AirPlay => {
             let Response::AirPlayReceivers(receivers) =
                 client::request(&mut stream, &Request::ListAirPlayReceivers)?
@@ -505,7 +496,9 @@ fn run_command(cmd: Command, out: Output) -> Result<(), Box<dyn Error>> {
             out.note("Daemon shut down.");
         }
 
-        Command::Daemon { .. } => unreachable!("daemon commands handled in main"),
+        Command::Daemon { .. } | Command::SystemDevices => {
+            unreachable!("commands without the daemon are handled in main")
+        }
     }
 
     Ok(())
@@ -524,6 +517,23 @@ fn create_source(
     out.emit(&json!({ "source_id": source_id }), || {
         println!("Source created: id={source_id}")
     })?;
+    Ok(())
+}
+
+fn list_system_devices(out: Output) -> Result<(), Box<dyn Error>> {
+    let devices = spaghetti_engine::list_all_devices();
+    let listed: Vec<_> = devices
+        .iter()
+        .map(|device| {
+            json!({
+                "uid": device.uid,
+                "name": device.name,
+                "input_channels": device.input_channels,
+                "output_channels": device.output_channels,
+            })
+        })
+        .collect();
+    out.emit(&listed, || print_system_devices(&devices))?;
     Ok(())
 }
 
@@ -556,6 +566,7 @@ fn main() {
         // shell out to launchctl / tail. Handle them before `run_command` so
         // they work even when the daemon is not running.
         Some(Command::Daemon { action }) => run_daemon(action, out).map_err(Into::into),
+        Some(Command::SystemDevices) => list_system_devices(out),
         Some(cmd) => run_command(cmd, out),
     };
     if let Err(e) = result {

@@ -302,7 +302,12 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
         }
         Request::ListDevices => Response::Devices(shared.devices.list_devices()),
         Request::GetActivity => Response::Activity(read_activity(&shared.activity)),
-        Request::ListSystemDevices => Response::SystemDevices(spaghetti_engine::list_all_devices()),
+        Request::ListSystemDevices => Response::SystemDevices(
+            spaghetti_engine::list_all_devices()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        ),
         Request::ListAirPlayReceivers => {
             receiver_listing(spaghetti_engine::list_airplay_receivers).await
         }

@@ -66,7 +66,7 @@ pub use spec::{Destination, InProcess, Playback, RouteInfo, SourceInfo, SourceSp
 #[cfg(target_os = "macos")]
 pub use activity::{ActivityReader, FpsTracker};
 #[cfg(target_os = "macos")]
-pub use audio::{find_device_by_uid, list_all_devices};
+pub use audio::{SystemDevice, find_device_by_uid, list_all_devices};
 #[cfg(target_os = "macos")]
 pub use device_manager::DeviceManager;
 #[cfg(target_os = "macos")]

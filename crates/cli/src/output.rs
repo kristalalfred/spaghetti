@@ -2,8 +2,9 @@ use serde::Serialize;
 use spaghetti_common::ipc_protocol::{
     ActivityInfo, AirPlayReceiverInfo, AirPlaySupport, AppInfo, DaemonStatus, Destination,
     DeviceInfo, FlowState, FlowStatus, PeerRole, RouteInfo, SourceInfo, SourceSpec, SrtMode,
-    SrtSocket, SystemDeviceInfo, WebRtcPeer,
+    SrtSocket, WebRtcPeer,
 };
+use spaghetti_engine::SystemDevice;
 use std::fmt::Display;
 use std::io::IsTerminal;
 
@@ -187,19 +188,38 @@ pub fn print_routes(routes: &[RouteInfo]) {
     }
 }
 
-pub fn print_system_devices(devices: &[SystemDeviceInfo]) {
+pub fn print_system_devices(devices: &[SystemDevice]) {
+    print!("{}", format_system_devices(devices));
+}
+
+fn format_system_devices(devices: &[SystemDevice]) -> String {
+    use std::fmt::Write;
     if devices.is_empty() {
-        println!("No audio devices found.");
-        return;
+        return "No audio devices found.\n".into();
     }
     let uid_w = col_width(devices.iter().map(|d| d.uid.as_str()), 40);
     let name_w = col_width(devices.iter().map(|d| d.name.as_str()), 24);
-    println!("{:<uid_w$} {:<name_w$} {:<8} TYPE", "UID", "NAME", "CHANNELS");
-    println!("{}", "-".repeat(uid_w + name_w + 16));
+    let channels = |count: u32| match count {
+        0 => "-".to_string(),
+        count => count.to_string(),
+    };
+    let mut text = format!(
+        "{:<uid_w$} {:<name_w$} {:>3} {:>3}\n",
+        "UID", "NAME", "IN", "OUT"
+    );
+    text.push_str(&"-".repeat(uid_w + name_w + 8));
+    text.push('\n');
     for d in devices {
-        let kind = if d.is_output { "output" } else { "input" };
-        println!("{:<uid_w$} {:<name_w$} {:<8} {}", d.uid, d.name, d.channels, kind);
+        let _ = writeln!(
+            text,
+            "{:<uid_w$} {:<name_w$} {:>3} {:>3}",
+            d.uid,
+            d.name,
+            channels(d.input_channels),
+            channels(d.output_channels)
+        );
     }
+    text
 }
 
 pub fn print_airplay_receivers(receivers: &[AirPlayReceiverInfo]) {
@@ -576,6 +596,34 @@ mod tests {
                 assert_eq!(json["destination"]["latency_offset_ms"], offset);
             }
         }
+    }
+
+    #[test]
+    fn device_listings_show_input_and_output_channels() {
+        let device = |uid: &str, input_channels, output_channels| SystemDevice {
+            uid: uid.into(),
+            name: uid.to_lowercase(),
+            input_channels,
+            output_channels,
+        };
+        let text = format_system_devices(&[
+            device("Microphone", 1, 0),
+            device("Speakers", 0, 2),
+            device("Interface", 8, 4),
+        ]);
+        let rows: Vec<Vec<&str>> = text
+            .lines()
+            .map(|line| line.split_whitespace().collect())
+            .collect();
+        assert_eq!(rows[0], ["UID", "NAME", "IN", "OUT"]);
+        assert_eq!(
+            rows[2..],
+            [
+                ["Microphone", "microphone", "1", "-"],
+                ["Speakers", "speakers", "-", "2"],
+                ["Interface", "interface", "8", "4"],
+            ]
+        );
     }
 
     #[test]
