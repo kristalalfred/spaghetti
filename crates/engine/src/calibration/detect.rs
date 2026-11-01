@@ -191,13 +191,45 @@ impl Detector {
         let background = *sorted.select_nth_unstable_by(middle, f64::total_cmp).1;
         let background = background.max(self.floor);
 
+        let mut failure = None;
+        for (candidate, strongest) in self
+            .candidates(&envelope, background)
+            .into_iter()
+            .enumerate()
+        {
+            match self.measure_train(span, sound_at, &envelope, background, strongest, candidate) {
+                Ok(measured) => return Ok(measured),
+                Err(found @ ProbeFailure::NotFound { .. }) => {
+                    failure.get_or_insert(found);
+                    break;
+                }
+                Err(other) => {
+                    failure.get_or_insert(other);
+                }
+            }
+        }
+        Err(failure.expect("a recording longer than a probe has a candidate"))
+    }
+
+    /// Claude: the train candidate number `candidate` makes of the probes'
+    /// strongest peaks `strongest`, each probe arriving at the earliest peak
+    /// the arrival rule allows, measured where at least `AGREEING` agree.
+    fn measure_train(
+        &self,
+        span: &Span,
+        sound_at: [f64; 5],
+        envelope: &[f64],
+        background: f64,
+        strongest: [usize; TRAIN.len()],
+        candidate: usize,
+    ) -> Result<Measured, ProbeFailure> {
         let ticks_per_second = crate::host_time::ticks_per_second();
         let detailed = tracing::enabled!(Level::DEBUG);
         let late_ms = |index: usize, k: usize| {
             (span.date(index as f64) - sound_at[k]) / ticks_per_second * 1e3
         };
-        let strongest = self.strongest_train(&envelope, background);
         debug!(
+            candidate,
             background_dbfs = %format!("{:.1}", db(background / self.floor) + FLOOR_DBFS),
             first_strongest_ms = %format!("{:+.2}", late_ms(strongest[0], 0)),
             "calibration train aligned"
@@ -236,7 +268,7 @@ impl Detector {
         let mut arrivals: Vec<(usize, f64)> = heard
             .iter()
             .filter_map(|&(k, peak)| {
-                let found = self.arrival(&envelope, peak, background, detailed);
+                let found = self.arrival(envelope, peak, background, detailed);
                 let level = envelope[peak];
                 let peaks = |indices: &[usize]| {
                     indices
@@ -316,7 +348,7 @@ impl Detector {
         let mut probes: Vec<(f64, f64)> = agreeing
             .iter()
             .map(|&(k, at)| {
-                let index = refine(&envelope, at + offset(k));
+                let index = refine(envelope, at + offset(k));
                 (
                     (span.date(index) - sound_at[k]) / ticks_per_second,
                     sound_at[k],
@@ -368,11 +400,13 @@ impl Detector {
         })
     }
 
-    /// Claude: each probe's strongest peak where the train is strongest: the
-    /// alignment of the layout with the most probes heard within
-    /// `NEAR_SECONDS` of their places, and of those, the loudest in decibels
-    /// summed, so that one loud sound cannot outweigh a whole train.
-    fn strongest_train(&self, envelope: &[f64], background: f64) -> [usize; TRAIN.len()] {
+    /// Claude: candidate trains, each its probes' strongest peaks within
+    /// `NEAR_SECONDS` of their places in an alignment of the layout: the most
+    /// probes heard first, and of those the loudest in decibels summed, so
+    /// that one loud sound cannot outweigh a whole train. An alignment within
+    /// `LOOKBACK_SECONDS` of a better one is that train's other paths, which
+    /// its arrival rule weighs, and no candidate of its own.
+    fn candidates(&self, envelope: &[f64], background: f64) -> Vec<[usize; TRAIN.len()]> {
         let block = ((NEAR_SECONDS * self.rate) as usize).max(1);
         let blocks: Vec<f64> = envelope
             .chunks(block)
@@ -398,20 +432,34 @@ impl Detector {
         };
         let span = blocks.len().saturating_sub(places[TRAIN.len() - 1]);
         let scores: Vec<(usize, f64)> = (0..span.max(1)).map(score).collect();
-        let best = (0..scores.len())
-            .max_by(|&a, &b| {
-                let ((count_a, sum_a), (count_b, sum_b)) = (scores[a], scores[b]);
-                count_a.cmp(&count_b).then(sum_a.total_cmp(&sum_b))
+        let mut ranked: Vec<usize> = (0..scores.len()).collect();
+        ranked.sort_by(|&a, &b| {
+            let ((count_a, sum_a), (count_b, sum_b)) = (scores[a], scores[b]);
+            count_b.cmp(&count_a).then(sum_b.total_cmp(&sum_a))
+        });
+        let same_train = (LOOKBACK_SECONDS * self.rate) as usize / block;
+        let mut chosen: Vec<usize> = Vec::new();
+        for alignment in ranked {
+            if chosen
+                .iter()
+                .all(|&better| better.abs_diff(alignment) > same_train)
+            {
+                chosen.push(alignment);
+            }
+        }
+        chosen
+            .into_iter()
+            .map(|alignment| {
+                places.map(|place| {
+                    let around = near(alignment + place);
+                    let from = around.start * block;
+                    let to = (around.end * block).min(envelope.len());
+                    (from..to.max(from + 1).min(envelope.len()))
+                        .max_by(|&a, &b| envelope[a].total_cmp(&envelope[b]))
+                        .unwrap_or(from.min(envelope.len() - 1))
+                })
             })
-            .unwrap_or(0);
-        places.map(|place| {
-            let around = near(best + place);
-            let from = around.start * block;
-            let to = (around.end * block).min(envelope.len());
-            (from..to.max(from + 1).min(envelope.len()))
-                .max_by(|&a, &b| envelope[a].total_cmp(&envelope[b]))
-                .unwrap_or(from.min(envelope.len() - 1))
-        })
+            .collect()
     }
 
     /// Claude: the earliest peak within `ARRIVAL_DB` of `strongest`, at most
@@ -680,6 +728,31 @@ mod tests {
         for sample in &mut span.samples[burst] {
             *sample += (0.3 * deviates.normal()) as f32;
         }
+        let measured = Detector::new(48_000.0)
+            .measure(&span, sound_at)
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        assert!((measured.residual - 0.031).abs() < 1e-5, "{measured:?}");
+    }
+
+    /// Claude: four strong probes agreeing at +31 ms, and all five 40 dB
+    /// weaker, scattered about +800 ms, as a second, quieter sound of the same
+    /// probes might be: the agreeing train is measured, though the scattered
+    /// one has more probes heard.
+    #[test]
+    fn a_valid_train_beats_one_with_more_probes_heard_that_disagree() {
+        let mut paths = vec![Path {
+            delay: 0.031,
+            gain: 0.3,
+            probes: Some(vec![0, 1, 2, 3]),
+        }];
+        for (k, scatter) in [-0.002, 0.0015, -0.001, 0.002, 0.0].into_iter().enumerate() {
+            paths.push(Path {
+                delay: 0.8 + scatter,
+                gain: 0.3 * db(-40.0),
+                probes: Some(vec![k]),
+            });
+        }
+        let (span, sound_at) = recorded(48_000.0, &paths, 1e-4);
         let measured = Detector::new(48_000.0)
             .measure(&span, sound_at)
             .unwrap_or_else(|failure| panic!("{failure}"));
