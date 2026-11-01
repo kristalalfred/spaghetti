@@ -3,7 +3,7 @@
 //! is needed.
 
 use std::error::Error;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, IsTerminal};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
@@ -72,6 +72,7 @@ fn receivers() -> Result<Vec<AirPlayReceiverInfo>, String> {
 }
 
 pub fn run(args: CalibrateArgs, out: Output) -> Result<(), Box<dyn Error>> {
+    log_to_stderr();
     let plain = SrtArgs {
         latency: None,
         passphrase: None,
@@ -115,6 +116,18 @@ pub fn run(args: CalibrateArgs, out: Output) -> Result<(), Box<dyn Error>> {
         Err(CalibrationFailure::Cancelled) => std::process::exit(130),
         Err(failure) => Err(failure.to_string().into()),
     }
+}
+
+/// Claude: the engine runs in this process, so what it warns of goes to
+/// standard error, beside the command's own output; `RUST_LOG` says more.
+fn log_to_stderr() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .try_init();
 }
 
 /// Claude: refuses to calibrate an AirPlay receiver the daemon listening on

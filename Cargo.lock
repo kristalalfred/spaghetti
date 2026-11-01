@@ -1859,6 +1859,7 @@ dependencies = [
  "spaghetti-common",
  "spaghetti-engine",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
