@@ -169,6 +169,9 @@ pub enum RecordingFailure {
     Stalled,
     /// Claude: frames the source did not date.
     Undated,
+    /// Claude: dates that did not keep up with the host clock, or with the
+    /// frames they date.
+    Behind,
     /// Claude: frames missing or repeated.
     Gap,
     Clipped,
@@ -181,6 +184,7 @@ impl std::fmt::Display for RecordingFailure {
             Self::Unavailable(reason) => write!(f, "the recording could not go on: {reason}"),
             Self::Stalled => f.write_str("the recording stopped delivering audio"),
             Self::Undated => f.write_str("the recording has frames its source did not date"),
+            Self::Behind => f.write_str("the recording's dates did not keep up with the clock"),
             Self::Gap => f.write_str("the recording misses or repeats frames"),
             Self::Clipped => {
                 f.write_str("the recording clipped: lower the volume or move the microphone away")

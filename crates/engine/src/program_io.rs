@@ -262,6 +262,18 @@ impl ProgramInput {
             .record((count * CHANNELS * size_of::<f32>()) as u64, now);
     }
 
+    #[cfg(test)]
+    pub(crate) fn push_undated(&mut self, frames: Frames<'_>) {
+        let now = host_time::now();
+        unsafe {
+            self.shared.sinks.for_each(|ring| {
+                ring.push_with(frames.len(), now, Captured::Unknown, |frame, channel| {
+                    frames.sample(frame, channel)
+                });
+            });
+        }
+    }
+
     /// Claude: real-time safe. The next push starts over, as after a capture
     /// that failed or restarted, however it is dated.
     pub fn discontinuity(&mut self) {

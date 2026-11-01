@@ -33,6 +33,11 @@ const LATE: f64 = 2.0;
 const READY_LIMIT: f64 = 25.0;
 /// Claude: how long the recording may pause once it delivered.
 const STALL: f64 = 0.5;
+/// Claude: how far behind the host clock the recording may date its audio:
+/// each train must be recorded through this long after it ends, and the
+/// recording may hold this much more than was captured since the earliest
+/// audio a train needs.
+pub(super) const RECORDING_LAG: f64 = 2.0;
 const SEQUENCE: [Role; 3] = [Role::Reference, Role::Output, Role::Reference];
 
 /// Claude: one destination as the calibration plays to it.
@@ -312,6 +317,21 @@ impl Job {
         if quiet {
             return Err(CalibrationFailure::Recording(RecordingFailure::Stalled));
         }
+        let needed = self
+            .trains
+            .first()
+            .map_or(now.saturating_sub((EARLY * ticks) as u64), |train| {
+                train.from
+            });
+        listening.recorder.forget_before(needed);
+        let track = listening.recorder.track();
+        let held = track.frames_since(needed) as f64 / listening.sample_rate;
+        let overdue = self.trains.iter().any(|train| {
+            seconds(train.to) > RECORDING_LAG && track.reached().is_none_or(|end| end <= train.to)
+        });
+        if overdue || held > seconds(needed) + RECORDING_LAG {
+            return Err(CalibrationFailure::Recording(track.falling_behind()));
+        }
 
         for leg in &mut self.legs {
             let Some(playing) = &leg.playing else {
@@ -460,6 +480,23 @@ impl Job {
     pub fn legs(&self) -> &[Leg; 2] {
         &self.legs
     }
+
+    /// Claude: when each train's search ends, in seconds from opening.
+    #[cfg(test)]
+    pub fn train_ends(&self) -> Vec<f64> {
+        let ticks = host_time::ticks_per_second();
+        self.trains
+            .iter()
+            .map(|train| (train.to - self.started) as f64 / ticks)
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub fn held_seconds(&self) -> f64 {
+        self.listening.as_ref().map_or(0.0, |listening| {
+            listening.recorder.track().held_frames() as f64 / listening.sample_rate
+        })
+    }
 }
 
 fn index(role: Role) -> usize {
@@ -470,5 +507,5 @@ fn index(role: Role) -> usize {
 }
 
 fn listening_end(listening: Option<&Listening>) -> Option<u64> {
-    listening?.recorder.track().end_date()
+    listening?.recorder.track().reached()
 }

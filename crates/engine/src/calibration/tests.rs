@@ -5,10 +5,11 @@
 //! dates what the microphone captures with a bias of its own. Every expected
 //! value comes from what the room was told.
 
+use std::cell::Cell;
 use std::f64::consts::PI;
 use std::time::Duration;
 
-use super::job::Step;
+use super::job::{RECORDING_LAG, Step};
 use super::*;
 use crate::program_io::{Frames, ProgramInput, ProgramOutput};
 use crate::route_output::Output;
@@ -148,6 +149,18 @@ enum Fault {
     NotANumber {
         at: f64,
     },
+    /// Claude: from `from` on, every push undated.
+    Undated {
+        from: f64,
+    },
+    /// Claude: from `from` on, every push dated when `from` was.
+    Frozen {
+        from: f64,
+    },
+    /// Claude: from `from` on, every push delivered ten times over, undated.
+    Flooded {
+        from: f64,
+    },
 }
 
 struct Microphone {
@@ -190,12 +203,28 @@ impl Room {
             if at(start + frames) > t - LAG {
                 return;
             }
+            let since = |from: &f64| at(start) >= *from;
+            let undated = mic.faults.iter().any(|fault| match fault {
+                Fault::Undated { from } => since(from),
+                _ => false,
+            });
+            let frozen = mic.faults.iter().find_map(|fault| match fault {
+                Fault::Frozen { from } if since(from) => Some(*from),
+                _ => None,
+            });
+            let flooded = mic.faults.iter().any(|fault| match fault {
+                Fault::Flooded { from } => since(from),
+                _ => false,
+            });
             let firing = mic.faults.iter().position(|fault| {
                 let when = match fault {
                     Fault::Missing { at, .. }
                     | Fault::Repeated { at, .. }
                     | Fault::Clipped { at, .. }
                     | Fault::NotANumber { at } => *at,
+                    Fault::Undated { .. } | Fault::Frozen { .. } | Fault::Flooded { .. } => {
+                        return false;
+                    }
                 };
                 (at(start)..at(start + frames)).contains(&when)
             });
@@ -237,10 +266,16 @@ impl Room {
                 _ => {}
             }
             let date = |frame: usize| {
-                let t = at(frame);
+                let t = frozen.unwrap_or(at(frame));
                 HostTime::from_ticks(self.origin + ((t + mic.bias + mic.drift * t) * ticks) as u64)
             };
             match fault {
+                _ if flooded => {
+                    for _ in 0..10 {
+                        mic.input.push_undated(Frames::mono(&samples).unwrap());
+                    }
+                }
+                _ if undated => mic.input.push_undated(Frames::mono(&samples).unwrap()),
                 Some(Fault::Missing { .. }) => {}
                 Some(Fault::Repeated { .. }) => {
                     mic.input.push(Frames::mono(&samples).unwrap(), date(start));
@@ -679,6 +714,78 @@ fn frames_the_microphone_lost_or_repeated_fail_without_a_marked_discontinuity() 
             CalibrationFailure::Recording(RecordingFailure::Gap)
         );
     }
+}
+
+/// Claude: how long a calibration of `setup` ran, the most audio it held at
+/// once in seconds, when its trains' searches ended, and how it ended.
+struct Held {
+    ran: f64,
+    most: f64,
+    train_ends: Vec<f64>,
+    result: Result<Calibrated, CalibrationFailure>,
+}
+
+fn held(setup: &Setup) -> Held {
+    let (ran, most, ends) = (Cell::new(0.0), Cell::new(0.0f64), Cell::new(Vec::new()));
+    let result = run(setup, |t, job| {
+        ran.set(t);
+        most.set(most.get().max(job.held_seconds()));
+        ends.set(job.train_ends());
+    })
+    .result;
+    Held {
+        ran: ran.get(),
+        most: most.get(),
+        train_ends: ends.take(),
+        result,
+    }
+}
+
+#[test]
+fn a_recording_that_stops_dating_or_freezes_its_dates_fails_once_a_train_is_overdue() {
+    for (fault, from, failure) in [
+        (Fault::Undated { from: 2.0 }, 2.0, RecordingFailure::Undated),
+        (Fault::Frozen { from: 2.0 }, 2.0, RecordingFailure::Behind),
+        (Fault::Undated { from: 9.0 }, 9.0, RecordingFailure::Undated),
+        (Fault::Frozen { from: 9.0 }, 9.0, RecordingFailure::Behind),
+    ] {
+        let setup = Setup {
+            faults: vec![fault],
+            ..Setup::new(Place::at(10.0, 1.0), Place::at(2.0, 1.0))
+        };
+        let held = held(&setup);
+        assert_eq!(
+            held.result,
+            Err(CalibrationFailure::Recording(failure.clone()))
+        );
+        let ends = held.train_ends.iter().find(|end| **end > from).unwrap();
+        let overdue = ends + RECORDING_LAG;
+        assert!(
+            (overdue..overdue + 0.02).contains(&held.ran),
+            "{failure:?} from {from} s: {} s, a train ending at {ends} s",
+            held.ran
+        );
+        assert!(held.most < held.ran, "{failure:?}: {} s held", held.most);
+    }
+}
+
+#[test]
+fn a_recording_flooding_undated_audio_fails_before_it_holds_much() {
+    let setup = Setup {
+        faults: vec![Fault::Flooded { from: 2.0 }],
+        ..Setup::new(Place::at(10.0, 1.0), Place::at(2.0, 1.0))
+    };
+    let held = held(&setup);
+    assert_eq!(
+        held.result,
+        Err(CalibrationFailure::Recording(RecordingFailure::Undated))
+    );
+    assert!(held.ran < 2.5, "{} s", held.ran);
+    assert!(
+        held.most < 2.0 + 2.0 * RECORDING_LAG,
+        "{} s held",
+        held.most
+    );
 }
 
 #[test]

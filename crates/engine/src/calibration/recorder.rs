@@ -50,6 +50,7 @@ impl Recorder {
             track: Track {
                 ticks_per_frame: host_time::ticks_per_second() / sample_rate,
                 first: 0,
+                reached: None,
                 left: Vec::new(),
                 right: Vec::new(),
                 pushes: Vec::new(),
@@ -87,11 +88,30 @@ impl Recorder {
                 track.right.push(frame[1]);
             }
             moved += read.frames;
+            track.reach();
         }
     }
 
     pub fn track(&self) -> &Track {
         &self.track
+    }
+
+    /// Claude: lets go of the recording before the push that covers `date`,
+    /// once that is at least as much as the recording keeps after it.
+    pub fn forget_before(&mut self, date: u64) {
+        let track = &mut self.track;
+        let Some(keep) = track.covering(date) else {
+            return;
+        };
+        let start = track.pushes[keep].start;
+        let forgotten = (start - track.first) as usize;
+        if forgotten == 0 || forgotten * 2 < track.left.len() {
+            return;
+        }
+        track.left.drain(..forgotten);
+        track.right.drain(..forgotten);
+        track.pushes.drain(..keep);
+        track.first = start;
     }
 
     /// Claude: whether the recording's source will deliver nothing more.
@@ -104,6 +124,8 @@ pub struct Track {
     ticks_per_frame: f64,
     /// Claude: the frame `left[0]` and `right[0]` hold.
     first: u64,
+    /// Claude: the latest the recording has dated the frame after its last.
+    reached: Option<u64>,
     left: Vec<f32>,
     right: Vec<f32>,
     pushes: Vec<Pushed>,
@@ -140,13 +162,51 @@ impl Span {
 }
 
 impl Track {
-    /// Claude: when the frame after the latest was captured, as far as the
-    /// latest push dates it.
-    pub fn end_date(&self) -> Option<u64> {
-        let last = self.pushes.last()?;
+    /// Claude: the latest date the recording reached: when the frame after
+    /// a push's last was captured, as far as that push dated it.
+    pub fn reached(&self) -> Option<u64> {
+        self.reached
+    }
+
+    fn reach(&mut self) {
+        let Some(last) = self.pushes.last() else {
+            return;
+        };
         let end = self.first + self.left.len() as u64;
-        last.captured
-            .map(|at| at + ((end - last.start) as f64 * self.ticks_per_frame) as u64)
+        let date = last
+            .captured
+            .map(|at| at + ((end - last.start) as f64 * self.ticks_per_frame) as u64);
+        self.reached = self.reached.max(date);
+    }
+
+    /// Claude: how many frames the recording holds from the push that covers
+    /// `date` on, or in all when none does.
+    pub fn frames_since(&self, date: u64) -> u64 {
+        let start = self
+            .covering(date)
+            .map_or(self.first, |push| self.pushes[push].start);
+        self.first + self.left.len() as u64 - start
+    }
+
+    #[cfg(test)]
+    pub fn held_frames(&self) -> usize {
+        self.left.len()
+    }
+
+    /// Claude: why a recording whose dates do not reach as far as they should
+    /// fails.
+    pub fn falling_behind(&self) -> RecordingFailure {
+        match self.pushes.last() {
+            Some(push) if push.captured.is_none() => RecordingFailure::Undated,
+            _ => RecordingFailure::Behind,
+        }
+    }
+
+    /// Claude: the latest push dated at or before `date`.
+    fn covering(&self, date: u64) -> Option<usize> {
+        self.pushes
+            .iter()
+            .rposition(|push| push.captured.is_some_and(|captured| captured <= date))
     }
 
     /// Claude: the recording from `from` to `to`, once it is all there and
@@ -155,19 +215,14 @@ impl Track {
     /// within a quarter frame of the line through them), nothing clipped or
     /// not finite. None while the recording has not reached `to` yet.
     pub fn span(&self, from: u64, to: u64) -> Option<Result<Span, RecordingFailure>> {
-        if self.end_date()? <= to {
+        if self.reached()? <= to {
             return None;
         }
         Some(self.checked(from, to))
     }
 
     fn checked(&self, from: u64, to: u64) -> Result<Span, RecordingFailure> {
-        let covering = |at: u64| {
-            self.pushes
-                .iter()
-                .rposition(|push| push.captured.is_some_and(|captured| captured <= at))
-        };
-        let (Some(first), Some(last)) = (covering(from), covering(to)) else {
+        let (Some(first), Some(last)) = (self.covering(from), self.covering(to)) else {
             return Err(RecordingFailure::Gap);
         };
         let pushes = &self.pushes[first..=last];
@@ -375,6 +430,66 @@ mod tests {
             Some(Err(RecordingFailure::Gap))
         ));
         assert!(fed.span(10.0, 4000.0).unwrap().is_ok());
+    }
+
+    #[test]
+    fn forgetting_keeps_the_push_that_covers_the_date_and_all_after_it() {
+        let mut fed = Fed::new();
+        fed.program(0, 100, 480, 0.0);
+        fed.recorder.drain();
+        fed.recorder.forget_before(fed.at(30_000.0));
+        assert_eq!(fed.recorder.track().first, 29_760);
+        assert_eq!(
+            fed.recorder.track().frames_since(fed.at(30_000.0)),
+            48_000 - 29_760
+        );
+        let span = fed.span(30_000.0, 40_000.0).unwrap().unwrap();
+        let from = fed.at(30_000.0) as f64;
+        let frame = host_time::ticks_per_second() / RATE;
+        assert!((0.0..frame).contains(&(from - span.date(0.0))));
+        assert!((span.samples[0] - 0.1).abs() < 1e-6);
+        assert!(matches!(
+            fed.span(25_000.0, 40_000.0),
+            Some(Err(RecordingFailure::Gap))
+        ));
+    }
+
+    #[test]
+    fn forgetting_waits_until_it_lets_go_of_as_much_as_it_keeps() {
+        let mut fed = Fed::new();
+        fed.program(0, 100, 480, 0.0);
+        fed.recorder.drain();
+        fed.recorder.forget_before(fed.at(20_000.0));
+        assert_eq!(fed.recorder.track().first, 0);
+        fed.recorder.forget_before(fed.at(24_000.0));
+        assert_eq!(fed.recorder.track().first, 24_000);
+    }
+
+    #[test]
+    fn continuous_undated_or_frozen_pushes_are_never_forgotten_past_and_fail_as_such() {
+        let mut fed = Fed::new();
+        fed.program(0, 10, 480, 0.0);
+        for _ in 0..1000 {
+            fed.push(480, Captured::Unknown, [0.1, 0.1]);
+            fed.recorder.drain();
+        }
+        let late = fed.at(400_000.0);
+        fed.recorder.forget_before(late);
+        let track = fed.recorder.track();
+        assert_eq!(track.frames_since(late), 1010 * 480 - 4320);
+        assert_eq!(track.reached(), Some(fed.at(4800.0)));
+        assert_eq!(track.falling_behind(), RecordingFailure::Undated);
+
+        let mut fed = Fed::new();
+        for _ in 0..1000 {
+            fed.push(480, Captured::Measured(fed.at(0.0)), [0.1, 0.1]);
+            fed.recorder.drain();
+        }
+        fed.recorder.forget_before(late);
+        let track = fed.recorder.track();
+        assert_eq!(track.frames_since(late), 480);
+        assert_eq!(track.reached(), Some(fed.at(480.0)));
+        assert_eq!(track.falling_behind(), RecordingFailure::Behind);
     }
 
     #[test]
