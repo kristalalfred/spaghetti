@@ -1,3 +1,4 @@
+mod calibrate;
 mod client;
 mod daemon_mgmt;
 mod output;
@@ -103,6 +104,8 @@ enum Command {
     Monitor,
     /// List all Core Audio devices visible to the system
     SystemDevices,
+    /// Measure how much later a destination sounds than a reference where a microphone hears both, and the latency offset that aligns them
+    Calibrate(calibrate::CalibrateArgs),
     #[command(name = "airplay", about = "List AirPlay receivers")]
     AirPlay,
     /// Shut down the daemon
@@ -496,7 +499,7 @@ fn run_command(cmd: Command, out: Output) -> Result<(), Box<dyn Error>> {
             out.note("Daemon shut down.");
         }
 
-        Command::Daemon { .. } | Command::SystemDevices => {
+        Command::Daemon { .. } | Command::SystemDevices | Command::Calibrate(_) => {
             unreachable!("commands without the daemon are handled in main")
         }
     }
@@ -567,6 +570,7 @@ fn main() {
         // they work even when the daemon is not running.
         Some(Command::Daemon { action }) => run_daemon(action, out).map_err(Into::into),
         Some(Command::SystemDevices) => list_system_devices(out),
+        Some(Command::Calibrate(args)) => calibrate::run(args, out),
         Some(cmd) => run_command(cmd, out),
     };
     if let Err(e) = result {

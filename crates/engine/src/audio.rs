@@ -20,6 +20,30 @@ pub fn find_device_by_uid(target_uid: &str) -> Option<AudioObjectID> {
         .copied()
 }
 
+/// Claude: the UID of the input device the system records from by default.
+pub fn default_input_device() -> Option<String> {
+    let property_address = AudioObjectPropertyAddress {
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut device: AudioObjectID = 0;
+    let mut size = mem::size_of::<AudioObjectID>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            kAudioObjectSystemObject,
+            &property_address,
+            0,
+            ptr::null(),
+            &mut size,
+            (&mut device as *mut AudioObjectID).cast(),
+        )
+    };
+    (status == 0 && device != kAudioObjectUnknown)
+        .then(|| get_device_uid(device))
+        .flatten()
+}
+
 /// Enumerate all audio devices on the system.
 fn get_all_devices() -> Option<Vec<AudioObjectID>> {
     let property_address = AudioObjectPropertyAddress {
