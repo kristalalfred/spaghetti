@@ -1073,6 +1073,36 @@ fn an_output_that_steps_between_its_trains_is_not_calibrated() {
     );
 }
 
+/// Claude: `reference` heard again 40 dB under, `TRAINS_EVERY` and 28 ms
+/// later, as a room or a loopback might replay it: every output train's
+/// window holds a copy of the reference train before it, standing still
+/// about 30 ms after the output's schedule.
+fn leaking(mut reference: Place) -> Place {
+    reference.paths.push((TRAINS_EVERY + 0.028, 0.003));
+    reference
+}
+
+/// Claude: an output drifting 2.3 ms a second, with the reference leaking
+/// into every output train's window, is not calibrated to the leak: its
+/// louder trains moved. Standing still, the same output is measured true.
+#[test]
+fn reference_leaking_into_the_output_trains_does_not_stand_in_for_a_moving_output() {
+    let mut output = Place::at(23.3, 1.7);
+    output.moving = Some(Moving::Drifting { per_second: 0.0023 });
+    let held = held(&Setup::new(output, leaking(Place::at(2.2, 0.4))));
+    let Err(CalibrationFailure::Unsettled {
+        role: Role::Output,
+        movement: Movement::AgainstSchedule { ms_per_second },
+        ..
+    }) = held.result
+    else {
+        panic!("{:?}", held.result)
+    };
+    assert!((ms_per_second - 2.3).abs() < 0.05, "{ms_per_second}");
+    let still = Setup::new(Place::at(23.3, 1.7), leaking(Place::at(2.2, 0.4)));
+    assert_measures(&still, &calibrated(&still));
+}
+
 #[test]
 fn a_calibration_waiting_for_its_output_to_settle_cancels() {
     let mut output = Place::at(23.3, 1.7);
