@@ -27,7 +27,7 @@ spaghetti routes
 spaghetti volume 1 0.8
 ```
 
-Use an output UID from `system-devices` and a route ID from `routes`.
+Use an output UID from `system-devices` and a route ID from `routes`. `system-devices` lists each device's input and output channels, and needs no daemon.
 
 Play a source in step on several outputs by giving each route the same delay in milliseconds. Each frame then sounds that long after it was captured, including on Macs that receive the source over WebRTC. Taps and WebRTC sources can play on a delay; SRT sources cannot:
 
@@ -41,6 +41,15 @@ Routes play in step as far as each output reports its own latency. `--latency-of
 ```sh
 spaghetti route 1 '<device-uid>' --delay 300 --latency-offset 20
 ```
+
+`calibrate` measures the offset with a microphone. It plays probe trains through a reference, then the destination, then the reference again, each on its own delay, and prints how late each was heard against its schedule and the `--latency-offset` that makes the destination sound with the reference where the microphone is. The microphone's own timing cancels out; moving the microphone changes the result. It runs in the CLI process, with the default input unless `--microphone` names an input UID, and plays audible chirps. `--latency-offset` and `--reference-latency-offset` measure with offsets already applied; calibrating again with the printed offset prints it again. Ctrl-C stops it:
+
+```sh
+spaghetti calibrate 'airplay://Kitchen' --reference BuiltInSpeakerDevice
+spaghetti route 1 'airplay://Kitchen' --delay 3000 --latency-offset 212
+```
+
+A destination and its reference play on `--delay`, 3000 ms unless given, and `--reference-delay`, the same unless given. A receiver a daemon route plays to is refused.
 
 Play a source on an AirPlay receiver. An AirPlay route always plays on a delay of at least about 2.1 s; the error for a shorter delay gives the minimum for the source. Give a local route the same delay to play in step:
 
@@ -113,6 +122,8 @@ fn example(captured: &[f32], left: &mut [f32], right: &mut [f32]) -> Result<(), 
 | Discontinuities | A push dated more than 1 ms off where the previous one ended, a push a route had no room for, and a push after `ProgramInput::discontinuity` each start a new run. A route drops what it still holds from before the new run and primes again. |
 | Several routes | One output mixes up to `MAX_PROGRAM_ROUTES` (8) routes. One input feeds up to 8 routes. |
 | Removal | `remove_program_input` destroys the sources made from the input. `remove_program_output` fades out and destroys the routes to the output. The real-time ends keep working: an input feeds nothing, an output renders silence. Drop them outside the real-time thread. |
+| Input devices | macOS only. `SourceSpec::Input { device_uid }` captures a Core Audio input device's first input stream, its first two channels or its one channel on both, while a route or calibration takes its frames. Each frame is dated by the device's time stamp less its input latency, and a change to the device's format, rate, latency or streams, or its removal, ends the source as `Lost`, with the reason in `SourceInfo::failure`. |
+| Calibration | `Router::calibrate` measures how much later one destination on a delay sounds than another where a recording hears both, a `Recording::Input` device or a `Recording::Program` input that dates its pushes, and returns at once. `Calibrating::state` reports progress and the result: both residuals and the output's `latency_offset_ms` that aligns it with the reference. The calibration holds its AirPlay receivers and program outputs against new routes while it runs, ends with `EndpointRemoved` when a program input or output it uses is removed or the router drops, and releases everything it opened before reporting `Done`. `Calibrating::cancel`, or dropping the handle, stops it. A program input recording must date each push within a quarter frame of the line through its pushes. |
 | State | `Router::list_routes` reports each device or program route's `Playback`: `Playing` when the output's latest render played the route's source at any volume, `Silent` while the route waits for audio or for its schedule or after a refused render, and `Stopped` when the output has not rendered for 100 ms plus 4096 frames at its rate. `list_sources` reports a program source as `Idle` without routes, then `Connected`, `Flowing` while the input pushes, and `Stalled` 3 s after it stops. |
 
 The engine also builds for iOS (`aarch64-apple-ios`, `aarch64-apple-ios-sim`). Those targets have no Core Audio HAL: process taps, input and output devices and the virtual-device functions are unavailable, and a `SourceSpec::Tap`, `SourceSpec::Input` or `Destination::Device` is refused when it is created. Program I/O, SRT, WebRTC and AirPlay remain available.
