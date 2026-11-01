@@ -240,7 +240,7 @@ impl std::fmt::Display for ProbeFailure {
                 "the probes were not heard: {heard} of the {} stood 20 dB above the background, \
                  where {required} must; the loudest of the others stood {above_background_db:.0} \
                  dB above it",
-                probe::TRAIN.len()
+                probe::PROBES
             ),
             Self::Ambiguous {
                 ambiguous,

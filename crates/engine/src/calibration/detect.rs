@@ -1,32 +1,33 @@
-//! Claude: finding a train in a recording. A matched filter turns the
-//! recording into the envelope of its correlation with the probe. Each
-//! alignment of the train's layout that gives its probes their strongest
-//! peaks is a candidate. One with `AGREEING` probes heard is significant
-//! within `ARRIVAL_DB` of the loudest such, and a group, one path of the
-//! train, when its probes, each arriving where its own cluster of peaks
-//! starts, agree with the layout. A train is measured only when every
-//! significant candidate is a group. Otherwise the loudest that is not fails
-//! it by its own arrivals, as `Moved` or `Disagree`, so that no quieter train
-//! or later echo stands in for a louder sound left unexplained. The train
-//! arrives with the earliest significant group, and an earlier group up to
-//! `AMBIGUITY_DB` under the loudest makes it ambiguous; no group under the
-//! significant ones removes or excludes anything. Each probe's arrival is
-//! then the earliest peak heard within `ARRIVAL_DB` of the arriving group's,
-//! up to `LOOKBACK_SECONDS` before it, that no later, stronger peak's
-//! sidelobes explain and that is not where a significant group has another
-//! of its probes. So a direct path heard under a later echo is still found,
-//! while a speaker's pre-ringing and the probe's sidelobes, which stand
-//! further under the arrival, never are. The train is measured where at
-//! least four probes' arrivals agree with its layout; with no candidate
-//! heard, the best-ranked is measured, to say why it fails.
+//! Claude: finding a train in a recording. A matched filter turns the recording
+//! into the envelope of its correlation with the train's role's probe, which
+//! answers the other role's probe 32.6 dB under its own, smeared over a third
+//! of a second rather than a peak. Each alignment of the train's layout that
+//! gives its probes their strongest peaks is a candidate. One with `AGREEING`
+//! probes heard is significant within `ARRIVAL_DB` of the loudest such, and a
+//! group, one path of the train, when its probes, each arriving where its own
+//! cluster of peaks starts, agree with the layout. A train is measured only
+//! when every significant candidate is a group. Otherwise the loudest that is
+//! not fails it by its own arrivals, as `Moved` or `Disagree`, so that no
+//! quieter train or later echo stands in for a louder sound left unexplained.
+//! The train arrives with the earliest significant group, and an earlier group
+//! up to `AMBIGUITY_DB` under the loudest makes it ambiguous; no group under
+//! the significant ones removes or excludes anything. Each probe's arrival is
+//! then the earliest peak heard within `ARRIVAL_DB` of the arriving group's, up
+//! to `LOOKBACK_SECONDS` before it, that no later, stronger peak's sidelobes
+//! explain and that is not where a significant group has another of its probes.
+//! So a direct path heard under a later echo is still found, while a speaker's
+//! pre-ringing and the probe's sidelobes, which stand further under the
+//! arrival, never are. The train is measured where at least four probes'
+//! arrivals agree with its layout; with no candidate heard, the best-ranked is
+//! measured, to say why it fails.
 
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 use tracing::{Level, debug};
 
-use super::ProbeFailure;
-use super::probe::{LEVEL, TRAIN, probe};
+use super::probe::{LEVEL, PROBES, layout, probe};
 use super::recorder::Span;
+use super::{ProbeFailure, Role};
 
 /// Claude: the train is heard when at least `AGREEING` probes peak this far
 /// above the background, and only a peak this far above it is an arrival or
@@ -135,8 +136,11 @@ pub struct Measured {
     pub drift: f64,
 }
 
+/// Claude: what finds one role's trains: its probe as the template, its
+/// layout, and the sidelobes of its probe's correlation with itself.
 pub struct Detector {
     rate: f64,
+    layout: [f64; PROBES],
     template: Vec<f32>,
     /// Claude: the template's spectrum at the latest FFT size it was needed at.
     spectrum: (usize, Vec<Complex<f64>>),
@@ -149,10 +153,11 @@ pub struct Detector {
 }
 
 impl Detector {
-    pub fn new(rate: f64) -> Self {
-        let template = probe(rate);
+    pub fn new(rate: f64, role: Role) -> Self {
+        let template = probe(rate, role);
         let mut detector = Self {
             rate,
+            layout: layout(role),
             spectrum: (0, Vec::new()),
             sidelobes: Vec::new(),
             floor: 0.0,
@@ -172,10 +177,6 @@ impl Detector {
             .collect();
         detector.floor = peak * ratio(FLOOR_DBFS) / LEVEL;
         detector
-    }
-
-    pub fn rate(&self) -> f64 {
-        self.rate
     }
 
     /// Claude: the envelope of `signal`'s correlation with the template at
@@ -343,7 +344,7 @@ impl Detector {
         &self,
         envelope: &[f64],
         background: f64,
-        strongest: &[usize; TRAIN.len()],
+        strongest: &[usize; PROBES],
     ) -> Option<f64> {
         let mut levels: Vec<f64> = strongest
             .iter()
@@ -361,9 +362,9 @@ impl Detector {
         &self,
         envelope: &[f64],
         background: f64,
-        strongest: &[usize; TRAIN.len()],
+        strongest: &[usize; PROBES],
     ) -> Vec<(f64, f64, usize)> {
-        let offset = |k: usize| (TRAIN[k] * self.rate).round();
+        let offset = |k: usize| (self.layout[k] * self.rate).round();
         let mut arrivals: Vec<(f64, f64, usize)> = strongest
             .iter()
             .enumerate()
@@ -399,7 +400,7 @@ impl Detector {
         &self,
         envelope: &[f64],
         background: f64,
-        strongest: &[usize; TRAIN.len()],
+        strongest: &[usize; PROBES],
         (candidate, level): (usize, f64),
     ) -> Option<Group> {
         let arrivals = self.cluster_arrivals(envelope, background, strongest);
@@ -423,7 +424,7 @@ impl Detector {
         &self,
         envelope: &[f64],
         background: f64,
-        strongest: &[usize; TRAIN.len()],
+        strongest: &[usize; PROBES],
     ) -> ProbeFailure {
         let arrivals = self.cluster_arrivals(envelope, background, strongest);
         let by_probe: Vec<(usize, f64)> = arrivals.iter().map(|&(at, _, k)| (k, at)).collect();
@@ -460,7 +461,7 @@ impl Detector {
         envelope: &[f64],
         background: f64,
         groups: &[&Group],
-        (candidate, strongest): (usize, [usize; TRAIN.len()]),
+        (candidate, strongest): (usize, [usize; PROBES]),
     ) -> Result<Measured, ProbeFailure> {
         let ticks_per_second = crate::host_time::ticks_per_second();
         let detailed = tracing::enabled!(Level::DEBUG);
@@ -503,7 +504,7 @@ impl Detector {
             });
         }
 
-        let offset = |k: usize| (TRAIN[k] * self.rate).round();
+        let offset = |k: usize| (self.layout[k] * self.rate).round();
         let mut arrivals: Vec<(usize, f64)> = heard
             .iter()
             .filter_map(|&(k, peak)| {
@@ -637,7 +638,7 @@ impl Detector {
         }
         let points: Vec<(f64, f64)> = arrivals
             .iter()
-            .map(|&(k, at)| (TRAIN[k], at / self.rate))
+            .map(|&(k, at)| (self.layout[k], at / self.rate))
             .collect();
         let (slope, mean_t, mean_at) = fit(&points);
         let residuals: Vec<f64> = points
@@ -664,9 +665,11 @@ impl Detector {
     /// alignment catching only part of a train's peaks is no candidate: the
     /// most probes heard first, and of those the loudest in decibels summed,
     /// so that one loud sound cannot outweigh a whole train.
-    fn candidates(&self, envelope: &[f64], background: f64) -> Vec<[usize; TRAIN.len()]> {
+    fn candidates(&self, envelope: &[f64], background: f64) -> Vec<[usize; PROBES]> {
         let block = ((NEAR_SECONDS * self.rate) as usize).max(1);
-        let offsets = TRAIN.map(|offset| (offset * self.rate).round() as usize);
+        let offsets = self
+            .layout
+            .map(|offset| (offset * self.rate).round() as usize);
         let phases = offsets.map(|offset| offset % block);
         let places = offsets.map(|offset| offset / block);
         let blocks = phases.map(|phase| {
@@ -681,7 +684,7 @@ impl Detector {
         };
         let heard = background * ratio(HEARD_DB);
         let score = |alignment: usize| -> (usize, f64) {
-            (0..TRAIN.len())
+            (0..PROBES)
                 .map(|k| near(k, alignment).map(|b| blocks[k][b]).fold(0.0, f64::max))
                 .fold((0, 0.0), |(count, sum), level| {
                     (
@@ -690,7 +693,7 @@ impl Detector {
                     )
                 })
         };
-        let span = (0..TRAIN.len())
+        let span = (0..PROBES)
             .map(|k| blocks[k].len().saturating_sub(places[k]))
             .min()
             .unwrap_or(0);
@@ -708,7 +711,7 @@ impl Detector {
             })
             .collect();
         ranked.sort_by(|&a, &b| better(b, a));
-        let mut candidates: Vec<[usize; TRAIN.len()]> = Vec::new();
+        let mut candidates: Vec<[usize; PROBES]> = Vec::new();
         for alignment in ranked {
             let strongest = std::array::from_fn(|k| {
                 let around = near(k, alignment);
@@ -846,6 +849,14 @@ mod tests {
     use crate::calibration::probe::probe_at;
     use crate::host_time;
 
+    /// Claude: the role a test's trains play as, unless it says otherwise.
+    const ROLE: Role = Role::Reference;
+    const ROLES: [Role; 2] = [Role::Reference, Role::Output];
+
+    fn train() -> [f64; PROBES] {
+        layout(ROLE)
+    }
+
     /// Claude: a reproducible stream of normal deviates.
     struct Noise(u64);
 
@@ -884,39 +895,62 @@ mod tests {
             .collect()
     }
 
-    /// Claude: a 5.3 s recording at `rate` of a train scheduled to sound
-    /// `SOUND` s in, arriving along each of `paths`, over noise of `noise`
-    /// RMS, and when each probe was scheduled.
-    fn recorded(rate: f64, paths: &[Path], noise: f64) -> (Span, [f64; 5]) {
+    /// Claude: a 5.3 s recording at `rate` of trains scheduled to sound
+    /// `SOUND` s in, each `(role, paths)` played with `role`'s probe on its
+    /// layout and arriving along each of `paths`, over noise of `noise` RMS,
+    /// and when each probe of `scheduled`'s train was scheduled.
+    fn recorded_as(
+        scheduled: Role,
+        rate: f64,
+        trains: &[(Role, &[Path])],
+        noise: f64,
+    ) -> (Span, [f64; 5]) {
         let ticks = host_time::ticks_per_second();
         let origin = 1e12;
         let mut deviates = Noise(0x9e37_79b9_7f4a_7c15 ^ rate.to_bits());
         let samples = (0..(5.3 * rate) as usize)
             .map(|i| {
                 let t = i as f64 / rate;
-                let train: f64 = paths
+                let train: f64 = trains
                     .iter()
-                    .flat_map(|path| {
-                        TRAIN.iter().enumerate().map(move |(k, offset)| {
-                            let heard = path.probes.as_ref().is_none_or(|on| on.contains(&k));
-                            if heard {
-                                path.gain * probe_at(t - SOUND - offset - path.delay)
-                            } else {
-                                0.0
-                            }
-                        })
+                    .flat_map(|&(role, paths)| paths.iter().map(move |path| (role, path)))
+                    .flat_map(|(role, path)| {
+                        layout(role)
+                            .into_iter()
+                            .enumerate()
+                            .map(move |(k, offset)| {
+                                let heard = path.probes.as_ref().is_none_or(|on| on.contains(&k));
+                                if heard {
+                                    path.gain * probe_at(role, t - SOUND - offset - path.delay)
+                                } else {
+                                    0.0
+                                }
+                            })
                     })
                     .sum();
                 (train + noise * deviates.normal()) as f32
             })
             .collect();
-        let sound_at = TRAIN.map(|offset| origin + (SOUND + offset) * ticks);
+        let sound_at = layout(scheduled).map(|offset| origin + (SOUND + offset) * ticks);
         (Span::linear(samples, origin, ticks / rate), sound_at)
     }
 
+    fn recorded(rate: f64, paths: &[Path], noise: f64) -> (Span, [f64; 5]) {
+        recorded_as(ROLE, rate, &[(ROLE, paths)], noise)
+    }
+
+    fn measure_as(
+        role: Role,
+        rate: f64,
+        taps: &[(f64, f64)],
+        noise: f64,
+    ) -> Result<Measured, ProbeFailure> {
+        let (span, sound_at) = recorded_as(role, rate, &[(role, &paths(taps))], noise);
+        Detector::new(rate, role).measure(&span, sound_at)
+    }
+
     fn measure(rate: f64, taps: &[(f64, f64)], noise: f64) -> Result<Measured, ProbeFailure> {
-        let (span, sound_at) = recorded(rate, &paths(taps), noise);
-        Detector::new(rate).measure(&span, sound_at)
+        measure_as(ROLE, rate, taps, noise)
     }
 
     fn db(db: f64) -> f64 {
@@ -925,16 +959,21 @@ mod tests {
 
     #[test]
     fn a_train_is_found_where_it_arrived_to_a_fraction_of_a_sample() {
-        for rate in [16_000.0, 44_100.0, 48_000.0, 96_000.0] {
-            for frames in [0.0, 0.25, 0.5, 0.73, 4801.4] {
-                let delay = 0.0123 + frames / rate;
-                let measured = measure(rate, &[(delay, 0.3)], 1e-4).unwrap();
-                let error = (measured.residual - delay) * rate;
-                assert!(
-                    error.abs() < 0.05,
-                    "{rate} Hz, {delay} s: {error} frames off"
-                );
-                assert!(measured.spread * rate < 0.1, "{rate} Hz: {measured:?}");
+        for role in ROLES {
+            for rate in [16_000.0, 44_100.0, 48_000.0, 96_000.0] {
+                for frames in [0.0, 0.25, 0.5, 0.73, 4801.4] {
+                    let delay = 0.0123 + frames / rate;
+                    let measured = measure_as(role, rate, &[(delay, 0.3)], 1e-4).unwrap();
+                    let error = (measured.residual - delay) * rate;
+                    assert!(
+                        error.abs() < 0.05,
+                        "{role}, {rate} Hz, {delay} s: {error} frames off"
+                    );
+                    assert!(
+                        measured.spread * rate < 0.1,
+                        "{role}, {rate} Hz: {measured:?}"
+                    );
+                }
             }
         }
     }
@@ -943,7 +982,7 @@ mod tests {
     /// over noise of `noise` RMS at 48 kHz: the probe's energy against the
     /// median envelope of filtered noise, 1.177 standard deviations of it.
     fn level_db(gain: f64, noise: f64) -> f64 {
-        let template: Vec<f32> = probe(48_000.0);
+        let template: Vec<f32> = probe(48_000.0, ROLE);
         let energy: f64 = template.iter().map(|s| f64::from(*s).powi(2)).sum();
         let peak = gain * energy;
         20.0 * (peak / (1.1774 * noise * energy.sqrt())).log10()
@@ -951,16 +990,19 @@ mod tests {
 
     #[test]
     fn a_single_path_shows_no_early_arrival_and_no_ambiguity() {
-        for (gain, noise) in [
-            (1.0, 1e-6),
-            (0.5, 1e-4),
-            (0.05, 1e-3),
-            (0.01, 3e-3),
-            (0.3, 0.02),
-        ] {
+        for (role, (gain, noise)) in ROLES.into_iter().flat_map(|role| {
+            [
+                (1.0, 1e-6),
+                (0.5, 1e-4),
+                (0.05, 1e-3),
+                (0.01, 3e-3),
+                (0.3, 0.02),
+            ]
+            .map(|level| (role, level))
+        }) {
             let delay = 0.0371;
-            let label = format!("gain {gain}, noise {noise}");
-            let measured = measure(48_000.0, &[(delay, gain)], noise)
+            let label = format!("{role}, gain {gain}, noise {noise}");
+            let measured = measure_as(role, 48_000.0, &[(delay, gain)], noise)
                 .unwrap_or_else(|e| panic!("{label}: {e:?}"));
             assert!(
                 (measured.residual - delay).abs() * 48_000.0 < 0.2,
@@ -1000,7 +1042,7 @@ mod tests {
         for sample in &mut span.samples[burst] {
             *sample += (0.3 * deviates.normal()) as f32;
         }
-        let measured = Detector::new(48_000.0)
+        let measured = Detector::new(48_000.0, ROLE)
             .measure(&span, sound_at)
             .unwrap_or_else(|failure| panic!("{failure}"));
         assert!((measured.residual - 0.031).abs() < 1e-5, "{measured:?}");
@@ -1025,7 +1067,7 @@ mod tests {
             });
         }
         let (span, sound_at) = recorded(48_000.0, &paths, 1e-4);
-        let measured = Detector::new(48_000.0)
+        let measured = Detector::new(48_000.0, ROLE)
             .measure(&span, sound_at)
             .unwrap_or_else(|failure| panic!("{failure}"));
         assert!((measured.residual - 0.031).abs() < 1e-5, "{measured:?}");
@@ -1049,7 +1091,7 @@ mod tests {
             });
         }
         let (span, sound_at) = recorded(48_000.0, &paths, 1e-4);
-        let failure = Detector::new(48_000.0)
+        let failure = Detector::new(48_000.0, ROLE)
             .measure(&span, sound_at)
             .unwrap_err();
         let ProbeFailure::Disagree { spread_ms } = failure else {
@@ -1065,7 +1107,7 @@ mod tests {
     #[test]
     fn a_quieter_still_train_does_not_hide_a_louder_one_that_moved() {
         for (from, under_db) in [(0.8, 40.0), (0.824_38, 40.0), (0.8, 14.0), (0.824_38, 14.0)] {
-            let mut paths: Vec<Path> = TRAIN
+            let mut paths: Vec<Path> = train()
                 .iter()
                 .enumerate()
                 .map(|(k, offset)| Path {
@@ -1081,7 +1123,7 @@ mod tests {
             });
             let label = format!("from {from} s, {under_db} dB under");
             let (span, sound_at) = recorded(48_000.0, &paths, 1e-4);
-            let failure = Detector::new(48_000.0)
+            let failure = Detector::new(48_000.0, ROLE)
                 .measure(&span, sound_at)
                 .map(|measured| panic!("{label}: {measured:?}"))
                 .unwrap_err();
@@ -1103,7 +1145,7 @@ mod tests {
     fn a_louder_sound_left_unexplained_leaves_no_path_measured() {
         let mut paths = paths(&[(0.012, 0.3 * db(-22.0)), (0.412, 0.3 * db(-12.0))]);
         let (span, sound_at) = recorded(48_000.0, &paths, 1e-4);
-        let measured = Detector::new(48_000.0)
+        let measured = Detector::new(48_000.0, ROLE)
             .measure(&span, sound_at)
             .unwrap_or_else(|failure| panic!("{failure}"));
         assert!((measured.residual - 0.012).abs() < 1e-5, "{measured:?}");
@@ -1115,7 +1157,7 @@ mod tests {
             });
         }
         let (span, sound_at) = recorded(48_000.0, &paths, 1e-4);
-        let failure = Detector::new(48_000.0)
+        let failure = Detector::new(48_000.0, ROLE)
             .measure(&span, sound_at)
             .map(|measured| panic!("{measured:?}"))
             .unwrap_err();
@@ -1139,7 +1181,7 @@ mod tests {
             probes: Some(vec![probe]),
         }));
         let (span, sound_at) = recorded(48_000.0, &paths, 1e-4);
-        Detector::new(48_000.0).measure(&span, sound_at)
+        Detector::new(48_000.0, ROLE).measure(&span, sound_at)
     }
 
     /// Claude: a weaker set of probes scattered 231 ms earlier, failing to
@@ -1159,7 +1201,7 @@ mod tests {
     /// agreeing, is not the arrival: the train is.
     #[test]
     fn a_weaker_agreeing_copy_after_a_valid_train_is_not_its_arrival() {
-        let copy: Vec<(f64, usize)> = (0..TRAIN.len()).map(|k| (0.431, k)).collect();
+        let copy: Vec<(f64, usize)> = (0..PROBES).map(|k| (0.431, k)).collect();
         let measured = strong_train_with(&copy).unwrap_or_else(|failure| panic!("{failure}"));
         assert!((measured.residual - 0.031).abs() < 1e-5, "{measured:?}");
     }
@@ -1181,7 +1223,7 @@ mod tests {
             },
         ];
         let (span, sound_at) = recorded(48_000.0, &paths, 0.01);
-        let failure = Detector::new(48_000.0)
+        let failure = Detector::new(48_000.0, ROLE)
             .measure(&span, sound_at)
             .unwrap_err();
         let ProbeFailure::NotFound {
@@ -1211,7 +1253,7 @@ mod tests {
             probes: Some(vec![0, 1]),
         });
         let (span, sound_at) = recorded(48_000.0, &taps, 1e-5);
-        let failure = Detector::new(48_000.0)
+        let failure = Detector::new(48_000.0, ROLE)
             .measure(&span, sound_at)
             .unwrap_err();
         assert_eq!(
@@ -1244,7 +1286,7 @@ mod tests {
             })
             .collect();
         let (span, sound_at) = recorded(48_000.0, &paths, 1e-5);
-        let failure = Detector::new(48_000.0)
+        let failure = Detector::new(48_000.0, ROLE)
             .measure(&span, sound_at)
             .unwrap_err();
         let ProbeFailure::Disagree { spread_ms } = failure else {
@@ -1258,7 +1300,7 @@ mod tests {
     /// not ambiguous.
     #[test]
     fn a_train_whose_probes_arrive_ever_later_moved() {
-        let paths: Vec<Path> = TRAIN
+        let paths: Vec<Path> = train()
             .iter()
             .enumerate()
             .map(|(k, offset)| Path {
@@ -1268,7 +1310,7 @@ mod tests {
             })
             .collect();
         let (span, sound_at) = recorded(48_000.0, &paths, 1e-4);
-        let failure = Detector::new(48_000.0)
+        let failure = Detector::new(48_000.0, ROLE)
             .measure(&span, sound_at)
             .unwrap_err();
         let ProbeFailure::Moved {
@@ -1296,13 +1338,13 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(k, scatter)| Path {
-                delay: 0.02 + 0.002 * TRAIN[k] + scatter,
+                delay: 0.02 + 0.002 * train()[k] + scatter,
                 gain: 0.3,
                 probes: Some(vec![k]),
             })
             .collect();
         let (span, sound_at) = recorded(48_000.0, &paths, 1e-4);
-        let failure = Detector::new(48_000.0)
+        let failure = Detector::new(48_000.0, ROLE)
             .measure(&span, sound_at)
             .unwrap_err();
         let ProbeFailure::Moved {
@@ -1355,7 +1397,10 @@ mod tests {
                 on(0.512, copy_gain, &[1, 2, 3, 4]),
             ];
             let (span, sound_at) = recorded(48_000.0, &paths, 1e-4);
-            match (Detector::new(48_000.0).measure(&span, sound_at), copy_gain) {
+            match (
+                Detector::new(48_000.0, ROLE).measure(&span, sound_at),
+                copy_gain,
+            ) {
                 (Ok(measured), 0.003) => {
                     assert!((measured.residual - 0.012).abs() < 1e-5, "{measured:?}")
                 }
@@ -1389,7 +1434,7 @@ mod tests {
             on(0.512, 0.3 * db(-24.0), &[1, 2, 3, 4]),
         ];
         let (span, sound_at) = recorded(48_000.0, &paths, 1e-4);
-        let failure = Detector::new(48_000.0)
+        let failure = Detector::new(48_000.0, ROLE)
             .measure(&span, sound_at)
             .unwrap_err();
         let ProbeFailure::Disagree { spread_ms } = failure else {
@@ -1403,7 +1448,10 @@ mod tests {
     /// further under leaves the echo the arrival, however far apart they lie.
     #[test]
     fn a_direct_path_under_an_echo_is_found_ambiguous_or_lost_by_how_far_under() {
-        for after in [0.02, 0.1, 0.4] {
+        for (role, after) in ROLES
+            .into_iter()
+            .flat_map(|role| [0.02, 0.1, 0.4].map(|after| (role, after)))
+        {
             for (under_db, expected) in [
                 (0.0, Some(0.0)),
                 (10.0, Some(0.0)),
@@ -1415,8 +1463,8 @@ mod tests {
                 (30.0, Some(after)),
             ] {
                 let taps = [(0.012, 0.3 * db(-under_db)), (0.012 + after, 0.3)];
-                let label = format!("echo {after} s later, direct {under_db} dB under");
-                match (measure(48_000.0, &taps, 1e-5), expected) {
+                let label = format!("{role}: echo {after} s later, direct {under_db} dB under");
+                match (measure_as(role, 48_000.0, &taps, 1e-5), expected) {
                     (Ok(measured), Some(late)) => assert!(
                         (measured.residual - 0.012 - late).abs() < 2e-5,
                         "{label}: {measured:?}"
@@ -1454,7 +1502,7 @@ mod tests {
             probes: Some(vec![0, 2]),
         });
         let (span, sound_at) = recorded(48_000.0, &taps, 1e-4);
-        let failure = Detector::new(48_000.0)
+        let failure = Detector::new(48_000.0, ROLE)
             .measure(&span, sound_at)
             .unwrap_err();
         let ProbeFailure::Disagree { spread_ms } = failure else {
@@ -1464,7 +1512,9 @@ mod tests {
         assert!(failure.to_string().contains("not as one train"));
         taps[1].probes = Some(vec![3]);
         let (span, sound_at) = recorded(48_000.0, &taps, 1e-4);
-        let measured = Detector::new(48_000.0).measure(&span, sound_at).unwrap();
+        let measured = Detector::new(48_000.0, ROLE)
+            .measure(&span, sound_at)
+            .unwrap();
         assert!((measured.residual - 0.012).abs() < 1e-5, "{measured:?}");
     }
 
@@ -1558,18 +1608,20 @@ mod tests {
             (built_in - 0.001_75, 0.3 * db(-32.0)),
             (built_in - 0.002_77, 0.3 * db(-31.0)),
         ]);
-        for (label, paths, arrival) in [
-            ("built-in", speakers, built_in),
-            ("soundbar", soundbar(), SOUNDBAR_FIRST),
-        ] {
-            let (span, sound_at) = recorded(48_000.0, &paths, 1e-5);
-            let measured = Detector::new(48_000.0)
-                .measure(&span, sound_at)
-                .unwrap_or_else(|e| panic!("{label}: {e}"));
-            assert!(
-                (measured.residual - arrival).abs() < 5e-5 && measured.spread < 1e-4,
-                "{label}: {measured:?}"
-            );
+        for role in ROLES {
+            for (label, paths, arrival) in [
+                ("built-in", speakers.clone(), built_in),
+                ("soundbar", soundbar(), SOUNDBAR_FIRST),
+            ] {
+                let (span, sound_at) = recorded_as(role, 48_000.0, &[(role, &paths)], 1e-5);
+                let measured = Detector::new(48_000.0, role)
+                    .measure(&span, sound_at)
+                    .unwrap_or_else(|e| panic!("{role}, {label}: {e}"));
+                assert!(
+                    (measured.residual - arrival).abs() < 5e-5 && measured.spread < 1e-4,
+                    "{role}, {label}: {measured:?}"
+                );
+            }
         }
     }
 
@@ -1582,12 +1634,76 @@ mod tests {
         let strongest = taps.iter().map(|path| path.gain).fold(0.0, f64::max);
         taps.extend(paths(&[(SOUNDBAR_FIRST + 0.4, strongest * db(-6.0))]));
         let (span, sound_at) = recorded(48_000.0, &taps, 1e-5);
-        let measured = Detector::new(48_000.0)
+        let measured = Detector::new(48_000.0, ROLE)
             .measure(&span, sound_at)
             .unwrap_or_else(|failure| panic!("{failure}"));
         assert!(
             (measured.residual - SOUNDBAR_FIRST).abs() < 5e-5,
             "{measured:?}"
         );
+    }
+
+    /// Claude: each role's filter answers the other role's probe 32.6 dB
+    /// under its own, smeared over a third of a second rather than a peak,
+    /// at every rate a recording may run at.
+    #[test]
+    fn each_filter_answers_the_other_roles_probe_32_db_under_its_own() {
+        for rate in [16_000.0, 44_100.0, 48_000.0, 96_000.0] {
+            for (role, other) in [
+                (Role::Reference, Role::Output),
+                (Role::Output, Role::Reference),
+            ] {
+                let mut detector = Detector::new(rate, role);
+                let silence = vec![0.0f32; (0.3 * rate) as usize];
+                let surrounded = |probe: Vec<f32>| [&silence[..], &probe, &silence].concat();
+                let peak = |envelope: Vec<f64>| envelope.into_iter().fold(0.0, f64::max);
+                let own = peak(detector.envelope(&surrounded(probe(rate, role))));
+                let other = peak(detector.envelope(&surrounded(probe(rate, other))));
+                let under = super::db(own / other);
+                assert!(
+                    (32.5..33.0).contains(&under),
+                    "{role}, {rate} Hz: {under} dB"
+                );
+            }
+        }
+    }
+
+    /// Claude: the output's probe, the reference's reversed in time, has the
+    /// same correlation with itself, so the same sidelobes.
+    #[test]
+    fn both_probes_have_the_same_sidelobes() {
+        for rate in [16_000.0, 48_000.0, 96_000.0] {
+            let [reference, output] = ROLES.map(|role| Detector::new(rate, role).sidelobes);
+            assert_eq!(reference.len(), output.len());
+            assert!(
+                reference
+                    .iter()
+                    .zip(&output)
+                    .all(|(a, b)| (a - b).abs() < 1e-9)
+            );
+        }
+    }
+
+    /// Claude: the reference's train leaking into the output's recording as
+    /// loud as the output, 51.5 ms ahead of it, is not measured as the
+    /// output: the output is, and with the output silent, nothing is.
+    #[test]
+    fn a_reference_train_leaking_into_an_output_recording_is_not_measured_as_the_output() {
+        let output = paths(&[(0.0817, 0.3)]);
+        let leak = paths(&[(0.0302, 0.3)]);
+        let (span, sound_at) = recorded_as(
+            Role::Output,
+            48_000.0,
+            &[(Role::Output, &output), (Role::Reference, &leak)],
+            1e-4,
+        );
+        let measured = Detector::new(48_000.0, Role::Output)
+            .measure(&span, sound_at)
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        assert!((measured.residual - 0.0817).abs() < 1e-5, "{measured:?}");
+        let (span, sound_at) =
+            recorded_as(Role::Output, 48_000.0, &[(Role::Reference, &leak)], 1e-4);
+        let result = Detector::new(48_000.0, Role::Output).measure(&span, sound_at);
+        assert!(result.is_err(), "{result:?}");
     }
 }

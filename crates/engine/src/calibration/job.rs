@@ -17,7 +17,7 @@ use crate::{audio, device_output};
 
 use super::detect::{Detector, Measured};
 use super::emitter::{self, Emitter};
-use super::probe::{MIN_RECORDING_RATE, TRAIN, TRAIN_SECONDS};
+use super::probe::{MIN_RECORDING_RATE, PROBES, TRAIN_SECONDS, layout};
 use super::recorder::Recorder;
 use super::{
     Calibrated, CalibrationFailure, CalibrationState, Movement, ProbeFailure, RecordingFailure,
@@ -189,7 +189,7 @@ impl Leg {
         output.start().map_err(unavailable)?;
         self.playing = Some(Playing {
             output,
-            emitter: Emitter::new(Arc::clone(&ring), now),
+            emitter: Emitter::new(Arc::clone(&ring), now, self.role),
             ring,
             volume,
         });
@@ -221,7 +221,10 @@ pub enum Feed {
 
 struct Listening {
     recorder: Recorder,
-    detector: Detector,
+    sample_rate: f64,
+    /// Claude: each role's detector, by `index`, so that each train is
+    /// searched for with its own leg's probe and layout only.
+    detectors: [Detector; 2],
     /// Claude: the input's sink slot or the program input's lease.
     sink: u64,
 }
@@ -231,7 +234,7 @@ struct Listening {
 /// what it measured once recorded through.
 struct Train {
     role: Role,
-    sound_at: [f64; TRAIN.len()],
+    sound_at: [f64; PROBES],
     from: u64,
     to: u64,
     glitches: u32,
@@ -417,7 +420,8 @@ impl Job {
                 let sink = input.add_sink(Arc::clone(&ring)).map_err(unavailable)?;
                 Listening {
                     recorder: Recorder::new(ring, sample_rate),
-                    detector: Detector::new(sample_rate),
+                    sample_rate,
+                    detectors: detectors(sample_rate),
                     sink: sink as u64,
                 }
             }
@@ -433,7 +437,8 @@ impl Job {
                 })?;
                 Listening {
                     recorder: Recorder::new(ring, sample_rate),
-                    detector: Detector::new(sample_rate),
+                    sample_rate,
+                    detectors: detectors(sample_rate),
                     sink,
                 }
             }
@@ -498,7 +503,7 @@ impl Job {
             });
         listening.recorder.forget_before(needed);
         let track = listening.recorder.track();
-        let held = track.frames_since(needed) as f64 / listening.detector.rate();
+        let held = track.frames_since(needed) as f64 / listening.sample_rate;
         let overdue = pending().any(|train| {
             seconds(train.to) > RECORDING_LAG && track.reached().is_none_or(|end| end <= train.to)
         });
@@ -555,7 +560,7 @@ impl Job {
                         .schedule(earliest as u64)
                         .expect("scheduled ahead of what was pushed")
                         as f64;
-                    let sound_at = TRAIN.map(|offset| {
+                    let sound_at = layout(role).map(|offset| {
                         first + (offset * emitter::RATE).round() / emitter::RATE * ticks + delay
                     });
                     self.trains.push(Train {
@@ -610,7 +615,8 @@ impl Job {
             };
             let _train = tracing::debug_span!("train", role = %train.role, number).entered();
             let span = span.map_err(CalibrationFailure::Recording)?;
-            train.outcome = Some(match listening.detector.measure(&span, train.sound_at) {
+            let detector = &mut listening.detectors[index(train.role)];
+            train.outcome = Some(match detector.measure(&span, train.sound_at) {
                 Ok(measured) => Outcome::Steady(measured),
                 Err(ProbeFailure::Moved { ms_per_second, .. }) => Outcome::Moving { ms_per_second },
                 Err(failure) => {
@@ -792,9 +798,13 @@ impl Job {
     #[cfg(test)]
     pub fn held_seconds(&self) -> f64 {
         self.listening.as_ref().map_or(0.0, |listening| {
-            listening.recorder.track().held_frames() as f64 / listening.detector.rate()
+            listening.recorder.track().held_frames() as f64 / listening.sample_rate
         })
     }
+}
+
+fn detectors(sample_rate: f64) -> [Detector; 2] {
+    [Role::Reference, Role::Output].map(|role| Detector::new(sample_rate, role))
 }
 
 fn index(role: Role) -> usize {

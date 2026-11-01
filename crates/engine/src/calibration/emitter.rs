@@ -9,7 +9,8 @@ use crate::host_time;
 use crate::ring::{Captured, Ring};
 use crate::sinks::SourceTiming;
 
-use super::probe::{TRAIN, probe};
+use super::Role;
+use super::probe::{PROBES, layout, probe};
 
 pub const RATE: f64 = 48_000.0;
 const BLOCK: u64 = 480;
@@ -31,18 +32,21 @@ pub struct Emitter {
     /// Claude: the next frame to push.
     next: u64,
     probe: Vec<f32>,
+    layout: [f64; PROBES],
     /// Claude: where each scheduled probe starts.
     starts: Vec<u64>,
 }
 
 impl Emitter {
-    pub fn new(ring: Arc<Ring>, origin: u64) -> Self {
+    /// Claude: an emitter playing `role`'s probe on `role`'s layout.
+    pub fn new(ring: Arc<Ring>, origin: u64, role: Role) -> Self {
         Self {
             ring,
             origin,
             ticks_per_frame: host_time::ticks_per_second() / RATE,
             next: 0,
-            probe: probe(RATE),
+            probe: probe(RATE, role),
+            layout: layout(role),
             starts: Vec::new(),
         }
     }
@@ -76,7 +80,7 @@ impl Emitter {
             return None;
         }
         self.starts.extend(
-            TRAIN
+            self.layout
                 .iter()
                 .map(|offset| first + (offset * RATE).round() as u64),
         );
@@ -107,7 +111,7 @@ mod tests {
     fn frames_are_pushed_dated_once_captured_in_one_run() {
         let ring = Arc::new(Ring::new(RATE));
         let origin = host_time::now();
-        let mut emitter = Emitter::new(Arc::clone(&ring), origin);
+        let mut emitter = Emitter::new(Arc::clone(&ring), origin, Role::Reference);
         emitter.feed(origin + (0.0099 * host_time::ticks_per_second()) as u64);
         assert!(
             ring.take_discontinuity().is_none(),
@@ -129,10 +133,16 @@ mod tests {
     }
 
     #[test]
-    fn a_train_plays_its_probes_from_the_frame_scheduled() {
+    fn a_train_plays_its_roles_probes_on_its_roles_layout_from_the_frame_scheduled() {
+        for role in [Role::Reference, Role::Output] {
+            plays_from_the_frame_scheduled(role);
+        }
+    }
+
+    fn plays_from_the_frame_scheduled(role: Role) {
         let ring = Arc::new(Ring::new(RATE));
         let origin = 1_000_000;
-        let mut emitter = Emitter::new(Arc::clone(&ring), origin);
+        let mut emitter = Emitter::new(Arc::clone(&ring), origin, role);
         emitter.feed(emitter.date(BLOCK));
         assert_eq!(emitter.schedule(emitter.date(BLOCK - 1)), None);
         let start = 1000;
@@ -146,15 +156,15 @@ mod tests {
         while read < end as usize {
             read += ring.pop_into(&mut played[read * CHANNELS..]);
         }
-        let probe = probe(RATE);
+        let probe = probe(RATE, role);
         let left: Vec<f32> = played.iter().step_by(CHANNELS).copied().collect();
-        for offset in TRAIN {
+        for offset in layout(role) {
             let first = (start + (offset * RATE).round() as u64) as usize;
             assert_eq!(left[first..first + probe.len()], probe[..]);
             assert_eq!(left[first - 1], 0.0);
             assert_eq!(left[first + probe.len()], 0.0);
         }
-        let probe_frames = TRAIN.len() * probe.len();
+        let probe_frames = PROBES * probe.len();
         let sounding = left.iter().filter(|s| **s != 0.0).count();
         assert!(sounding <= probe_frames && sounding > probe_frames - 20);
     }

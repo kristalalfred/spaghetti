@@ -553,7 +553,7 @@ fn assert_measures(setup: &Setup, calibrated: &Calibrated) {
         (late - wanted).abs() < 0.05,
         "{late} ms against {wanted} ms: {calibrated:?}"
     );
-    let drifted = setup.drift.abs() * super::probe::TRAIN[4] * 1000.0;
+    let drifted = setup.drift.abs() * super::probe::layout(Role::Reference)[4] * 1000.0;
     for residual in [calibrated.output, calibrated.reference] {
         assert!(residual.spread_ms < 0.05 + drifted, "{calibrated:?}");
     }
@@ -1086,8 +1086,9 @@ fn leaking(mut reference: Place, under_db: f64) -> Place {
 
 /// Claude: an output drifting 2.3 ms a second, with the reference leaking
 /// into every output train's window 40 or 14 dB under it, is not calibrated
-/// to the leak: its louder trains moved. Standing still, the same output is
-/// measured true.
+/// to the leak: its louder trains moved. Standing still and heard 81.7 ms
+/// after its schedule, after the leak, the output is measured true: 79 ms
+/// later than the reference.
 #[test]
 fn reference_leaking_into_the_output_trains_does_not_stand_in_for_a_moving_output() {
     for under_db in [40.0, 14.0] {
@@ -1106,8 +1107,10 @@ fn reference_leaking_into_the_output_trains_does_not_stand_in_for_a_moving_outpu
             (ms_per_second - 2.3).abs() < 0.05,
             "{under_db} dB under: {ms_per_second}"
         );
-        let still = Setup::new(Place::at(23.3, 1.7), leaking(Place::at(2.2, 0.4), under_db));
-        assert_measures(&still, &calibrated(&still));
+        let still = Setup::new(Place::at(80.0, 1.7), leaking(Place::at(2.2, 0.4), under_db));
+        let calibrated = calibrated(&still);
+        assert_measures(&still, &calibrated);
+        assert_eq!(calibrated.latency_offset_ms, 79);
     }
 }
 
