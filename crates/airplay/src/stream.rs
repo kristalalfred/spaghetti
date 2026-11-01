@@ -362,6 +362,15 @@ fn connect<'a, R>(
     let backlog_packets =
         (settings.latency + Duration::from_secs(1)).as_nanos() / PACKET_DURATION.as_nanos() + 1;
     let now = Instant::now();
+    debug!(
+        now = %shared.clock.ntp(now),
+        first_plays_at = %shared.clock.ntp(now + settings.latency),
+        first_rtp = settings.first_rtp,
+        first_seq = settings.first_seq,
+        latency_frames,
+        audio_latency,
+        "AirPlay timeline"
+    );
     Ok(Streamer {
         shared,
         timeline: Timeline {
@@ -712,6 +721,15 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
             .session
             .write_audio(&header, &self.left, &self.right, &mut self.packet);
         let sent = self.send_audio(len);
+        if header.marker {
+            debug!(
+                seq,
+                rtp = header.timestamp,
+                plays_at = %self.shared.clock.ntp(self.timeline.play_at(packet)),
+                now = %self.shared.clock.now(),
+                "AirPlay first audio packet sent"
+            );
+        }
         self.backlog.push(packet, seq, &self.packet[..len]);
         match sent {
             Ok(sent) => {
@@ -761,6 +779,15 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
         {
             debug!(error = %e, "could not send a sync packet");
         }
+        debug!(
+            first = sync.first,
+            playing = sync.playing,
+            at = %sync.at,
+            sending = sync.sending,
+            now = %self.shared.clock.ntp(now),
+            after_timing = self.timing.last_request().is_some(),
+            "AirPlay sync sent"
+        );
     }
 
     /// Claude: answers the receiver until `deadline`, or until the command
@@ -920,6 +947,7 @@ impl TimingResponder {
                 let (stop, last_request) = (stop.clone(), last_request.clone());
                 move || {
                     let mut request = [0u8; 64];
+                    let mut answered = 0u64;
                     while !stop.load(Ordering::Acquire) {
                         let (len, from) = match socket.recv_from(&mut request) {
                             Ok(received) => received,
@@ -941,16 +969,24 @@ impl TimingResponder {
                         let Some(origin) = packet::timing_request_sent_at(&request[..len]) else {
                             continue;
                         };
-                        let reply = packet::timing_reply(origin, received, clock.now());
+                        let replied = clock.now();
+                        let reply = packet::timing_reply(origin, received, replied);
                         if let Err(e) = socket.send_to(&reply, from) {
                             debug!(error = %e, "could not answer a timing request");
                         }
-                        let first = last_request
-                            .swap(started.elapsed().as_nanos() as u64 + 1, Ordering::Release)
-                            == 0;
-                        if first {
-                            debug!(%from, "first timing request answered");
-                        }
+                        last_request
+                            .swap(started.elapsed().as_nanos() as u64 + 1, Ordering::Release);
+                        debug!(
+                            %from,
+                            request = answered,
+                            receiver_sent = %origin,
+                            %received,
+                            %replied,
+                            receiver_behind_ms = (origin.0 != 0)
+                                .then(|| format!("{:.3}", received.ms_after(origin))),
+                            "AirPlay timing request answered"
+                        );
+                        answered += 1;
                     }
                 }
             })

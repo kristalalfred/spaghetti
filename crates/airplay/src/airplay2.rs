@@ -85,6 +85,10 @@ pub(crate) fn negotiate(
     getrandom::fill(&mut audio_key).map_err(|e| Failure::Failed(e.to_string()))?;
     let peer = connection.peer_addr();
     let reply = setup(&mut connection, &uri, session_setup(offer)?, timeout, abort)?;
+    debug!(
+        timing_port = offer.timing_port,
+        "AirPlay 2 session SETUP answered"
+    );
     let opened = port(&reply, "eventPort").and_then(|event_port| {
         let stream = stream_setup(offer, &audio_key, session_id);
         let events_at = with_port(peer, event_port);
@@ -161,6 +165,7 @@ fn open_stream(
         .ok_or_else(|| Failure::Failed("its stream SETUP answer has no stream".into()))?;
     let (audio_port, control_port) = (port(stream, "dataPort")?, port(stream, "controlPort")?);
     let stream_id = stream.get("streamID").and_then(Value::as_unsigned_integer);
+    debug!(audio_port, control_port, "AirPlay 2 stream SETUP answered");
     let record = exchange(
         connection,
         &Request {
@@ -172,6 +177,7 @@ fn open_stream(
         timeout,
         abort,
     )?;
+    debug!("AirPlay 2 RECORD answered");
     Ok(OpenStream {
         events,
         audio_port,

@@ -121,6 +121,7 @@ fn attempt(
         body: None,
     })?;
     let response = expect_ok("SETUP", response)?;
+    debug!(timing_port = offer.timing_port, "AirPlay 1 SETUP answered");
     let session = response
         .header("Session")
         .and_then(|s| s.split(';').next())
@@ -160,6 +161,7 @@ fn attempt(
         )
         .map_err(Failure::Other)?;
     let response = expect_ok("RECORD", response)?;
+    debug!("AirPlay 1 RECORD answered");
     Ok(Session {
         connection,
         uri,

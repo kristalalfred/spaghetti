@@ -11,12 +11,26 @@ const UNIX_TO_NTP_SECONDS: u64 = 2_208_988_800;
 pub(crate) struct Ntp(pub(crate) u64);
 
 impl Ntp {
+    /// Claude: how much later than `earlier` this is, in milliseconds.
+    pub(crate) fn ms_after(self, earlier: Ntp) -> f64 {
+        self.0.wrapping_sub(earlier.0) as i64 as f64 * 1e3 / (1u64 << 32) as f64
+    }
+
     pub(crate) fn to_be_bytes(self) -> [u8; 8] {
         self.0.to_be_bytes()
     }
 
     pub(crate) fn from_be_bytes(bytes: [u8; 8]) -> Ntp {
         Ntp(u64::from_be_bytes(bytes))
+    }
+}
+
+/// Claude: seconds since the NTP epoch, to the microsecond, as the debug log
+/// shows them.
+impl std::fmt::Display for Ntp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let micros = ((self.0 & 0xFFFF_FFFF) * 1_000_000) >> 32;
+        write!(f, "{}.{micros:06}", self.0 >> 32)
     }
 }
 
@@ -134,6 +148,15 @@ pub(crate) const PACKET_DURATION: Duration =
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ntp_times_show_as_seconds_to_the_microsecond_and_differ_in_milliseconds() {
+        let later = Ntp((3_900_000_000 << 32) | (1 << 31));
+        assert_eq!(later.to_string(), "3900000000.500000");
+        let earlier = Ntp(3_900_000_000 << 32);
+        assert_eq!(later.ms_after(earlier), 500.0);
+        assert_eq!(earlier.ms_after(later), -500.0);
+    }
 
     #[test]
     fn ntp_keeps_whole_seconds_above_the_fraction() {
