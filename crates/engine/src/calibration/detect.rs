@@ -172,6 +172,7 @@ impl Detector {
         let samples = &span.samples;
         if samples.len() < self.template.len() {
             return Err(ProbeFailure::NotFound {
+                heard: 0,
                 above_background_db: 0.0,
             });
         }
@@ -209,10 +210,16 @@ impl Detector {
             );
         }
         if heard.len() < AGREEING {
-            let loudest = strongest.iter().map(|&p| envelope[p]).fold(0.0, f64::max);
+            let loudest_unheard = strongest
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| !heard.iter().any(|(heard, _)| heard == k))
+                .map(|(_, &peak)| envelope[peak])
+                .fold(0.0, f64::max);
             debug!(heard = heard.len(), "calibration train not found");
             return Err(ProbeFailure::NotFound {
-                above_background_db: db(loudest / background),
+                heard: heard.len(),
+                above_background_db: db(loudest_unheard / background),
             });
         }
 
@@ -284,7 +291,7 @@ impl Detector {
             "calibration train agreement"
         );
         if agreeing.len() < AGREEING {
-            return Err(ProbeFailure::Ambiguous);
+            return Err(self.moved(&arrivals).unwrap_or(ProbeFailure::Ambiguous));
         }
 
         let mut probes: Vec<(f64, f64)> = agreeing
@@ -310,6 +317,40 @@ impl Detector {
             "calibration train measured"
         );
         Ok(measured)
+    }
+
+    /// Claude: how the arrivals moved, `(k, samples off the layout)` sorted by
+    /// the latter, when there are enough to make a match and they lie within
+    /// `AGREEMENT_SECONDS` of a line through their probes' times, as the
+    /// arrivals of a destination whose timing moves steadily do; none when
+    /// they scatter, as probes heard by different paths do.
+    fn moved(&self, arrivals: &[(usize, f64)]) -> Option<ProbeFailure> {
+        if arrivals.len() < AGREEING {
+            return None;
+        }
+        let points: Vec<(f64, f64)> = arrivals
+            .iter()
+            .map(|&(k, at)| (TRAIN[k], at / self.rate))
+            .collect();
+        let n = points.len() as f64;
+        let (mean_t, mean_at) = points
+            .iter()
+            .fold((0.0, 0.0), |(t, at), (pt, pat)| (t + pt / n, at + pat / n));
+        let (sta, stt) = points.iter().fold((0.0, 0.0), |(sta, stt), (t, at)| {
+            (
+                sta + (t - mean_t) * (at - mean_at),
+                stt + (t - mean_t) * (t - mean_t),
+            )
+        });
+        let slope = sta / stt;
+        let on_a_line = points
+            .iter()
+            .all(|(t, at)| (at - (mean_at + slope * (t - mean_t))).abs() <= AGREEMENT_SECONDS);
+        let spread = arrivals[arrivals.len() - 1].1 - arrivals[0].1;
+        on_a_line.then(|| ProbeFailure::Moved {
+            spread_ms: spread / self.rate * 1e3,
+            ms_per_second: slope * 1e3,
+        })
     }
 
     /// Claude: each probe's strongest peak where the train is strongest: the
@@ -572,10 +613,77 @@ mod tests {
         assert!(level_db(gain, noise) < 10.0, "{}", level_db(gain, noise));
         match measure(48_000.0, &[(0.02, gain)], noise) {
             Err(ProbeFailure::NotFound {
+                heard: 0,
                 above_background_db,
             }) => assert!(above_background_db < 20.0, "{above_background_db}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Claude: one probe heard loudly and the others not at all says so,
+    /// rather than that the loudest fell short.
+    #[test]
+    fn a_train_with_one_probe_heard_is_not_found_and_says_how_many_were() {
+        let paths = [
+            Path {
+                delay: 0.02,
+                gain: 0.3,
+                probes: Some(vec![2]),
+            },
+            Path {
+                delay: 0.02,
+                gain: 0.0002,
+                probes: Some(vec![0, 1, 3, 4]),
+            },
+        ];
+        let (span, sound_at) = recorded(48_000.0, &paths, 0.01);
+        let failure = Detector::new(48_000.0)
+            .measure(&span, sound_at)
+            .unwrap_err();
+        let ProbeFailure::NotFound {
+            heard: 1,
+            above_background_db,
+        } = failure
+        else {
+            panic!("{failure:?}")
+        };
+        assert!(above_background_db < 20.0, "{above_background_db}");
+        let said = failure.to_string();
+        assert!(said.contains("1 of the 5 stood 20 dB above"), "{said}");
+    }
+
+    /// Claude: a train played by a receiver that slews its clock 2.3 ms a
+    /// second, each probe arriving later than the one before, moved: it is
+    /// not ambiguous.
+    #[test]
+    fn a_train_whose_probes_arrive_ever_later_moved() {
+        let paths: Vec<Path> = TRAIN
+            .iter()
+            .enumerate()
+            .map(|(k, offset)| Path {
+                delay: 0.02 + 0.0023 * offset,
+                gain: 0.3,
+                probes: Some(vec![k]),
+            })
+            .collect();
+        let (span, sound_at) = recorded(48_000.0, &paths, 1e-4);
+        let failure = Detector::new(48_000.0)
+            .measure(&span, sound_at)
+            .unwrap_err();
+        let ProbeFailure::Moved {
+            spread_ms,
+            ms_per_second,
+        } = failure
+        else {
+            panic!("{failure:?}")
+        };
+        assert!((spread_ms - 5.98).abs() < 0.05, "{spread_ms}");
+        assert!((ms_per_second - 2.3).abs() < 0.02, "{ms_per_second}");
+        let said = failure.to_string();
+        assert!(
+            said.contains("timing moved") && said.contains("drifted +2.3 ms a second"),
+            "{said}"
+        );
     }
 
     #[test]

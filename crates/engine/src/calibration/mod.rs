@@ -134,26 +134,45 @@ impl std::error::Error for CalibrationFailure {}
 /// Claude: why a train was not measured.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProbeFailure {
-    /// Claude: nothing in the recording matched the train as clearly as it
-    /// must; the loudest it heard stood this far above the background.
-    NotFound { above_background_db: f64 },
+    /// Claude: fewer than four probes stood 20 dB above the background:
+    /// `heard` did, and the loudest of the others stood this far above it.
+    NotFound {
+        heard: usize,
+        above_background_db: f64,
+    },
     /// Claude: something matched the train before the arrival, too faint to
     /// measure and too clear to ignore.
     Ambiguous,
+    /// Claude: enough probes arrived, each unambiguously, but not together:
+    /// drifting `ms_per_second` a second against their schedules, `spread_ms`
+    /// in all, where one train's agree within 1 ms. The destination's timing
+    /// moved while it played them.
+    Moved { spread_ms: f64, ms_per_second: f64 },
 }
 
 impl std::fmt::Display for ProbeFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound {
+                heard,
                 above_background_db,
             } => write!(
                 f,
-                "the probes were not heard: the loudest sound stood {above_background_db:.0} dB \
-                 above the background, short of 20 dB"
+                "the probes were not heard: {heard} of the {} stood 20 dB above the background, \
+                 where 4 must; the loudest of the others stood {above_background_db:.0} dB above it",
+                probe::TRAIN.len()
             ),
             Self::Ambiguous => f.write_str(
                 "the probes were heard more than once, the earliest too faintly to measure",
+            ),
+            Self::Moved {
+                spread_ms,
+                ms_per_second,
+            } => write!(
+                f,
+                "its timing moved while it played the probes: their arrivals drifted \
+                 {ms_per_second:+.1} ms a second against their schedules, {spread_ms:.1} ms in \
+                 all, where one train's agree within 1 ms"
             ),
         }
     }
