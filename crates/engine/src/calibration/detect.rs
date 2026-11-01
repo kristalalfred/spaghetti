@@ -10,6 +10,7 @@
 
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
+use tracing::{Level, debug};
 
 use super::ProbeFailure;
 use super::probe::{LEVEL, TRAIN, probe};
@@ -60,6 +61,30 @@ const AGREEING: usize = 4;
 
 fn ratio(db: f64) -> f64 {
     10f64.powf(db / 20.0)
+}
+
+fn db(ratio: f64) -> f64 {
+    20.0 * ratio.log10()
+}
+
+/// Claude: what finding one probe's arrival came to, as the debug log shows it.
+struct Found {
+    /// Claude: the earliest peak within `ARRIVAL_DB` of the strongest that no
+    /// sidelobes explain, or the strongest: the arrival unless a near miss
+    /// makes the probe ambiguous.
+    within: usize,
+    /// Claude: the peaks in the band down to `AMBIGUITY_DB` that came more
+    /// than `RINGING_SECONDS` before `within`.
+    near_misses: Vec<usize>,
+    /// Claude: the peaks a later, stronger peak's sidelobes explain, kept
+    /// only while the debug log is on.
+    sidelobes: Vec<usize>,
+}
+
+impl Found {
+    fn arrival(&self) -> Option<usize> {
+        self.near_misses.is_empty().then_some(self.within)
+    }
 }
 
 /// Claude: where a train sounded, against where it was scheduled to.
@@ -157,17 +182,37 @@ impl Detector {
         let background = *sorted.select_nth_unstable_by(middle, f64::total_cmp).1;
         let background = background.max(self.floor);
 
+        let ticks_per_second = crate::host_time::ticks_per_second();
+        let detailed = tracing::enabled!(Level::DEBUG);
+        let late_ms = |index: usize, k: usize| {
+            (span.date(index as f64) - sound_at[k]) / ticks_per_second * 1e3
+        };
         let strongest = self.strongest_train(&envelope);
+        debug!(
+            background_dbfs = %format!("{:.1}", db(background / self.floor) + FLOOR_DBFS),
+            first_strongest_ms = %format!("{:+.2}", late_ms(strongest[0], 0)),
+            "calibration train aligned"
+        );
         let heard: Vec<(usize, usize)> = strongest
             .iter()
             .enumerate()
             .filter(|(_, peak)| envelope[**peak] >= background * ratio(HEARD_DB))
             .map(|(k, peak)| (k, *peak))
             .collect();
+        for (k, &peak) in strongest.iter().enumerate() {
+            debug!(
+                probe = k,
+                strongest_ms = %format!("{:+.2}", late_ms(peak, k)),
+                above_background_db = %format!("{:.1}", db(envelope[peak] / background)),
+                heard = heard.iter().any(|&(heard, _)| heard == k),
+                "calibration probe"
+            );
+        }
         if heard.len() < AGREEING {
             let loudest = strongest.iter().map(|&p| envelope[p]).fold(0.0, f64::max);
+            debug!(heard = heard.len(), "calibration train not found");
             return Err(ProbeFailure::NotFound {
-                above_background_db: 20.0 * (loudest / background).log10(),
+                above_background_db: db(loudest / background),
             });
         }
 
@@ -175,8 +220,40 @@ impl Detector {
         let mut arrivals: Vec<(usize, f64)> = heard
             .iter()
             .filter_map(|&(k, peak)| {
-                let arrival = self.arrival(&envelope, peak, background)?;
-                Some((k, arrival as f64 - offset(k)))
+                let found = self.arrival(&envelope, peak, background, detailed);
+                let level = envelope[peak];
+                let peaks = |indices: &[usize]| {
+                    indices
+                        .iter()
+                        .map(|&i| {
+                            format!(
+                                "{:+.2} ms {:.1} dB under",
+                                late_ms(i, k),
+                                db(level / envelope[i])
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let separations = || {
+                    found
+                        .near_misses
+                        .iter()
+                        .map(|&i| format!("{:.2} ms", (found.within - i) as f64 / self.rate * 1e3))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                debug!(
+                    probe = k,
+                    arrival_ms = %format!("{:+.2}", late_ms(found.within, k)),
+                    arrival_under_db = %format!("{:.1}", db(level / envelope[found.within])),
+                    ambiguous = !found.near_misses.is_empty(),
+                    near_misses = peaks(&found.near_misses),
+                    near_misses_before_arrival = separations(),
+                    sidelobes = peaks(&found.sidelobes),
+                    "calibration probe arrival"
+                );
+                Some((k, found.arrival()? as f64 - offset(k)))
             })
             .collect();
         arrivals.sort_by(|a, b| a.1.total_cmp(&b.1));
@@ -191,11 +268,25 @@ impl Detector {
             })
             .max_by_key(|agreeing| agreeing.len())
             .unwrap_or(&[]);
+        let against_schedule = |arrivals: &[(usize, f64)]| {
+            arrivals
+                .iter()
+                .map(|&(k, at)| {
+                    let late = (span.date(at + offset(k)) - sound_at[k]) / ticks_per_second;
+                    format!("probe {k} {:+.2} ms", late * 1e3)
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        debug!(
+            arrivals = against_schedule(&arrivals),
+            agreeing = against_schedule(agreeing),
+            "calibration train agreement"
+        );
         if agreeing.len() < AGREEING {
             return Err(ProbeFailure::Ambiguous);
         }
 
-        let ticks_per_second = crate::host_time::ticks_per_second();
         let mut probes: Vec<(f64, f64)> = agreeing
             .iter()
             .map(|&(k, at)| {
@@ -208,11 +299,17 @@ impl Detector {
             .collect();
         probes.sort_by(|a, b| a.0.total_cmp(&b.0));
         let n = probes.len() as f64;
-        Ok(Measured {
+        let measured = Measured {
             residual: probes.iter().map(|(late, _)| late).sum::<f64>() / n,
             spread: probes[probes.len() - 1].0 - probes[0].0,
             at: probes.iter().map(|(_, at)| at).sum::<f64>() / n,
-        })
+        };
+        debug!(
+            residual_ms = %format!("{:+.3}", measured.residual * 1e3),
+            spread_ms = %format!("{:.3}", measured.spread * 1e3),
+            "calibration train measured"
+        );
+        Ok(measured)
     }
 
     /// Claude: each probe's strongest peak where the train is strongest: the
@@ -252,19 +349,31 @@ impl Detector {
 
     /// Claude: the earliest peak within `ARRIVAL_DB` of `strongest`, at most
     /// `LOOKBACK_SECONDS` before it, that no later peak's sidelobes explain;
-    /// None when a peak in the band down to `AMBIGUITY_DB` comes more than
-    /// `RINGING_SECONDS` before that.
-    fn arrival(&self, envelope: &[f64], strongest: usize, background: f64) -> Option<usize> {
+    /// none when a peak in the band down to `AMBIGUITY_DB` comes more than
+    /// `RINGING_SECONDS` before that. `detailed` keeps the peaks excluded as
+    /// sidelobes.
+    fn arrival(
+        &self,
+        envelope: &[f64],
+        strongest: usize,
+        background: f64,
+        detailed: bool,
+    ) -> Found {
         let level = envelope[strongest];
         let from = strongest
             .saturating_sub((LOOKBACK_SECONDS * self.rate) as usize)
             .max(1);
+        let mut sidelobes = Vec::new();
         let candidates: Vec<usize> = (from..strongest)
             .filter(|&i| {
-                is_peak(envelope, i)
+                let considered = is_peak(envelope, i)
                     && envelope[i] >= level * ratio(-AMBIGUITY_DB)
-                    && envelope[i] >= background * ratio(HEARD_DB)
-                    && !self.is_sidelobe(envelope, i)
+                    && envelope[i] >= background * ratio(HEARD_DB);
+                let explained = considered && self.is_sidelobe(envelope, i);
+                if explained && detailed {
+                    sidelobes.push(i);
+                }
+                considered && !explained
             })
             .collect();
         let arrival = candidates
@@ -273,9 +382,15 @@ impl Detector {
             .find(|&i| envelope[i] >= level * ratio(-ARRIVAL_DB))
             .unwrap_or(strongest);
         let ringing = (RINGING_SECONDS * self.rate) as usize;
-        match candidates.first() {
-            Some(&earliest) if earliest + ringing < arrival => None,
-            _ => Some(arrival),
+        let near_misses: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .take_while(|&i| i + ringing < arrival)
+            .collect();
+        Found {
+            within: arrival,
+            near_misses,
+            sidelobes,
         }
     }
 

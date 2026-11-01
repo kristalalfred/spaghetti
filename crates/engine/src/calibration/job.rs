@@ -545,7 +545,8 @@ impl Job {
         let listening = self.listening.as_ref().expect("opened before analyzing");
         let mut detector = Detector::new(listening.sample_rate);
         let mut measured = Vec::with_capacity(self.trains.len());
-        for train in &self.trains {
+        for (number, train) in self.trains.iter().enumerate() {
+            let _train = tracing::debug_span!("train", role = %train.role, number).entered();
             let span = listening
                 .recorder
                 .track()
