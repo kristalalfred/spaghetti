@@ -19,6 +19,9 @@ airplay-interop:
 input-loopback:
     ./scripts/input-loopback.sh
 
+calibration-check:
+    ./scripts/calibration-check.sh
+
 install:
     ./scripts/install.sh
 
