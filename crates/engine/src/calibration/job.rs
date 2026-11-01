@@ -296,13 +296,14 @@ impl Job {
             self.last_heard = Some(now);
         }
         if listening.recorder.has_ended() {
-            let reason = match &self.feed {
-                Feed::Input(input) => input.failure(),
-                Feed::Program(_) => None,
-            };
-            return Err(CalibrationFailure::Recording(
-                RecordingFailure::Unavailable(reason.unwrap_or_else(|| "its source ended".into())),
-            ));
+            return Err(match &self.feed {
+                Feed::Input(input) => CalibrationFailure::Recording(RecordingFailure::Unavailable(
+                    input
+                        .failure()
+                        .unwrap_or_else(|| "the input device ended".into()),
+                )),
+                Feed::Program(_) => CalibrationFailure::EndpointRemoved,
+            });
         }
         let quiet = match self.last_heard {
             Some(heard) => seconds(heard) > STALL,
@@ -375,7 +376,11 @@ impl Job {
         }
 
         if let Some(train) = self.trains.iter().find(|train| train.to > now) {
-            return Ok(Some(CalibrationState::Probing(train.role)));
+            return Ok(Some(if now < train.from {
+                CalibrationState::Waiting(train.role)
+            } else {
+                CalibrationState::Probing(train.role)
+            }));
         }
         if let Some(&role) = SEQUENCE.get(self.trains.len()) {
             return Ok(Some(CalibrationState::Waiting(role)));

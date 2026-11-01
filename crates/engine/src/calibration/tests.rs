@@ -944,7 +944,7 @@ mod lifecycle {
                         "{label}"
                     );
                     if removed != "router" {
-                        assert!(loudest["other"] > 0.2, "{label}");
+                        assert!(loudest["other"] > 0.2, "{label}: {loudest:?}");
                     }
                 }
             }
