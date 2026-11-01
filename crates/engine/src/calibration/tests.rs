@@ -61,6 +61,7 @@ struct Speaker {
     muted: Vec<i32>,
     /// Claude: from this time on, renders are dated this much later.
     skip: Option<(f64, f64)>,
+    moving: Option<Moving>,
 }
 
 impl Speaker {
@@ -101,10 +102,28 @@ impl Speaker {
         }
     }
 
+    /// Claude: how much later than its heard times the speaker sounds at `t`.
+    fn lateness_at(&self, t: f64) -> f64 {
+        self.lateness
+            + match self.moving {
+                Some(Moving::Settling { extra, tau }) => extra * (-t / tau).exp(),
+                Some(Moving::Drifting { per_second }) => per_second * t,
+                Some(Moving::Swaying {
+                    amplitude,
+                    period,
+                    rising,
+                }) => amplitude * (2.0 * PI * (t - rising) / period).sin(),
+                Some(Moving::Stepping { first, every, by }) if t >= first => {
+                    by * (((t - first) / every).floor() + 1.0)
+                }
+                Some(Moving::Stepping { .. }) | None => 0.0,
+            }
+    }
+
     /// Claude: the sound at `t` seconds, by band-limited interpolation of what
     /// was rendered, as heard `lateness` after its heard time.
     fn sound(&self, t: f64) -> f64 {
-        let position = (t - self.lateness) * self.rate;
+        let position = (t - self.lateness_at(t)) * self.rate;
         let base = position.floor() as isize;
         let mut sum = 0.0;
         for tap in (base - TAPS + 1)..=(base + TAPS) {
@@ -129,6 +148,25 @@ impl Speaker {
     fn sounding_bursts(&self) -> i32 {
         self.count
     }
+}
+
+/// Claude: how a speaker's lateness moves from time 0 on.
+#[derive(Clone, Copy, Debug)]
+enum Moving {
+    /// Claude: `extra` seconds later at time 0, decaying with time constant
+    /// `tau`, as a receiver settles after a late start.
+    Settling { extra: f64, tau: f64 },
+    /// Claude: later by `per_second` each second.
+    Drifting { per_second: f64 },
+    /// Claude: later by `amplitude` times the sine of `period`'s phase,
+    /// rising through 0 at `rising`.
+    Swaying {
+        amplitude: f64,
+        period: f64,
+        rising: f64,
+    },
+    /// Claude: later by `by` at `first`, and again every `every` seconds.
+    Stepping { first: f64, every: f64, by: f64 },
 }
 
 /// Claude: something the microphone does wrong once, at a time.
@@ -302,6 +340,7 @@ struct Place {
     latency_offset_ms: Option<i32>,
     muted: Vec<i32>,
     skip: Option<(f64, f64)>,
+    moving: Option<Moving>,
 }
 
 impl Place {
@@ -315,6 +354,7 @@ impl Place {
             latency_offset_ms: None,
             muted: Vec::new(),
             skip: None,
+            moving: None,
         }
     }
 
@@ -344,6 +384,7 @@ struct Setup {
     noise: f64,
     faults: Vec<Fault>,
     interrupted: Option<(Phase, Interruption)>,
+    cancelled_at: Option<f64>,
 }
 
 /// Claude: what happens to a calibration as it reaches a phase.
@@ -366,6 +407,7 @@ impl Setup {
             noise: 1e-4,
             faults: Vec::new(),
             interrupted: None,
+            cancelled_at: None,
         }
     }
 }
@@ -398,6 +440,7 @@ fn run(setup: &Setup, hook: impl Fn(f64, &Job)) -> Run {
                 count: 0,
                 muted: place.muted.clone(),
                 skip: place.skip,
+                moving: place.moving,
             },
         ));
         destinations.push(Destination::Program {
@@ -467,12 +510,18 @@ fn run(setup: &Setup, hook: impl Fn(f64, &Job)) -> Run {
         let mut t = 0.0;
         loop {
             t += STEP;
+            if setup.cancelled_at.is_some_and(|at| t >= at) {
+                cancelled.store(true, Ordering::Release);
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return Err(CalibrationFailure::Cancelled);
+            }
             hook(t, &job);
             if let Step::Done(result) = job.tick(room.ticks(t)) {
                 return result;
             }
             room.step(t);
-            assert!(t < 60.0, "the calibration ran for a minute");
+            assert!(t < 90.0, "the calibration ran for a minute and a half");
         }
     })();
     let result = job.conclude(result, &|| cancelled.load(Ordering::Acquire));
@@ -617,8 +666,8 @@ fn each_leg_plays_only_its_own_trains_on_its_own_delay() {
         .collect();
     assert_eq!(
         bursts,
-        [5, 10],
-        "probes the output and the reference played"
+        [10, 15],
+        "probes the output and the reference played: two trains and three"
     );
 }
 
@@ -898,6 +947,141 @@ fn a_calibration_cancelled_or_left_without_an_endpoint_as_it_analyzes_fails() {
 #[test]
 fn a_calibration_cancelled_or_left_without_an_endpoint_as_it_releases_fails() {
     interrupted_while(Phase::Releasing);
+}
+
+/// Claude: a calibration of an output whose timing moves as `moving`.
+fn moving(moving: Moving) -> Held {
+    let mut output = Place::at(23.3, 1.7);
+    output.moving = Some(moving);
+    held(&Setup::new(output, Place::at(2.2, 0.4)))
+}
+
+/// Claude: 0.3 ms a second moves an output only 0.78 ms within a train, which
+/// one train's agreement allows, but its drift within the trains, and its
+/// trains against the reference, show it moving until the calibration stops
+/// waiting, after its fifth output train.
+#[test]
+fn an_output_drifting_slowly_is_not_calibrated_and_says_it_kept_moving() {
+    let held = moving(Moving::Drifting { per_second: 0.0003 });
+    let Err(CalibrationFailure::Unsettled {
+        role: Role::Output,
+        ms_per_second,
+        after_seconds,
+    }) = held.result
+    else {
+        panic!("{:?}", held.result)
+    };
+    assert!((ms_per_second - 0.3).abs() < 0.02, "{ms_per_second}");
+    assert_eq!(held.train_ends.len(), 11);
+    assert!((50.0..60.0).contains(&after_seconds), "{after_seconds}");
+    let said = held.result.unwrap_err().to_string();
+    assert!(said.contains("the output's timing kept moving"), "{said}");
+}
+
+/// Claude: an output 30 ms late at first and settling with a time constant
+/// of 2 s still moves through the first output train; the calibration waits
+/// for two settled ones and measures where it settled.
+#[test]
+fn an_output_that_settles_within_the_bound_is_measured_where_it_settled() {
+    let mut output = Place::at(23.3, 1.7);
+    output.moving = Some(Moving::Settling {
+        extra: 0.03,
+        tau: 2.0,
+    });
+    let setup = Setup::new(output, Place::at(2.2, 0.4));
+    let held = held(&setup);
+    let calibrated = held.result.unwrap_or_else(|failure| panic!("{failure}"));
+    assert_measures(&setup, &calibrated);
+    let seventh = held.train_ends[6];
+    assert!(
+        (seventh..seventh + 0.5).contains(&held.ran),
+        "done at {} s, the seventh train recorded through at {seventh} s",
+        held.ran
+    );
+}
+
+/// Claude: a receiver that starts 115 ms late and settles with a time
+/// constant of a minute, as one was measured to, keeps moving through every
+/// train the calibration may play: it fails, saying so, rather than measure
+/// where the receiver happened to be.
+#[test]
+fn an_output_settling_as_slowly_as_a_receiver_measured_is_not_calibrated() {
+    let held = moving(Moving::Settling {
+        extra: 0.115,
+        tau: 60.0,
+    });
+    let Err(CalibrationFailure::Unsettled {
+        role: Role::Output,
+        ms_per_second,
+        ..
+    }) = held.result
+    else {
+        panic!("{:?}", held.result)
+    };
+    assert!((-2.0..-0.5).contains(&ms_per_second), "{ms_per_second}");
+    assert_eq!(held.train_ends.len(), 11);
+    assert!(held.ran < 62.0, "{} s", held.ran);
+}
+
+/// Claude: in the room as `Setup::new` places it, with 300 ms delays, a
+/// train sounds every 5.3 s from 1.31 s, each for 2.6 s.
+const TRAINS_FROM: f64 = 1.31;
+const TRAINS_EVERY: f64 = 5.3;
+
+/// Claude: an output swaying with the period its trains come in, rising
+/// through its mean in the middle of each, sounds as late in every output
+/// train but drifts within each, 0.18 ms a second: only the drift within the
+/// trains shows it moving.
+#[test]
+fn an_output_that_sways_with_its_trains_drifts_within_them_and_is_not_calibrated() {
+    let held = moving(Moving::Swaying {
+        amplitude: 0.0003,
+        period: 2.0 * TRAINS_EVERY,
+        rising: TRAINS_FROM + TRAINS_EVERY + 1.3,
+    });
+    let Err(CalibrationFailure::Unsettled {
+        role: Role::Output, ..
+    }) = held.result
+    else {
+        panic!("{:?}", held.result)
+    };
+}
+
+/// Claude: an output that steps 0.5 ms later between every two trains never
+/// drifts within one: only its trains against the reference, 10.6 s apart,
+/// show it moving, at the 0.094 ms a second its steps average.
+#[test]
+fn an_output_that_steps_between_its_trains_is_not_calibrated() {
+    let held = moving(Moving::Stepping {
+        first: TRAINS_FROM + 2.6 + (TRAINS_EVERY - 2.6) / 2.0,
+        every: TRAINS_EVERY,
+        by: 0.0005,
+    });
+    let Err(CalibrationFailure::Unsettled {
+        role: Role::Output,
+        ms_per_second,
+        ..
+    }) = held.result
+    else {
+        panic!("{:?}", held.result)
+    };
+    assert!(
+        (ms_per_second - 0.5 / TRAINS_EVERY).abs() < 0.005,
+        "{ms_per_second}"
+    );
+}
+
+#[test]
+fn a_calibration_waiting_for_its_output_to_settle_cancels() {
+    let mut output = Place::at(23.3, 1.7);
+    output.moving = Some(Moving::Drifting { per_second: 0.0003 });
+    let setup = Setup {
+        cancelled_at: Some(30.0),
+        ..Setup::new(output, Place::at(2.2, 0.4))
+    };
+    let held = held(&setup);
+    assert_eq!(held.result, Err(CalibrationFailure::Cancelled));
+    assert!((29.99..30.1).contains(&held.ran), "{} s", held.ran);
 }
 
 #[test]

@@ -98,6 +98,9 @@ pub struct Measured {
     /// Claude: when the agreeing probes were scheduled to sound, on average,
     /// in host ticks, so it and the residual weigh them alike.
     pub at: f64,
+    /// Claude: how much later each second the agreeing probes arrived against
+    /// their schedules, by the line through them, in seconds a second.
+    pub drift: f64,
 }
 
 pub struct Detector {
@@ -137,6 +140,10 @@ impl Detector {
             .collect();
         detector.floor = peak * ratio(FLOOR_DBFS) / LEVEL;
         detector
+    }
+
+    pub fn rate(&self) -> f64 {
+        self.rate
     }
 
     /// Claude: the envelope of `signal`'s correlation with the template at
@@ -316,16 +323,22 @@ impl Detector {
                 )
             })
             .collect();
+        let (drift, _, _) = fit(&probes
+            .iter()
+            .map(|&(late, at)| (at / ticks_per_second, late))
+            .collect::<Vec<_>>());
         probes.sort_by(|a, b| a.0.total_cmp(&b.0));
         let n = probes.len() as f64;
         let measured = Measured {
             residual: probes.iter().map(|(late, _)| late).sum::<f64>() / n,
             spread: probes[probes.len() - 1].0 - probes[0].0,
             at: probes.iter().map(|(_, at)| at).sum::<f64>() / n,
+            drift,
         };
         debug!(
             residual_ms = %format!("{:+.3}", measured.residual * 1e3),
             spread_ms = %format!("{:.3}", measured.spread * 1e3),
+            drift_ms_per_second = %format!("{:+.4}", measured.drift * 1e3),
             "calibration train measured"
         );
         Ok(measured)
@@ -344,17 +357,7 @@ impl Detector {
             .iter()
             .map(|&(k, at)| (TRAIN[k], at / self.rate))
             .collect();
-        let n = points.len() as f64;
-        let (mean_t, mean_at) = points
-            .iter()
-            .fold((0.0, 0.0), |(t, at), (pt, pat)| (t + pt / n, at + pat / n));
-        let (sta, stt) = points.iter().fold((0.0, 0.0), |(sta, stt), (t, at)| {
-            (
-                sta + (t - mean_t) * (at - mean_at),
-                stt + (t - mean_t) * (t - mean_t),
-            )
-        });
-        let slope = sta / stt;
+        let (slope, mean_t, mean_at) = fit(&points);
         let on_a_line = points
             .iter()
             .all(|(t, at)| (at - (mean_at + slope * (t - mean_t))).abs() <= AGREEMENT_SECONDS);
@@ -468,6 +471,22 @@ impl Detector {
                 && envelope[j] * self.sidelobes[j - i] * ratio(SIDELOBE_MARGIN_DB) >= envelope[i]
         })
     }
+}
+
+/// Claude: the least-squares line through `points`: its slope, and the
+/// means it passes through.
+fn fit(points: &[(f64, f64)]) -> (f64, f64, f64) {
+    let n = points.len() as f64;
+    let (mean_x, mean_y) = points
+        .iter()
+        .fold((0.0, 0.0), |(x, y), (px, py)| (x + px / n, y + py / n));
+    let (sxy, sxx) = points.iter().fold((0.0, 0.0), |(sxy, sxx), (x, y)| {
+        (
+            sxy + (x - mean_x) * (y - mean_y),
+            sxx + (x - mean_x) * (x - mean_x),
+        )
+    });
+    (sxy / sxx, mean_x, mean_y)
 }
 
 fn is_peak(envelope: &[f64], i: usize) -> bool {

@@ -15,11 +15,14 @@ use crate::ring::Ring;
 use crate::route_output::{Output, Target};
 use crate::{audio, device_output};
 
-use super::detect::Detector;
+use super::detect::{Detector, Measured};
 use super::emitter::{self, Emitter};
 use super::probe::{MIN_RECORDING_RATE, TRAIN, TRAIN_SECONDS};
 use super::recorder::Recorder;
-use super::{Calibrated, CalibrationFailure, CalibrationState, RecordingFailure, Residual, Role};
+use super::{
+    Calibrated, CalibrationFailure, CalibrationState, ProbeFailure, RecordingFailure, Residual,
+    Role,
+};
 
 const TICK: Duration = Duration::from_millis(5);
 /// Claude: how long a leg's output plays before its first train, so that
@@ -40,7 +43,28 @@ const STALL: f64 = 0.5;
 /// recording may hold this much more than was captured since the earliest
 /// audio a train needs.
 pub(super) const RECORDING_LAG: f64 = 2.0;
-const SEQUENCE: [Role; 3] = [Role::Reference, Role::Output, Role::Reference];
+/// Claude: the most a train's arrivals may drift within it, in seconds a
+/// second, for its leg to count as settled. A receiver settling
+/// exponentially with a time constant of a minute, as one was measured to,
+/// drifts this little only within 1.2 ms of where it settles.
+const STEADY_DRIFT: f64 = 0.000_02;
+/// Claude: how far apart two successive output trains' lateness against the
+/// reference may lie, about 10.6 s apart, for the output to count as
+/// settled: at that time constant, within 1.3 ms of where it settles.
+const STEADY_SPAN: f64 = 0.000_25;
+/// Claude: how many output trains, each between two reference trains, a
+/// calibration plays before it stops waiting for the output to settle.
+const MOST_OUTPUT_TRAINS: usize = 5;
+const MOST_TRAINS: usize = 2 * MOST_OUTPUT_TRAINS + 1;
+
+/// Claude: reference and output trains take turns, a reference first.
+fn role_of(train: usize) -> Role {
+    if train.is_multiple_of(2) {
+        Role::Reference
+    } else {
+        Role::Output
+    }
+}
 
 /// Claude: what a leg plays to as the router checked it, before anything is
 /// looked up, built or opened for it.
@@ -190,24 +214,48 @@ pub enum Feed {
 
 struct Listening {
     recorder: Recorder,
-    sample_rate: f64,
+    detector: Detector,
     /// Claude: the input's sink slot or the program input's lease.
     sink: u64,
 }
 
 /// Claude: a train: whose, when each probe was scheduled to sound, the stretch
-/// of recording searched for it, and the leg's glitches as it was scheduled.
+/// of recording searched for it, the leg's glitches as it was scheduled, and
+/// what it measured once recorded through.
 struct Train {
     role: Role,
     sound_at: [f64; TRAIN.len()],
     from: u64,
     to: u64,
     glitches: u32,
+    outcome: Option<Outcome>,
+}
+
+/// Claude: a measured train: where it arrived, or, when its leg's timing
+/// moved while it played, how fast.
+#[derive(Debug, Clone, Copy)]
+enum Outcome {
+    Steady(Measured),
+    Moving { ms_per_second: f64 },
+}
+
+impl Outcome {
+    fn steady(&self) -> Option<&Measured> {
+        match self {
+            Outcome::Steady(measured) => Some(measured),
+            Outcome::Moving { .. } => None,
+        }
+    }
 }
 
 pub enum Step {
     Running(CalibrationState),
     Done(Result<Calibrated, CalibrationFailure>),
+}
+
+enum Advance {
+    Running(CalibrationState),
+    Done(Calibrated),
 }
 
 /// Claude: where a test can hold the job up, each passed once.
@@ -260,7 +308,7 @@ impl Job {
     }
 
     pub fn state(&self) -> CalibrationState {
-        CalibrationState::Waiting(SEQUENCE[0])
+        CalibrationState::Waiting(role_of(0))
     }
 
     fn leg(&self, role: Role) -> &Leg {
@@ -362,7 +410,7 @@ impl Job {
                 let sink = input.add_sink(Arc::clone(&ring)).map_err(unavailable)?;
                 Listening {
                     recorder: Recorder::new(ring, sample_rate),
-                    sample_rate,
+                    detector: Detector::new(sample_rate),
                     sink: sink as u64,
                 }
             }
@@ -378,7 +426,7 @@ impl Job {
                 })?;
                 Listening {
                     recorder: Recorder::new(ring, sample_rate),
-                    sample_rate,
+                    detector: Detector::new(sample_rate),
                     sink,
                 }
             }
@@ -395,14 +443,13 @@ impl Job {
 
     pub fn tick(&mut self, now: u64) -> Step {
         match self.advance(now) {
-            Ok(Some(state)) => Step::Running(state),
-            Ok(None) => Step::Done(self.analyze()),
+            Ok(Advance::Running(state)) => Step::Running(state),
+            Ok(Advance::Done(calibrated)) => Step::Done(Ok(calibrated)),
             Err(failure) => Step::Done(Err(failure)),
         }
     }
 
-    /// Claude: None once every train was recorded through.
-    fn advance(&mut self, now: u64) -> Result<Option<CalibrationState>, CalibrationFailure> {
+    fn advance(&mut self, now: u64) -> Result<Advance, CalibrationFailure> {
         let ticks = host_time::ticks_per_second();
         let seconds = |from: u64| now.saturating_sub(from) as f64 / ticks;
         if self.removed() {
@@ -436,16 +483,16 @@ impl Job {
         if quiet {
             return Err(CalibrationFailure::Recording(RecordingFailure::Stalled));
         }
-        let needed = self
-            .trains
-            .first()
+        let pending = || self.trains.iter().filter(|train| train.outcome.is_none());
+        let needed = pending()
+            .next()
             .map_or(now.saturating_sub((EARLY * ticks) as u64), |train| {
                 train.from
             });
         listening.recorder.forget_before(needed);
         let track = listening.recorder.track();
-        let held = track.frames_since(needed) as f64 / listening.sample_rate;
-        let overdue = self.trains.iter().any(|train| {
+        let held = track.frames_since(needed) as f64 / listening.detector.rate();
+        let overdue = pending().any(|train| {
             seconds(train.to) > RECORDING_LAG && track.reached().is_none_or(|end| end <= train.to)
         });
         if overdue || held > seconds(needed) + RECORDING_LAG {
@@ -472,7 +519,15 @@ impl Job {
             }
         }
 
-        if let Some(&role) = SEQUENCE.get(self.trains.len()) {
+        self.measure_recorded()?;
+        if let Some(concluded) = self.concluded(now) {
+            return concluded.map(Advance::Done);
+        }
+
+        let next = self.trains.len();
+        let due = next < MOST_TRAINS && self.trains.last().is_none_or(|last| now >= last.from);
+        if due {
+            let role = role_of(next);
             let leg = self.leg(role);
             match leg.running_since {
                 Some(since) => {
@@ -502,6 +557,7 @@ impl Job {
                         from: (sound_at[0] - EARLY * ticks) as u64,
                         to: (sound_at[0] + (TRAIN_SECONDS + LATE) * ticks) as u64,
                         glitches,
+                        outcome: None,
                     });
                 }
                 None if seconds(self.started) > READY_LIMIT => {
@@ -515,60 +571,125 @@ impl Job {
         }
 
         if let Some(train) = self.trains.iter().find(|train| train.to > now) {
-            return Ok(Some(if now < train.from {
+            return Ok(Advance::Running(if now < train.from {
                 CalibrationState::Waiting(train.role)
             } else {
                 CalibrationState::Probing(train.role)
             }));
         }
-        if let Some(&role) = SEQUENCE.get(self.trains.len()) {
-            return Ok(Some(CalibrationState::Waiting(role)));
+        if self.trains.len() < MOST_TRAINS {
+            return Ok(Advance::Running(CalibrationState::Waiting(role_of(
+                self.trains.len(),
+            ))));
         }
-        let last = self.trains.last().expect("every train scheduled").to;
-        let recorded = listening_end(self.listening.as_ref()).is_some_and(|end| end > last);
-        Ok((!recorded).then_some(CalibrationState::Analyzing))
+        Ok(Advance::Running(CalibrationState::Analyzing))
     }
 
-    /// Claude: whether the router, or a program endpoint the job uses, went
-    /// away.
-    fn removed(&self) -> bool {
-        !self.alive.load(Ordering::Acquire)
-            || self.legs.iter().any(Leg::removed)
-            || matches!(&self.feed, Feed::Program(input) if input.ended())
-    }
-
-    fn analyze(&self) -> Result<Calibrated, CalibrationFailure> {
-        #[cfg(test)]
-        if let Some(at) = &self.at {
-            at(Phase::Analyzing);
-        }
-        let listening = self.listening.as_ref().expect("opened before analyzing");
-        let mut detector = Detector::new(listening.sample_rate);
-        let mut measured = Vec::with_capacity(self.trains.len());
-        for (number, train) in self.trains.iter().enumerate() {
+    /// Claude: measures each train once the recording passed its end, in
+    /// order. A train whose leg's timing moved while it played is kept as
+    /// such, for the calibration to wait on; any other failure ends it.
+    fn measure_recorded(&mut self) -> Result<(), CalibrationFailure> {
+        let Self {
+            trains, listening, ..
+        } = self;
+        let listening = listening.as_mut().expect("opened before measuring");
+        for (number, train) in trains.iter_mut().enumerate() {
+            if train.outcome.is_some() {
+                continue;
+            }
+            let track = listening.recorder.track();
+            let Some(span) = track.span(train.from, train.to) else {
+                return Ok(());
+            };
             let _train = tracing::debug_span!("train", role = %train.role, number).entered();
-            let span = listening
-                .recorder
-                .track()
-                .span(train.from, train.to)
-                .expect("recorded through every train")
-                .map_err(CalibrationFailure::Recording)?;
-            let train_measured = detector.measure(&span, train.sound_at).map_err(|failure| {
-                CalibrationFailure::Probes {
-                    role: train.role,
-                    failure,
+            let span = span.map_err(CalibrationFailure::Recording)?;
+            train.outcome = Some(match listening.detector.measure(&span, train.sound_at) {
+                Ok(measured) => Outcome::Steady(measured),
+                Err(ProbeFailure::Moved { ms_per_second, .. }) => Outcome::Moving { ms_per_second },
+                Err(failure) => {
+                    return Err(CalibrationFailure::Probes {
+                        role: train.role,
+                        failure,
+                    });
                 }
-            })?;
-            measured.push(train_measured);
+            });
         }
-        let [first, output, second] = measured[..] else {
-            unreachable!("three trains");
+        Ok(())
+    }
+
+    /// Claude: the calibration, once its latest two output trains and the
+    /// reference trains around them are steady and agree; its failure, once
+    /// it measured every train it may play and they did not.
+    fn concluded(&self, now: u64) -> Option<Result<Calibrated, CalibrationFailure>> {
+        let measured: Vec<&Outcome> = self
+            .trains
+            .iter()
+            .map_while(|train| train.outcome.as_ref())
+            .collect();
+        let output = match measured.len() {
+            n if n >= 5 && n % 2 == 1 => n - 2,
+            n if n >= 5 => n - 3,
+            _ => return None,
         };
+        let window: Option<Vec<&Measured>> = (output - 3..=output + 1)
+            .map(|train| measured[train].steady())
+            .collect();
+        if let Some(window) = &window
+            && movement(window).is_none()
+            && (lateness(window, 3) - lateness(window, 1)).abs() <= STEADY_SPAN
+        {
+            #[cfg(test)]
+            if let Some(at) = &self.at {
+                at(Phase::Analyzing);
+            }
+            return Some(Ok(self.calibrated(window[2], window[3], window[4])));
+        }
+        (measured.len() == MOST_TRAINS).then(|| Err(self.unsettled(&measured, output, now)))
+    }
+
+    /// Claude: why the latest trains, around output train `output`, show the
+    /// calibration not settled: the latest train whose leg moved while it
+    /// played, or else how the window's trains drifted, or else how fast the
+    /// output moved against the reference between its latest two trains.
+    fn unsettled(&self, measured: &[&Outcome], output: usize, now: u64) -> CalibrationFailure {
+        let ticks = host_time::ticks_per_second();
+        let moving = (output - 3..=output + 1)
+            .rev()
+            .find_map(|train| match measured[train] {
+                Outcome::Moving { ms_per_second } => Some((role_of(train), *ms_per_second)),
+                Outcome::Steady(_) => None,
+            });
+        let (role, ms_per_second) = moving.unwrap_or_else(|| {
+            let window: Vec<&Measured> = (output - 3..=output + 1)
+                .filter_map(|train| measured[train].steady())
+                .collect();
+            movement(&window).map_or_else(
+                || {
+                    let seconds = (window[3].at - window[1].at) / ticks;
+                    let moved = lateness(&window, 3) - lateness(&window, 1);
+                    (Role::Output, moved / seconds * 1e3)
+                },
+                |(role, drift)| (role, drift * 1e3),
+            )
+        });
+        CalibrationFailure::Unsettled {
+            role,
+            ms_per_second,
+            after_seconds: self
+                .leg(role)
+                .running_since
+                .map_or(0.0, |since| now.saturating_sub(since) as f64 / ticks),
+        }
+    }
+
+    /// Claude: the offset from output train `output` and the reference trains
+    /// before and after it.
+    fn calibrated(&self, first: &Measured, output: &Measured, second: &Measured) -> Calibrated {
         let along = (output.at - first.at) / (second.at - first.at);
         let reference = first.residual + (second.residual - first.residual) * along;
         let offset = f64::from(self.leg(Role::Output).latency_offset_ms)
             + (output.residual - reference) * 1000.0;
-        Ok(Calibrated {
+        Calibrated {
             output: Residual {
                 late_ms: output.residual * 1000.0,
                 spread_ms: output.spread * 1000.0,
@@ -578,7 +699,15 @@ impl Job {
                 spread_ms: first.spread.max(second.spread) * 1000.0,
             },
             latency_offset_ms: offset.round() as i32,
-        })
+        }
+    }
+
+    /// Claude: whether the router, or a program endpoint the job uses, went
+    /// away.
+    fn removed(&self) -> bool {
+        !self.alive.load(Ordering::Acquire)
+            || self.legs.iter().any(Leg::removed)
+            || matches!(&self.feed, Feed::Program(input) if input.ended())
     }
 
     /// Claude: releases everything, then gives `result`, unless by then the
@@ -649,7 +778,7 @@ impl Job {
     #[cfg(test)]
     pub fn held_seconds(&self) -> f64 {
         self.listening.as_ref().map_or(0.0, |listening| {
-            listening.recorder.track().held_frames() as f64 / listening.sample_rate
+            listening.recorder.track().held_frames() as f64 / listening.detector.rate()
         })
     }
 }
@@ -661,6 +790,29 @@ fn index(role: Role) -> usize {
     }
 }
 
-fn listening_end(listening: Option<&Listening>) -> Option<u64> {
-    listening?.recorder.track().reached()
+/// Claude: how a five-train window, reference, output, reference, output,
+/// reference, drifted more than `STEADY_DRIFT` within its trains, the latest
+/// first: an output train against the reference trains around it, or the
+/// reference trains against one another. A recording whose dates drift
+/// steadily drifts every train alike, which cancels.
+fn movement(window: &[&Measured]) -> Option<(Role, f64)> {
+    for output in [3, 1] {
+        let reference = (window[output - 1].drift + window[output + 1].drift) / 2.0;
+        let drift = window[output].drift - reference;
+        if drift.abs() > STEADY_DRIFT {
+            return Some((Role::Output, drift));
+        }
+    }
+    let references = [window[0].drift, window[2].drift, window[4].drift];
+    let lowest = references.iter().copied().fold(f64::INFINITY, f64::min);
+    let highest = references.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    (highest - lowest > STEADY_DRIFT).then(|| (Role::Reference, window[4].drift - window[0].drift))
+}
+
+/// Claude: how much later than the reference output train `train` of a
+/// five-train window, reference, output, reference, output, reference, sounded.
+fn lateness(window: &[&Measured], train: usize) -> f64 {
+    let (first, output, second) = (window[train - 1], window[train], window[train + 1]);
+    let along = (output.at - first.at) / (second.at - first.at);
+    output.residual - (first.residual + (second.residual - first.residual) * along)
 }

@@ -105,6 +105,14 @@ pub enum CalibrationFailure {
         failure: ProbeFailure,
     },
     Recording(RecordingFailure),
+    /// Claude: a leg's timing kept moving, `ms_per_second` a second against
+    /// its schedule `after_seconds` after it started playing, when the
+    /// calibration stopped waiting for it to settle.
+    Unsettled {
+        role: Role,
+        ms_per_second: f64,
+        after_seconds: f64,
+    },
     /// Claude: the router, or a program input or output the calibration
     /// used, went away.
     EndpointRemoved,
@@ -123,6 +131,16 @@ impl std::fmt::Display for CalibrationFailure {
             }
             Self::Probes { role, failure } => write!(f, "{role}: {failure}"),
             Self::Recording(failure) => failure.fmt(f),
+            Self::Unsettled {
+                role,
+                ms_per_second,
+                after_seconds,
+            } => write!(
+                f,
+                "the {role}'s timing kept moving: {ms_per_second:+.3} ms a second against its \
+                 schedule {after_seconds:.0} s after it started playing, where a settled one \
+                 moves under 0.02"
+            ),
             Self::EndpointRemoved => f.write_str("a program input or output it used was removed"),
             Self::Cancelled => f.write_str("cancelled"),
         }
