@@ -8,6 +8,8 @@
 mod abl;
 mod adts;
 mod airplay_sender;
+#[cfg(test)]
+mod calibration;
 mod clock;
 mod codec;
 mod delivery;

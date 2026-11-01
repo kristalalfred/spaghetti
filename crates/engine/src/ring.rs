@@ -234,6 +234,29 @@ pub struct Ring {
     ended: AtomicBool,
 }
 
+#[cfg(test)]
+/// Claude: one push's record as the consumer reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PushRecord {
+    pub run: u64,
+    pub frames: usize,
+    /// Claude: when its first frame was captured, when the producer dated it.
+    pub captured: Option<u64>,
+    /// Claude: the capturing device's position of its first frame, when the
+    /// producer counted it.
+    pub position: Option<u64>,
+}
+
+#[cfg(test)]
+/// Claude: frames `pop_push` read: how many, how far into their push they
+/// start, and the push's record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Popped {
+    pub frames: usize,
+    pub offset: usize,
+    pub push: PushRecord,
+}
+
 /// Claude: what the consumer can see of the latest push.
 pub struct LastPush {
     pub buffered: usize,
@@ -587,6 +610,42 @@ impl Ring {
         frames
     }
 
+    #[cfg(test)]
+    /// Claude: consumer only. Fills `dst`, which holds at least one frame,
+    /// with frames from the tail up to the end of the push the first came in
+    /// at most, and returns them with that push's record. None when it may
+    /// read nothing.
+    pub fn pop_push(&self, dst: &mut [f32]) -> Option<Popped> {
+        let published = self.view();
+        let (tail, readable) = self.readable(&published);
+        if readable == 0 {
+            return None;
+        }
+        let push = self.current(&published)?;
+        let offset = ahead(tail, push.start);
+        let left = ahead(push.start.wrapping_add(push.len), tail);
+        let frames = readable.min(left as usize).min(dst.len() / CHANNELS);
+        for frame in 0..frames {
+            let base = (tail.wrapping_add(frame as u64) as usize & self.mask) * CHANNELS;
+            for ch in 0..CHANNELS {
+                dst[frame * CHANNELS + ch] = unsafe { *self.samples[base + ch].get() };
+            }
+        }
+        self.tail
+            .store(tail.wrapping_add(frames as u64), Ordering::Release);
+        self.current(&published);
+        Some(Popped {
+            frames,
+            offset: offset as usize,
+            push: PushRecord {
+                run: push.run,
+                frames: push.len as usize,
+                captured: (push.captured != NO_TIME).then_some(push.captured),
+                position: (push.position != NO_POSITION).then_some(push.position),
+            },
+        })
+    }
+
     /// Claude: consumer only. Drops the frames at the tail whose pushes carried
     /// no capture time, up to the first dated frame of its run or all the run
     /// holds, and returns how many. A push's date never changes, so a consumer
@@ -810,6 +869,52 @@ mod tests {
         assert!(ring.take_discontinuity().is_some());
         assert_eq!(front(&ring), 5.0);
         assert_eq!(ring.available(), 479);
+    }
+
+    #[test]
+    fn a_pop_reads_within_one_push_and_returns_its_record() {
+        let ring = Ring::new(RATE);
+        assert!(push_counted(&ring, 0.0, 4096, 480, 1.0));
+        assert!(push_measured(&ring, 0.01, 480, 2.0));
+        assert!(push_counting(&ring, 960, 100));
+        assert!(ring.pop_push(&mut [0.0; 2 * CHANNELS]).is_none());
+        assert!(ring.take_discontinuity().is_some());
+        let mut dst = vec![0.0; 300 * CHANNELS];
+        let at = |seconds: f64| Some(ticks(100.0 + seconds));
+        let reads: Vec<Popped> = std::iter::from_fn(|| ring.pop_push(&mut dst)).collect();
+        let first = PushRecord {
+            run: reads[0].push.run,
+            frames: 480,
+            captured: at(0.0),
+            position: Some(4096),
+        };
+        let second = PushRecord {
+            frames: 480,
+            captured: at(0.01),
+            position: None,
+            ..first
+        };
+        let third = PushRecord {
+            frames: 100,
+            captured: None,
+            position: None,
+            ..first
+        };
+        let read = |frames, offset, push| Popped {
+            frames,
+            offset,
+            push,
+        };
+        assert_eq!(
+            reads,
+            [
+                read(300, 0, first),
+                read(180, 300, first),
+                read(300, 0, second),
+                read(180, 300, second),
+                read(100, 0, third),
+            ]
+        );
     }
 
     #[test]
