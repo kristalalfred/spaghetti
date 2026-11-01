@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::job::{Phase, RECORDING_LAG, Step};
-use super::probe::MIN_RECORDING_RATE;
+use super::probe::{MIN_RECORDING_RATE, TRAIN_SECONDS};
 use super::*;
 use crate::program_io::{Frames, ProgramInput, ProgramOutput};
 use crate::route_output::Output;
@@ -569,10 +569,10 @@ fn a_destinations_lateness_and_travel_are_recovered() {
 }
 
 /// Claude: in the room as `Setup::new` places it, with 300 ms delays, the
-/// output's second probe has sounded and the next starts 400 ms later.
-const BETWEEN_OUTPUT_PROBES: f64 = 8.15;
-/// Claude: the output's fourth probe is scheduled at 8.405 s and heard 11 ms later.
-const IN_THE_OUTPUTS_FOURTH_PROBE: f64 = 8.5;
+/// output's second probe has sounded and the next is heard 521 ms later.
+const BETWEEN_OUTPUT_PROBES: f64 = 9.0;
+/// Claude: the output's fourth probe is scheduled at 10.51 s and heard 11 ms later.
+const IN_THE_OUTPUTS_FOURTH_PROBE: f64 = 10.6;
 
 fn failure(setup: &Setup) -> CalibrationFailure {
     run(setup, |_, _| {}).result.unwrap_err()
@@ -973,7 +973,7 @@ fn an_output_drifting_slowly_is_not_calibrated_and_says_it_kept_moving() {
     };
     assert!((ms_per_second - 0.3).abs() < 0.02, "{ms_per_second}");
     assert_eq!(held.train_ends.len(), 11);
-    assert!((50.0..60.0).contains(&after_seconds), "{after_seconds}");
+    assert!((65.0..72.0).contains(&after_seconds), "{after_seconds}");
     let said = held.result.unwrap_err().to_string();
     assert!(said.contains("the output's timing kept moving"), "{said}");
 }
@@ -1020,13 +1020,13 @@ fn an_output_settling_as_slowly_as_a_receiver_measured_is_not_calibrated() {
     };
     assert!((-2.0..-0.5).contains(&ms_per_second), "{ms_per_second}");
     assert_eq!(held.train_ends.len(), 11);
-    assert!(held.ran < 62.0, "{} s", held.ran);
+    assert!(held.ran < 72.0, "{} s", held.ran);
 }
 
 /// Claude: in the room as `Setup::new` places it, with 300 ms delays, a
-/// train sounds every 5.3 s from 1.31 s, each for 2.6 s.
+/// train sounds every 6.2 s from 1.31 s, each for 3.7 s.
 const TRAINS_FROM: f64 = 1.31;
-const TRAINS_EVERY: f64 = 5.3;
+const TRAINS_EVERY: f64 = 6.2;
 
 /// Claude: an output swaying with the period its trains come in, rising
 /// through its mean in the middle of each, sounds as late in every output
@@ -1037,7 +1037,7 @@ fn an_output_that_sways_with_its_trains_drifts_within_them_and_is_not_calibrated
     let held = moving(Moving::Swaying {
         amplitude: 0.0003,
         period: 2.0 * TRAINS_EVERY,
-        rising: TRAINS_FROM + TRAINS_EVERY + 1.3,
+        rising: TRAINS_FROM + TRAINS_EVERY + TRAIN_SECONDS / 2.0,
     });
     let Err(CalibrationFailure::Unsettled {
         role: Role::Output,
@@ -1050,12 +1050,12 @@ fn an_output_that_sways_with_its_trains_drifts_within_them_and_is_not_calibrated
 }
 
 /// Claude: an output that steps 0.5 ms later between every two trains never
-/// drifts within one: only its trains against the reference, 10.6 s apart,
-/// show it moving, at the 0.094 ms a second its steps average.
+/// drifts within one: only its trains against the reference, 12.4 s apart,
+/// show it moving, at the 0.081 ms a second its steps average.
 #[test]
 fn an_output_that_steps_between_its_trains_is_not_calibrated() {
     let held = moving(Moving::Stepping {
-        first: TRAINS_FROM + 2.6 + (TRAINS_EVERY - 2.6) / 2.0,
+        first: TRAINS_FROM + TRAIN_SECONDS + (TRAINS_EVERY - TRAIN_SECONDS) / 2.0,
         every: TRAINS_EVERY,
         by: 0.0005,
     });
@@ -1111,6 +1111,33 @@ fn reference_leaking_into_the_output_trains_does_not_stand_in_for_a_moving_outpu
         let calibrated = calibrated(&still);
         assert_measures(&still, &calibrated);
         assert_eq!(calibrated.latency_offset_ms, 79);
+    }
+}
+
+/// Claude: an output heard 81.7 ms late along its direct path and 100, 200
+/// and 300 ms after that, each 3 dB under the one before, as a room ringing
+/// back and forth: the echoes of different probes cannot line up as an
+/// earlier train, so the calibration finds the output 79 ms later than the
+/// reference, and finds 79 ms again with it applied. With the reference
+/// ringing instead, it finds -79 ms, and again with it applied.
+#[test]
+fn reflections_of_different_probes_do_not_line_up_as_an_earlier_train() {
+    let mut ringing = Place::at(80.0, 1.7);
+    ringing.paths = vec![
+        (0.0017, 0.3),
+        (0.1017, 0.21),
+        (0.2017, 0.147),
+        (0.3017, 0.1029),
+    ];
+    let setup = Setup::new(ringing, Place::at(2.2, 0.4));
+    for (setup, offset) in [(setup.clone(), 79), (swapped(&setup), -79)] {
+        let first = calibrated(&setup);
+        assert_measures(&setup, &first);
+        assert_eq!(first.latency_offset_ms, offset, "{first:?}");
+        let mut corrected = setup.clone();
+        corrected.output.latency_offset_ms = Some(offset);
+        let second = calibrated(&corrected);
+        assert_eq!(second.latency_offset_ms, offset, "{second:?}");
     }
 }
 

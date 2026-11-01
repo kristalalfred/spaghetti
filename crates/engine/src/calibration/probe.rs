@@ -1,8 +1,11 @@
 //! Claude: the calibration signal: a linear chirp, played in trains of five
-//! at starts whose differences all differ, so that at any wrong alignment of
-//! a train at most one probe lines up with another. The reference sweeps up
-//! and the output down, each on a layout of its own, so that a train of one
-//! heard in the other's recording is neither its probe nor its layout.
+//! at starts whose differences all differ by at least 0.25 s, an extra path
+//! of 86 m, longer than any room's strong reflection: at any wrong alignment
+//! of a train at most one probe lines up with another, and echoes of
+//! different probes line up as a false train only at delays differing by a
+//! difference of those differences, 0.25 s or more. The reference sweeps up and the
+//! output down, each on a layout of its own, so that a train of one heard in
+//! the other's recording is neither its probe nor its layout.
 
 use std::f64::consts::PI;
 
@@ -10,14 +13,16 @@ use super::Role;
 
 pub const PROBES: usize = 5;
 /// Claude: when each probe of a reference train starts, in seconds from its
-/// first.
-const REFERENCE_TRAIN: [f64; PROBES] = [0.0, 0.5, 1.2, 1.8, 2.6];
-/// Claude: when each probe of an output train starts: the same gaps in
-/// another order, so that a reference train at any lag lines up with it on
-/// at most two probes, and on two at six lags only.
-const OUTPUT_TRAIN: [f64; PROBES] = [0.0, 0.7, 1.5, 2.0, 2.6];
+/// first: 0, 2, 6, 11 and 14 steps of 0.25 s, of the shortest layouts found
+/// on a 50 ms grid whose starts lie at least 0.5 s apart and whose
+/// differences lie at least 0.25 s apart.
+const REFERENCE_TRAIN: [f64; PROBES] = [0.0, 0.5, 1.5, 2.75, 3.5];
+/// Claude: when each probe of an output train starts: the reference's
+/// layout mirrored, the one of the shortest layouts with which a reference
+/// train at any lag lines up on at most two probes.
+const OUTPUT_TRAIN: [f64; PROBES] = [0.0, 0.75, 2.0, 3.0, 3.5];
 /// Claude: from a train's first probe's start to its last probe's end.
-pub const TRAIN_SECONDS: f64 = 2.8;
+pub const TRAIN_SECONDS: f64 = 3.7;
 const PROBE_SECONDS: f64 = 0.2;
 const LOW_HZ: f64 = 500.0;
 const HIGH_HZ: f64 = 6000.0;
@@ -77,9 +82,10 @@ mod tests {
     use super::*;
 
     const ROLES: [Role; 2] = [Role::Reference, Role::Output];
+    const SPACINGS_APART: f64 = 0.25;
 
     #[test]
-    fn train_starts_lie_apart_by_distances_at_least_100_ms_apart() {
+    fn train_starts_lie_apart_by_distances_a_quarter_second_apart() {
         for role in ROLES {
             let train = layout(role);
             let mut gaps: Vec<f64> = (0..PROBES)
@@ -87,7 +93,10 @@ mod tests {
                 .collect();
             gaps.sort_by(f64::total_cmp);
             for pair in gaps.windows(2) {
-                assert!(pair[1] - pair[0] >= 0.1 - 1e-9, "{role}: {gaps:?}");
+                assert!(
+                    pair[1] - pair[0] >= SPACINGS_APART - 1e-9,
+                    "{role}: {gaps:?}"
+                );
             }
             assert!(train[1..].iter().zip(train).all(|(b, a)| b - a >= 0.5));
             assert!(train[PROBES - 1] + PROBE_SECONDS <= TRAIN_SECONDS + 1e-9);
@@ -95,7 +104,7 @@ mod tests {
     }
 
     /// Claude: a reference train at any lag lines up with the output's
-    /// layout, within 50 ms, on at most two probes, and on two at six lags
+    /// layout, within 50 ms, on at most two probes, and on two at ten lags
     /// only, among them lag 0, where both trains start and end together.
     #[test]
     fn a_reference_train_at_any_lag_lines_up_with_the_output_layout_on_at_most_two_probes() {
@@ -117,7 +126,7 @@ mod tests {
             .collect();
         twice.sort_by(f64::total_cmp);
         twice.dedup_by(|a, b| (*a - *b).abs() < 0.05);
-        assert_eq!(twice.len(), 6, "{twice:?}");
+        assert_eq!(twice.len(), 10, "{twice:?}");
     }
 
     #[test]

@@ -148,7 +148,7 @@ mod tests {
         let start = 1000;
         let at = emitter.date(start) - 1;
         assert_eq!(emitter.schedule(at), Some(emitter.date(start)));
-        let end = (start + (3.0 * RATE) as u64).next_multiple_of(BLOCK);
+        let end = (start + (4.0 * RATE) as u64).next_multiple_of(BLOCK);
         emitter.feed(emitter.date(end));
         assert!(ring.take_discontinuity().is_some());
         let mut played = vec![0.0; end as usize * CHANNELS];

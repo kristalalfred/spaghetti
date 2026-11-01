@@ -895,7 +895,7 @@ mod tests {
             .collect()
     }
 
-    /// Claude: a 5.3 s recording at `rate` of trains scheduled to sound
+    /// Claude: a 6.2 s recording at `rate` of trains scheduled to sound
     /// `SOUND` s in, each `(role, paths)` played with `role`'s probe on its
     /// layout and arriving along each of `paths`, over noise of `noise` RMS,
     /// and when each probe of `scheduled`'s train was scheduled.
@@ -908,7 +908,7 @@ mod tests {
         let ticks = host_time::ticks_per_second();
         let origin = 1e12;
         let mut deviates = Noise(0x9e37_79b9_7f4a_7c15 ^ rate.to_bits());
-        let samples = (0..(5.3 * rate) as usize)
+        let samples = (0..(6.2 * rate) as usize)
             .map(|i| {
                 let t = i as f64 / rate;
                 let train: f64 = trains
@@ -1104,6 +1104,10 @@ mod tests {
     /// a train 40 or 14 dB under it that stands still, as the reference played
     /// before it might leak into its window: the train moved, wherever the
     /// output has moved to, and the quieter train is not measured instead.
+    /// Over the 3.5 s of its probes the train drifts 8.05 ms, more than the
+    /// two steps of `NEAR_SECONDS` an alignment holds, so from some starts its
+    /// last probe is found on its peak's flank and its rate reads up to a
+    /// tenth low.
     #[test]
     fn a_quieter_still_train_does_not_hide_a_louder_one_that_moved() {
         for (from, under_db) in [(0.8, 40.0), (0.824_38, 40.0), (0.8, 14.0), (0.824_38, 14.0)] {
@@ -1131,9 +1135,89 @@ mod tests {
                 panic!("{label}: {failure:?}")
             };
             assert!(
-                (ms_per_second - 2.3).abs() < 0.02,
+                (2.05..2.32).contains(&ms_per_second),
                 "{label}: {ms_per_second}"
             );
+        }
+    }
+
+    /// Claude: a train slewing up to 1.7 ms a second drifts no more than the
+    /// 6 ms two steps of `NEAR_SECONDS` hold over the 3.5 s of its probes:
+    /// from every start, its probes are found at their peaks, and it moved
+    /// at its rate.
+    #[test]
+    fn a_train_slewing_up_to_1_7_ms_a_second_moved_at_its_rate_from_any_start() {
+        for per_second in [0.0015, 0.0017] {
+            for step in 0..12 {
+                let from = 0.8 + 0.000_25 * f64::from(step);
+                let paths: Vec<Path> = train()
+                    .iter()
+                    .enumerate()
+                    .map(|(k, offset)| Path {
+                        delay: from + per_second * offset,
+                        gain: 0.3,
+                        probes: Some(vec![k]),
+                    })
+                    .collect();
+                let (span, sound_at) = recorded(48_000.0, &paths, 1e-4);
+                let label = format!("{per_second} s a second from {from} s");
+                let failure = Detector::new(48_000.0, ROLE)
+                    .measure(&span, sound_at)
+                    .map(|measured| panic!("{label}: {measured:?}"))
+                    .unwrap_err();
+                let ProbeFailure::Moved { ms_per_second, .. } = failure else {
+                    panic!("{label}: {failure:?}")
+                };
+                assert!(
+                    (ms_per_second - per_second * 1e3).abs() < 0.01,
+                    "{label}: {ms_per_second}"
+                );
+            }
+        }
+    }
+
+    /// Claude: a direct path at +81.7 ms and reflections 100, 200 and 300 ms
+    /// after it, each 3 dB under the one before: the echoes of different
+    /// probes, a tenth of a second apart, cannot line up as an earlier train
+    /// when the layout's spacings lie a quarter second apart, in either leg.
+    #[test]
+    fn echoes_of_different_probes_do_not_line_up_as_an_earlier_train() {
+        for role in ROLES {
+            let taps = [
+                (0.0817, 0.3),
+                (0.1817, 0.21),
+                (0.2817, 0.147),
+                (0.3817, 0.1029),
+            ];
+            let measured = measure_as(role, 48_000.0, &taps, 1e-4)
+                .unwrap_or_else(|failure| panic!("{role}: {failure}"));
+            assert!(
+                (measured.residual - 0.0817).abs() < 1e-5,
+                "{role}: {measured:?}"
+            );
+        }
+    }
+
+    /// Claude: echoes of different probes line up as a false train only at
+    /// delays that differ by a difference of the layout's spacings, which lie
+    /// a quarter second apart. A direct path at +81.7 ms with echoes 0.24 or
+    /// 0.26 s apart, each 3 dB under the one before, is measured where it
+    /// arrived; with echoes 0.25 s apart, the nearest that can, they line up
+    /// as a train 500 ms early, which is measured instead, in either leg.
+    #[test]
+    fn echoes_a_quarter_second_apart_are_the_nearest_that_line_up_as_an_earlier_train() {
+        for role in ROLES {
+            for (spacing, arrival) in [(0.24, 0.0817), (0.25, 0.0817 - 0.5), (0.26, 0.0817)] {
+                let taps: Vec<(f64, f64)> = (0..4)
+                    .map(|n| (0.0817 + spacing * f64::from(n), 0.3 * 0.7f64.powi(n)))
+                    .collect();
+                let measured = measure_as(role, 48_000.0, &taps, 1e-4)
+                    .unwrap_or_else(|failure| panic!("{role}, {spacing} s: {failure}"));
+                assert!(
+                    (measured.residual - arrival).abs() < 1e-5,
+                    "{role}, {spacing} s: {measured:?}"
+                );
+            }
         }
     }
 
@@ -1320,7 +1404,7 @@ mod tests {
         else {
             panic!("{failure:?}")
         };
-        assert!((spread_ms - 5.98).abs() < 0.05, "{spread_ms}");
+        assert!((spread_ms - 8.05).abs() < 0.1, "{spread_ms}");
         assert!((ms_per_second - 2.3).abs() < 0.02, "{ms_per_second}");
         let said = failure.to_string();
         assert!(
@@ -1354,8 +1438,8 @@ mod tests {
         else {
             panic!("{failure:?}")
         };
-        assert!((spread_ms - 3.43).abs() < 0.05, "{spread_ms}");
-        assert!((ms_per_second - 1.96).abs() < 0.05, "{ms_per_second}");
+        assert!((spread_ms - 5.33).abs() < 0.05, "{spread_ms}");
+        assert!((ms_per_second - 1.97).abs() < 0.05, "{ms_per_second}");
     }
 
     #[test]
@@ -1376,15 +1460,12 @@ mod tests {
     }
 
     /// Claude: four probes heard at +12 ms and, 3.5 dB louder, at +14 ms, and
-    /// a copy of the train at +512 ms on the other four, so that where the
-    /// copy's first probe would be, had it been heard, the second probe
-    /// arrives. 40 dB under, the copy removes no arrival, and the train
-    /// arrives at +12 ms. 20 dB under, too faint to take part, it explains
-    /// none of its own probes, two of which come 0.1 and 0.2 s before the
-    /// train's third and fourth in the band where an earlier path makes a
-    /// probe ambiguous: the train is.
+    /// a copy of the train 40 or 20 dB under them at +512 ms on the other
+    /// four, so that where the copy's first probe would be, had it been
+    /// heard, the second probe arrives: the copy removes no arrival it has no
+    /// probe at, and the train arrives at +12 ms.
     #[test]
-    fn a_copy_of_the_train_removes_no_arrival_and_one_too_faint_to_take_part_is_ambiguous() {
+    fn a_copy_of_the_train_removes_no_arrival_where_it_has_no_probe() {
         for copy_gain in [0.003, 0.03] {
             let on = |delay: f64, gain: f64, probes: &[usize]| Path {
                 delay,
@@ -1397,23 +1478,13 @@ mod tests {
                 on(0.512, copy_gain, &[1, 2, 3, 4]),
             ];
             let (span, sound_at) = recorded(48_000.0, &paths, 1e-4);
-            match (
-                Detector::new(48_000.0, ROLE).measure(&span, sound_at),
-                copy_gain,
-            ) {
-                (Ok(measured), 0.003) => {
-                    assert!((measured.residual - 0.012).abs() < 1e-5, "{measured:?}")
-                }
-                (
-                    Err(ProbeFailure::Ambiguous {
-                        ambiguous: 2,
-                        measurable: 2,
-                        required: 4,
-                    }),
-                    0.03,
-                ) => {}
-                (result, _) => panic!("copy at {copy_gain}: {result:?}"),
-            }
+            let measured = Detector::new(48_000.0, ROLE)
+                .measure(&span, sound_at)
+                .unwrap_or_else(|failure| panic!("copy at {copy_gain}: {failure}"));
+            assert!(
+                (measured.residual - 0.012).abs() < 1e-5,
+                "copy at {copy_gain}: {measured:?}"
+            );
         }
     }
 

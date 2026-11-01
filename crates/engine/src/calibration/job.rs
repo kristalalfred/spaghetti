@@ -53,7 +53,7 @@ pub(super) const RECORDING_LAG: f64 = 2.0;
 /// constant of 600 s passes both gates about 9.7 ms from where it ends.
 pub(super) const STEADY_DRIFT: f64 = 0.000_02;
 /// Claude: how far apart two successive output trains' lateness against the
-/// reference may lie, about 10.6 s apart, for the output to count as
+/// reference may lie, about 12.4 s apart, for the output to count as
 /// settled: under the same model, within about 1.3 ms of where it settles.
 pub(super) const STEADY_SPAN: f64 = 0.000_25;
 /// Claude: how far apart, in seconds, successive output trains sound: two
