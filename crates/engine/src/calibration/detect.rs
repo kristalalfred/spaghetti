@@ -1,23 +1,24 @@
 //! Claude: finding a train in a recording. A matched filter turns the
 //! recording into the envelope of its correlation with the probe. Each
 //! alignment of the train's layout that gives its probes their strongest
-//! peaks is a candidate, and a candidate whose probes, each arriving where
-//! its own cluster of peaks starts, agree with the layout at levels within
-//! `ARRIVAL_DB` of their median is a group: one path of the train. The
-//! loudest candidate with `AGREEING` probes heard, agreeing or not, sets the
-//! level: groups more than `AMBIGUITY_DB` under it take no part, the train
-//! arrives with the earliest group within `ARRIVAL_DB` of it, and an earlier
-//! group in the band between makes it ambiguous. With no group that close,
-//! the loudest candidate is measured itself, so a louder train that moved or
-//! scattered is reported as such rather than hidden by a quieter one. Each
-//! probe's arrival is then the earliest peak heard within `ARRIVAL_DB` of the
-//! measured candidate's, up to `LOOKBACK_SECONDS` before it, that no later,
-//! stronger peak's sidelobes explain and that is not where a group taking
-//! part places another of its probes. So a direct path heard under a later
-//! echo is still found, while a speaker's pre-ringing and the probe's
-//! sidelobes, which stand further under the arrival, never are. The train is
-//! measured where at least four probes' arrivals agree with its layout; with
-//! no candidate heard, the best-ranked is measured, to say why it fails.
+//! peaks is a candidate. One with `AGREEING` probes heard is significant
+//! within `ARRIVAL_DB` of the loudest such, and a group, one path of the
+//! train, when its probes, each arriving where its own cluster of peaks
+//! starts, agree with the layout. A train is measured only when every
+//! significant candidate is a group. Otherwise the loudest that is not fails
+//! it by its own arrivals, as `Moved` or `Disagree`, so that no quieter train
+//! or later echo stands in for a louder sound left unexplained. The train
+//! arrives with the earliest significant group, and an earlier group up to
+//! `AMBIGUITY_DB` under the loudest makes it ambiguous; no group under the
+//! significant ones removes or excludes anything. Each probe's arrival is
+//! then the earliest peak heard within `ARRIVAL_DB` of the arriving group's,
+//! up to `LOOKBACK_SECONDS` before it, that no later, stronger peak's
+//! sidelobes explain and that is not where a significant group has another
+//! of its probes. So a direct path heard under a later echo is still found,
+//! while a speaker's pre-ringing and the probe's sidelobes, which stand
+//! further under the arrival, never are. The train is measured where at
+//! least four probes' arrivals agree with its layout; with no candidate
+//! heard, the best-ranked is measured, to say why it fails.
 
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
@@ -84,8 +85,8 @@ fn db(ratio: f64) -> f64 {
 }
 
 /// Claude: a train candidate whose probes agree: where in the envelope its
-/// first probe arrived by the median of their arrivals, the median level of
-/// the probes that agree, which they are, and the candidate.
+/// first probe arrived by the median of their arrivals, the candidate's
+/// level, which probes agree, and the candidate.
 struct Group {
     at: f64,
     level: f64,
@@ -223,17 +224,11 @@ impl Detector {
         let background = background.max(self.floor);
 
         let candidates = self.candidates(&envelope, background);
-        let loudest = candidates
+        let levels: Vec<Option<f64>> = candidates
             .iter()
-            .enumerate()
-            .filter_map(|(candidate, strongest)| {
-                Some((
-                    candidate,
-                    self.heard_level(&envelope, background, strongest)?,
-                ))
-            })
-            .max_by(|a, b| a.1.total_cmp(&b.1));
-        let Some((loudest, loudest_level)) = loudest else {
+            .map(|strongest| self.heard_level(&envelope, background, strongest))
+            .collect();
+        let Some(loudest) = levels.iter().flatten().copied().reduce(f64::max) else {
             return self.measure_train(
                 span,
                 sound_at,
@@ -243,23 +238,38 @@ impl Detector {
                 (0, candidates[0]),
             );
         };
+        let significant = loudest * ratio(-ARRIVAL_DB);
         let mut groups: Vec<Group> = Vec::new();
+        let mut unexplained: Option<(usize, f64)> = None;
         for (candidate, strongest) in candidates.iter().enumerate() {
-            if let Some(group) = self.group(&envelope, background, strongest, candidate) {
-                let same = groups
-                    .iter()
-                    .any(|other| (other.at - group.at).abs() <= AGREEMENT_SECONDS * self.rate);
-                if !same {
-                    groups.push(group);
+            let Some(level) = levels[candidate] else {
+                continue;
+            };
+            match self.group(&envelope, background, strongest, (candidate, level)) {
+                Some(group) => {
+                    let same = groups
+                        .iter_mut()
+                        .find(|other| (other.at - group.at).abs() <= AGREEMENT_SECONDS * self.rate);
+                    match same {
+                        Some(other) if other.level < group.level => *other = group,
+                        Some(_) => {}
+                        None => groups.push(group),
+                    }
                 }
+                None if level >= significant
+                    && unexplained.is_none_or(|(_, louder)| level > louder) =>
+                {
+                    unexplained = Some((candidate, level));
+                }
+                None => {}
             }
         }
-        groups.retain(|group| group.level >= loudest_level * ratio(-AMBIGUITY_DB));
+        groups.retain(|group| group.level >= loudest * ratio(-AMBIGUITY_DB));
         let ticks_per_second = crate::host_time::ticks_per_second();
         let late_ms = |at: f64| (span.date(at) - sound_at[0]) / ticks_per_second * 1e3;
         debug!(
-            loudest,
-            loudest_db = %format!("{:.1}", db(loudest_level / background)),
+            loudest_db = %format!("{:.1}", db(loudest / background)),
+            unexplained = unexplained.map(|(candidate, _)| candidate),
             groups = groups
                 .iter()
                 .map(|group| format!(
@@ -272,25 +282,29 @@ impl Detector {
                 .join(", "),
             "calibration train groups"
         );
-        let within = loudest_level * ratio(-ARRIVAL_DB);
-        let Some(arrival) = groups
-            .iter()
-            .filter(|group| group.level >= within)
-            .min_by(|a, b| a.at.total_cmp(&b.at))
-        else {
-            return self.measure_train(
-                span,
-                sound_at,
-                &envelope,
-                background,
-                &groups,
-                (loudest, candidates[loudest]),
+        if let Some((candidate, level)) = unexplained {
+            let failure = self.failure(&envelope, background, &candidates[candidate]);
+            debug!(
+                candidate,
+                under_loudest_db = %format!("{:.1}", db(loudest / level)),
+                first_strongest_ms = %format!("{:+.2}", late_ms(candidates[candidate][0] as f64)),
+                %failure,
+                "calibration train refused: a candidate as loud as a train does not agree"
             );
-        };
+            return Err(failure);
+        }
+        let taking_part: Vec<&Group> = groups
+            .iter()
+            .filter(|group| group.level >= significant)
+            .collect();
+        let arrival = taking_part
+            .iter()
+            .min_by(|a, b| a.at.total_cmp(&b.at))
+            .expect("the loudest candidate forms a group");
         let ringing = RINGING_SECONDS * self.rate;
         let near_misses: Vec<&Group> = groups
             .iter()
-            .filter(|group| group.at + ringing < arrival.at && group.level < within)
+            .filter(|group| group.at + ringing < arrival.at && group.level < significant)
             .collect();
         if !near_misses.is_empty() {
             let ambiguous = arrival
@@ -318,7 +332,7 @@ impl Detector {
             sound_at,
             &envelope,
             background,
-            &groups,
+            &taking_part,
             (arrival.candidate, candidates[arrival.candidate]),
         )
     }
@@ -339,19 +353,16 @@ impl Detector {
         (levels.len() >= AGREEING).then(|| median(&mut levels))
     }
 
-    /// Claude: the group a candidate's heard probes form where at least
-    /// `AGREEING` of their arrivals, each the earliest peak of its probe's
-    /// cluster within `ARRIVAL_DB` of its strongest, agree with the layout and
-    /// stand within `ARRIVAL_DB` of their median level: a probe far louder or
-    /// quieter than the rest is another path's, caught where the group would
-    /// have a probe.
-    fn group(
+    /// Claude: the arrivals of a candidate's heard probes, each the earliest
+    /// peak of its probe's cluster within `ARRIVAL_DB` of its strongest, as
+    /// samples off the layout, with the probe's level and number, sorted by
+    /// the first.
+    fn cluster_arrivals(
         &self,
         envelope: &[f64],
         background: f64,
         strongest: &[usize; TRAIN.len()],
-        candidate: usize,
-    ) -> Option<Group> {
+    ) -> Vec<(f64, f64, usize)> {
         let offset = |k: usize| (TRAIN[k] * self.rate).round();
         let mut arrivals: Vec<(f64, f64, usize)> = strongest
             .iter()
@@ -363,8 +374,14 @@ impl Detector {
             })
             .collect();
         arrivals.sort_by(|a, b| a.0.total_cmp(&b.0));
+        arrivals
+    }
+
+    /// Claude: the most of `arrivals` that lie within `AGREEMENT_SECONDS` of
+    /// one another.
+    fn agreeing<'a>(&self, arrivals: &'a [(f64, f64, usize)]) -> &'a [(f64, f64, usize)] {
         let agreement = AGREEMENT_SECONDS * self.rate;
-        let agreeing = (0..arrivals.len())
+        (0..arrivals.len())
             .map(|first| {
                 let count = arrivals[first..]
                     .iter()
@@ -372,23 +389,46 @@ impl Detector {
                     .count();
                 &arrivals[first..first + count]
             })
-            .max_by_key(|agreeing| agreeing.len())?;
-        let mut levels: Vec<f64> = agreeing.iter().map(|(_, level, _)| *level).collect();
-        let level = median(&mut levels);
-        let members: Vec<&(f64, f64, usize)> = agreeing
-            .iter()
-            .filter(|(_, member, _)| db(member / level).abs() <= ARRIVAL_DB)
-            .collect();
-        if members.len() < AGREEING {
+            .max_by_key(|agreeing| agreeing.len())
+            .unwrap_or(&[])
+    }
+
+    /// Claude: the group a candidate heard at `level` forms where at least
+    /// `AGREEING` of its probes' arrivals agree.
+    fn group(
+        &self,
+        envelope: &[f64],
+        background: f64,
+        strongest: &[usize; TRAIN.len()],
+        (candidate, level): (usize, f64),
+    ) -> Option<Group> {
+        let arrivals = self.cluster_arrivals(envelope, background, strongest);
+        let agreeing = self.agreeing(&arrivals);
+        if agreeing.len() < AGREEING {
             return None;
         }
-        let mut ats: Vec<f64> = members.iter().map(|(at, _, _)| *at).collect();
-        let mut levels: Vec<f64> = members.iter().map(|(_, level, _)| *level).collect();
+        let mut ats: Vec<f64> = agreeing.iter().map(|(at, _, _)| *at).collect();
         Some(Group {
             at: median(&mut ats),
-            level: median(&mut levels),
-            probes: members.iter().map(|(_, _, k)| *k).collect(),
+            level,
+            probes: agreeing.iter().map(|(_, _, k)| *k).collect(),
             candidate,
+        })
+    }
+
+    /// Claude: how a candidate that forms no group fails to agree, from its
+    /// own probes' arrivals: on a trending line (`Moved`), or otherwise
+    /// scattered (`Disagree`).
+    fn failure(
+        &self,
+        envelope: &[f64],
+        background: f64,
+        strongest: &[usize; TRAIN.len()],
+    ) -> ProbeFailure {
+        let arrivals = self.cluster_arrivals(envelope, background, strongest);
+        let by_probe: Vec<(usize, f64)> = arrivals.iter().map(|&(at, _, k)| (k, at)).collect();
+        self.moved(&by_probe).unwrap_or(ProbeFailure::Disagree {
+            spread_ms: (arrivals[arrivals.len() - 1].0 - arrivals[0].0) / self.rate * 1e3,
         })
     }
 
@@ -419,7 +459,7 @@ impl Detector {
         sound_at: [f64; 5],
         envelope: &[f64],
         background: f64,
-        groups: &[Group],
+        groups: &[&Group],
         (candidate, strongest): (usize, [usize; TRAIN.len()]),
     ) -> Result<Measured, ProbeFailure> {
         let ticks_per_second = crate::host_time::ticks_per_second();
@@ -1019,12 +1059,12 @@ mod tests {
     }
 
     /// Claude: an output whose probes arrive 2.3 ms a second later each, and
-    /// a train 40 dB under it that stands still, as the reference played
+    /// a train 40 or 14 dB under it that stands still, as the reference played
     /// before it might leak into its window: the train moved, wherever the
-    /// output has moved to, and the quiet train is not measured instead.
+    /// output has moved to, and the quieter train is not measured instead.
     #[test]
-    fn a_quiet_still_train_does_not_hide_a_louder_one_that_moved() {
-        for from in [0.8, 0.824_38] {
+    fn a_quieter_still_train_does_not_hide_a_louder_one_that_moved() {
+        for (from, under_db) in [(0.8, 40.0), (0.824_38, 40.0), (0.8, 14.0), (0.824_38, 14.0)] {
             let mut paths: Vec<Path> = TRAIN
                 .iter()
                 .enumerate()
@@ -1036,21 +1076,53 @@ mod tests {
                 .collect();
             paths.push(Path {
                 delay: 0.031,
-                gain: 0.003,
+                gain: 0.3 * db(-under_db),
                 probes: None,
             });
+            let label = format!("from {from} s, {under_db} dB under");
             let (span, sound_at) = recorded(48_000.0, &paths, 1e-4);
             let failure = Detector::new(48_000.0)
                 .measure(&span, sound_at)
+                .map(|measured| panic!("{label}: {measured:?}"))
                 .unwrap_err();
             let ProbeFailure::Moved { ms_per_second, .. } = failure else {
-                panic!("from {from} s: {failure:?}")
+                panic!("{label}: {failure:?}")
             };
             assert!(
                 (ms_per_second - 2.3).abs() < 0.02,
-                "from {from} s: {ms_per_second}"
+                "{label}: {ms_per_second}"
             );
         }
+    }
+
+    /// Claude: a direct path 10 dB under an echo 400 ms later is the arrival,
+    /// but with five louder probes scattered about +1900 ms, unexplained, the
+    /// train is not measured at all: neither at the direct path nor at the
+    /// echo.
+    #[test]
+    fn a_louder_sound_left_unexplained_leaves_no_path_measured() {
+        let mut paths = paths(&[(0.012, 0.3 * db(-22.0)), (0.412, 0.3 * db(-12.0))]);
+        let (span, sound_at) = recorded(48_000.0, &paths, 1e-4);
+        let measured = Detector::new(48_000.0)
+            .measure(&span, sound_at)
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        assert!((measured.residual - 0.012).abs() < 1e-5, "{measured:?}");
+        for (k, scatter) in [-0.002, 0.0015, -0.001, 0.002, 0.0].into_iter().enumerate() {
+            paths.push(Path {
+                delay: 1.9 + scatter,
+                gain: 0.3,
+                probes: Some(vec![k]),
+            });
+        }
+        let (span, sound_at) = recorded(48_000.0, &paths, 1e-4);
+        let failure = Detector::new(48_000.0)
+            .measure(&span, sound_at)
+            .map(|measured| panic!("{measured:?}"))
+            .unwrap_err();
+        let ProbeFailure::Disagree { spread_ms } = failure else {
+            panic!("{failure:?}")
+        };
+        assert!((spread_ms - 4.0).abs() < 0.05, "{spread_ms}");
     }
 
     /// Claude: four strong probes agreeing at +31 ms, and `weak` paths 40 dB
@@ -1262,12 +1334,15 @@ mod tests {
     }
 
     /// Claude: four probes heard at +12 ms and, 3.5 dB louder, at +14 ms, and
-    /// a copy of the train 40 or 20 dB under them at +512 ms on the other
-    /// four, so that where the copy's first probe would be, had it been
-    /// heard, the second probe arrives: the copy removes no arrival it has no
-    /// probe at, and the train arrives at +12 ms.
+    /// a copy of the train at +512 ms on the other four, so that where the
+    /// copy's first probe would be, had it been heard, the second probe
+    /// arrives. 40 dB under, the copy removes no arrival, and the train
+    /// arrives at +12 ms. 20 dB under, too faint to take part, it explains
+    /// none of its own probes, two of which come 0.1 and 0.2 s before the
+    /// train's third and fourth in the band where an earlier path makes a
+    /// probe ambiguous: the train is.
     #[test]
-    fn a_copy_of_the_train_removes_no_arrival_where_it_has_no_probe() {
+    fn a_copy_of_the_train_removes_no_arrival_and_one_too_faint_to_take_part_is_ambiguous() {
         for copy_gain in [0.003, 0.03] {
             let on = |delay: f64, gain: f64, probes: &[usize]| Path {
                 delay,
@@ -1280,13 +1355,20 @@ mod tests {
                 on(0.512, copy_gain, &[1, 2, 3, 4]),
             ];
             let (span, sound_at) = recorded(48_000.0, &paths, 1e-4);
-            let measured = Detector::new(48_000.0)
-                .measure(&span, sound_at)
-                .unwrap_or_else(|failure| panic!("copy at {copy_gain}: {failure}"));
-            assert!(
-                (measured.residual - 0.012).abs() < 1e-5,
-                "copy at {copy_gain}: {measured:?}"
-            );
+            match (Detector::new(48_000.0).measure(&span, sound_at), copy_gain) {
+                (Ok(measured), 0.003) => {
+                    assert!((measured.residual - 0.012).abs() < 1e-5, "{measured:?}")
+                }
+                (
+                    Err(ProbeFailure::Ambiguous {
+                        ambiguous: 2,
+                        measurable: 2,
+                        required: 4,
+                    }),
+                    0.03,
+                ) => {}
+                (result, _) => panic!("copy at {copy_gain}: {result:?}"),
+            }
         }
     }
 
