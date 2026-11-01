@@ -159,11 +159,10 @@ pub mod device_output {
         pub unsafe fn open(
             device: DeviceId,
             _source: SourceTiming,
-            _ring: Arc<Ring>,
             _volume: Arc<AtomicU32>,
             _delay: Option<f64>,
             _latency_offset_ms: Option<i32>,
-        ) -> Result<Self, String> {
+        ) -> Result<(Self, Arc<Ring>), String> {
             match device {}
         }
 

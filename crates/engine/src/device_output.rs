@@ -27,14 +27,14 @@ pub struct DeviceOutput {
 }
 
 impl DeviceOutput {
+    /// Claude: and the ring the route's source feeds it through.
     pub unsafe fn open(
         device: AudioObjectID,
         source: SourceTiming,
-        ring: Arc<Ring>,
         volume: Arc<AtomicU32>,
         delay: Option<f64>,
         latency_offset_ms: Option<i32>,
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, Arc<Ring>), String> {
         let mut unit = unsafe { OutputUnit::new(device) }?;
 
         let device_format = unsafe { unit.device_format() }?;
@@ -75,6 +75,7 @@ impl DeviceOutput {
             host_time::ticks_per_second(),
             schedule,
         )?;
+        let ring = playout.ring();
         let health = playout.health();
         tracing::info!(
             src_rate = source.sample_rate,
@@ -87,7 +88,7 @@ impl DeviceOutput {
         let cycles = Arc::new(Cycles::new());
         unsafe {
             unit.connect(
-                ring,
+                Arc::clone(&ring),
                 playout,
                 Fader::new(
                     f32::from_bits(volume.load(Ordering::Relaxed)),
@@ -98,14 +99,17 @@ impl DeviceOutput {
                 Arc::clone(&cycles),
             )
         }?;
-        Ok(Self {
-            unit,
-            health,
-            meter,
-            cycles,
-            reported_glitches: [0; 5],
-            scheduled: schedule.is_some(),
-        })
+        Ok((
+            Self {
+                unit,
+                health,
+                meter,
+                cycles,
+                reported_glitches: [0; 5],
+                scheduled: schedule.is_some(),
+            },
+            ring,
+        ))
     }
 
     /// Claude: `Connected` until the route's ring fills enough to play.

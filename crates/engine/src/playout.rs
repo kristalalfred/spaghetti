@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::delivery::DeliverySpan;
 use crate::mixer::{Cycles, IDLE, RAMP};
-use crate::ring::{CHANNELS, LastPush, Ring, capacity_frames};
+use crate::ring::{CHANNELS, LastPush, Ring};
 use crate::sinks::SourceTiming;
 use crate::spec::Playback;
 
@@ -30,6 +30,34 @@ const CONTROL_DAMPING: f64 = 1.0;
 /// Claude: a scheduled playout further off its schedule than this re-primes
 /// rather than resample its way back.
 const RESCHEDULE_SECONDS: f64 = 0.02;
+/// Claude: a 48 kHz source's route holds a ring of `HELD_FRAMES`; a route
+/// from any other source holds at least the delay that one does at its rate.
+const HELD_FRAMES: usize = 1 << 18;
+const HELD_RATE: f64 = 48_000.0;
+
+/// Claude: the most frames the resampler asks for in one render, as rubato
+/// sizes an `Async` sinc resampler with a fixed output.
+fn max_input_frames(source_rate: f64, device_rate: f64) -> usize {
+    (MAX_RENDER_FRAMES as f64 * source_rate / device_rate * MAX_RATIO_RELATIVE).ceil() as usize
+        + 2
+        + SINC_LEN / 2
+}
+
+/// Claude: what a route's ring holds beside the audio its delay keeps: one
+/// render's input and the lateness tolerated before rescheduling.
+fn reserve_frames(source_rate: f64, device_rate: f64) -> usize {
+    max_input_frames(source_rate, device_rate) + (RESCHEDULE_SECONDS * source_rate).ceil() as usize
+}
+
+/// Claude: the fewest frames, in a power of two, a route's ring needs to hold
+/// at least the delay a 48 kHz source's does in `HELD_FRAMES` at this device
+/// rate, beside its reserve.
+fn ring_capacity(source_rate: f64, device_rate: f64) -> usize {
+    let held = (HELD_FRAMES - reserve_frames(HELD_RATE, device_rate)) as f64;
+    let needed = (held * (source_rate / HELD_RATE)).ceil() as usize
+        + reserve_frames(source_rate, device_rate);
+    needed.next_power_of_two()
+}
 
 /// Claude: a route that plays each frame `delay` seconds after the source
 /// captured it, on a device that takes `latency` seconds from a render's
@@ -265,7 +293,7 @@ impl Playout {
             FixedAsync::Output,
         )
         .map_err(|e| format!("create resampler: {e}"))?;
-        let input = vec![0.0; resampler.input_frames_max() * CHANNELS];
+        let input = vec![0.0; max_input_frames(source_rate, device_rate) * CHANNELS];
         let playout = Self {
             resampler,
             input,
@@ -326,16 +354,25 @@ impl Playout {
     /// plus one render's input and the lateness it tolerates before rescheduling.
     pub fn max_held_seconds(&self) -> f64 {
         let rate = self.health.source_rate;
-        let reserve =
-            self.resampler.input_frames_max() + (RESCHEDULE_SECONDS * rate).ceil() as usize;
-        capacity_frames(rate).saturating_sub(reserve) as f64 / rate
+        (ring_capacity(rate, self.device_rate) - reserve_frames(rate, self.device_rate)) as f64
+            / rate
+    }
+
+    /// Claude: a ring for this playout to read, sized for the longest delay it
+    /// holds.
+    pub fn ring(&self) -> Arc<Ring> {
+        let rate = self.health.source_rate;
+        Arc::new(Ring::with_capacity(
+            rate,
+            ring_capacity(rate, self.device_rate),
+        ))
     }
 
     pub fn minimum_delay(&self, render_ahead: f64) -> f64 {
         render_ahead
             + self.output_latency()
             + (self.delivery.frames()
-                + self.resampler.input_frames_max() as f64
+                + max_input_frames(self.health.source_rate, self.device_rate) as f64
                 + self.margin_frames as f64)
                 / self.health.source_rate
     }
@@ -767,7 +804,7 @@ mod tests {
     /// Claude: a producer and a device clocked independently, advanced in simulated
     /// host time. `device_ppm` makes the device run fast relative to the source.
     struct Sim {
-        ring: Ring,
+        ring: Arc<Ring>,
         source: Source,
         playout: Playout,
         source_rate: f64,
@@ -825,9 +862,10 @@ mod tests {
                 sample_rate: source_rate,
                 delivery: source.span(),
             };
+            let playout = Playout::new(&timing, device_rate, TICKS_PER_SECOND, None).unwrap();
             Self {
-                ring: Ring::new(source_rate),
-                playout: Playout::new(&timing, device_rate, TICKS_PER_SECOND, None).unwrap(),
+                ring: playout.ring(),
+                playout,
                 source,
                 source_rate,
                 pushes,
@@ -865,6 +903,7 @@ mod tests {
             };
             sim.playout =
                 Playout::new(&timing, device_rate, TICKS_PER_SECOND, Some(schedule)).unwrap();
+            sim.ring = sim.playout.ring();
             sim.dated_from = Some(0);
             sim.next_render = start;
             sim
@@ -1546,41 +1585,61 @@ mod tests {
 
     #[test]
     fn every_source_rate_holds_at_least_the_delay_48_khz_holds() {
-        let limit_at = |rate: f64| {
+        let playout = |rate: f64, device: f64, schedule| {
             let timing = SourceTiming {
                 sample_rate: rate,
                 delivery: Arc::new(DeliverySpan::new(rate)),
             };
-            Playout::new(&timing, 44100.0, TICKS_PER_SECOND, None)
-                .unwrap()
-                .max_held_seconds()
+            Playout::new(&timing, device, TICKS_PER_SECOND, schedule)
         };
-        let at_48_khz = limit_at(48000.0);
-        assert!(at_48_khz > 5.3, "only {at_48_khz} s held at 48 kHz");
-        for rate in [16000.0, 44100.0, 48000.0, 96000.0, 192000.0] {
-            let timing = SourceTiming {
-                sample_rate: rate,
-                delivery: Arc::new(DeliverySpan::new(rate)),
-            };
-            let limit = limit_at(rate);
-            assert!(limit >= at_48_khz, "{rate} Hz: only {limit} s held");
-            for latency in [-0.047, 0.0, 0.083] {
-                let schedule = Schedule {
-                    delay: limit + latency + 1.0 / rate,
-                    latency,
-                };
-                assert!(Playout::new(&timing, 44100.0, TICKS_PER_SECOND, Some(schedule)).is_err());
-                let schedule = Schedule {
-                    delay: limit + latency - 1.0 / rate,
-                    latency,
-                };
-                assert!(Playout::new(&timing, 44100.0, TICKS_PER_SECOND, Some(schedule)).is_ok());
+        for device in [8000.0, 44100.0, 48000.0, 96000.0] {
+            assert_eq!(ring_capacity(48000.0, device), HELD_FRAMES, "{device} Hz");
+            let at_48_khz = playout(48000.0, device, None).unwrap().max_held_seconds();
+            for rate in [
+                8000.0, 11025.0, 12000.0, 16000.0, 22050.0, 24000.0, 32000.0, 44100.0, 48000.0,
+                88200.0, 96000.0, 176400.0, 192000.0, 384000.0, 768000.0,
+            ] {
+                let label = format!("{rate} Hz to {device} Hz");
+                let limit = playout(rate, device, None).unwrap().max_held_seconds();
+                assert!(limit >= at_48_khz, "{label}: {limit} s, not {at_48_khz} s");
+                for latency in [-0.047, 0.0, 0.083] {
+                    let over = Schedule {
+                        delay: limit + latency + 1.0 / rate,
+                        latency,
+                    };
+                    assert!(playout(rate, device, Some(over)).is_err(), "{label}");
+                    let within = Schedule {
+                        delay: at_48_khz + latency,
+                        latency,
+                    };
+                    assert!(playout(rate, device, Some(within)).is_ok(), "{label}");
+                }
             }
-            let schedule = Schedule {
-                delay: 2.5,
-                latency: 0.0,
-            };
-            assert!(Playout::new(&timing, 44100.0, TICKS_PER_SECOND, Some(schedule)).is_ok());
+        }
+    }
+
+    #[test]
+    fn the_reserve_counts_what_the_resampler_asks_for() {
+        let params = SincInterpolationParameters::new(SINC_LEN, WindowFunction::BlackmanHarris2);
+        for source in [
+            8000.0, 12000.0, 44100.0, 48000.0, 96000.0, 192000.0, 768000.0,
+        ] {
+            for device in [8000.0, 44100.0, 48000.0, 96000.0] {
+                let resampler = Async::<f32>::new_sinc(
+                    device / source,
+                    MAX_RATIO_RELATIVE,
+                    &params,
+                    MAX_RENDER_FRAMES,
+                    CHANNELS,
+                    FixedAsync::Output,
+                )
+                .unwrap();
+                assert_eq!(
+                    max_input_frames(source, device),
+                    resampler.input_frames_max(),
+                    "{source} Hz to {device} Hz"
+                );
+            }
         }
     }
 
@@ -1711,7 +1770,7 @@ mod tests {
     /// than its ring holds.
     #[test]
     fn plays_the_first_dated_frame_on_schedule_after_undated_ones() {
-        let longer_than_the_ring = (capacity_frames(48000.0) as f64 / 48000.0).ceil() + 1.0;
+        let longer_than_the_ring = (HELD_FRAMES as f64 / 48000.0).ceil() + 1.0;
         for undated in [0.2, longer_than_the_ring] {
             let pushes = on_time(48000.0, 960, 100.0);
             let mut sim = Sim::scheduled(48000.0, 48000.0, 0.0, SCHEDULE, pushes, 0.0013);

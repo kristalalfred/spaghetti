@@ -457,8 +457,7 @@ impl Router {
             _ => {
                 let source = &mut entry.source;
                 let timing = source.timing()?;
-                let ring = Arc::new(Ring::new(timing.sample_rate));
-                let output = match &mut destination {
+                let (output, ring) = match &mut destination {
                     Destination::Device {
                         uid,
                         delay_ms,
@@ -467,16 +466,16 @@ impl Router {
                         let device = audio::find_device_by_uid(uid)
                             .ok_or_else(|| format!("device '{uid}' not found"))?;
                         let delay = delay_ms.map(|ms| f64::from(ms) / 1000.0);
-                        Output::Device(unsafe {
+                        let (output, ring) = unsafe {
                             DeviceOutput::open(
                                 device,
                                 timing,
-                                Arc::clone(&ring),
                                 Arc::clone(&volume),
                                 delay,
                                 *latency_offset_ms,
                             )
-                        }?)
+                        }?;
+                        (Output::Device(output), ring)
                     }
                     Destination::AirPlay {
                         receiver,
@@ -495,13 +494,13 @@ impl Router {
                                 .map(|(&id, route)| (id, &route.destination)),
                         )?;
                         *receiver = id.to_string();
-                        Output::AirPlay(AirPlayOutput::open(
+                        let (output, ring) = AirPlayOutput::open(
                             airplay_browser(),
                             id,
                             playout,
-                            Arc::clone(&ring),
                             Arc::clone(&volume),
-                        ))
+                        );
+                        (Output::AirPlay(output), ring)
                     }
                     Destination::Program {
                         output,
@@ -509,27 +508,35 @@ impl Router {
                         latency_offset_ms,
                     } => {
                         let delay = delay_ms.map(|ms| f64::from(ms) / 1000.0);
-                        Output::Program(ProgramRoute::open(
+                        let (output, ring) = ProgramRoute::open(
                             &self.programs.output(output)?,
                             timing,
-                            Arc::clone(&ring),
                             Arc::clone(&volume),
                             delay,
                             *latency_offset_ms,
-                        )?)
+                        )?;
+                        (Output::Program(output), ring)
                     }
-                    Destination::Srt(socket) => Output::Srt(SrtOutput::open(
-                        socket,
-                        timing,
-                        Arc::clone(&ring),
-                        Arc::clone(&volume),
-                    )?),
-                    Destination::WebRtc(peer) => Output::WebRtc(WebRtcOutput::open(
-                        peer,
-                        timing,
-                        Arc::clone(&ring),
-                        Arc::clone(&volume),
-                    )?),
+                    Destination::Srt(socket) => {
+                        let ring = Arc::new(Ring::new(timing.sample_rate));
+                        let output = SrtOutput::open(
+                            socket,
+                            timing,
+                            Arc::clone(&ring),
+                            Arc::clone(&volume),
+                        )?;
+                        (Output::Srt(output), ring)
+                    }
+                    Destination::WebRtc(peer) => {
+                        let ring = Arc::new(Ring::new(timing.sample_rate));
+                        let output = WebRtcOutput::open(
+                            peer,
+                            timing,
+                            Arc::clone(&ring),
+                            Arc::clone(&volume),
+                        )?;
+                        (Output::WebRtc(output), ring)
+                    }
                 };
                 let sink_slot = source.add_sink(Arc::clone(&ring))?;
                 if let Err(e) = output.start() {

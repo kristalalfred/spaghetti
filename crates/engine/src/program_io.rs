@@ -418,15 +418,15 @@ impl ProgramRoute {
     /// The program passes the time each render is heard, so the output's
     /// latency only bounds how long the route holds a frame before it renders.
     /// A latency offset renders each frame that much earlier, for an output
-    /// heard later than the program says.
+    /// heard later than the program says. Returns the ring the route's source
+    /// feeds it through.
     pub(crate) fn open(
         output: &Arc<OutputShared>,
         source: SourceTiming,
-        ring: Arc<Ring>,
         volume: Arc<AtomicU32>,
         delay: Option<f64>,
         latency_offset_ms: Option<i32>,
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, Arc<Ring>), String> {
         let schedule = delay.map(|delay| Schedule {
             delay,
             latency: output.latency + f64::from(latency_offset_ms.unwrap_or(0)) / 1000.0,
@@ -443,11 +443,12 @@ impl ProgramRoute {
             delay_frames = playout.delay_frames(),
             "created resampler"
         );
+        let ring = playout.ring();
         let health = playout.health();
         let meter = Arc::new(FlowMeter::new());
         let cycles = Arc::new(Cycles::new());
         let render = RouteRender {
-            ring,
+            ring: Arc::clone(&ring),
             playout,
             fader: Fader::new(
                 f32::from_bits(volume.load(Ordering::Relaxed)),
@@ -461,7 +462,7 @@ impl ProgramRoute {
             .routes
             .insert(Box::new(render))
             .map_err(|_| format!("a program output mixes at most {MAX_PROGRAM_ROUTES} routes"))?;
-        Ok(Self {
+        let route = Self {
             output: Arc::clone(output),
             slot,
             health,
@@ -469,7 +470,8 @@ impl ProgramRoute {
             cycles,
             scheduled: schedule.is_some(),
             reported_glitches: [0; 5],
-        })
+        };
+        Ok((route, ring))
     }
 
     /// Claude: `Connected` until the route's playout primes.
@@ -1209,9 +1211,18 @@ mod tests {
         let _late = router
             .add_program_output("late", RATE, Duration::from_secs(9))
             .unwrap();
+        let _slow = router.add_program_input("slow", 12_000.0).unwrap();
+        let _half = router.add_program_input("half", 24_000.0).unwrap();
         let mic = program_source(&mut router, "mic");
         let fast = program_source(&mut router, "fast");
+        let slow = program_source(&mut router, "slow");
+        let half = program_source(&mut router, "half");
         for (source, output, delay_ms, offset_ms, fits) in [
+            (slow, "speaker", 5353, None, true),
+            (half, "speaker", 5353, None, true),
+            (fast, "speaker", 5353, None, true),
+            (mic, "speaker", 5353, None, true),
+            (mic, "speaker", 5354, None, false),
             (mic, "speaker", 2500, None, true),
             (mic, "speaker", 5300, None, true),
             (mic, "speaker", 5300, Some(-300), false),

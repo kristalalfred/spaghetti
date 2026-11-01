@@ -260,9 +260,7 @@ impl Ring {
         Self::starting_at(sample_rate, 0, 0, capacity_frames(sample_rate))
     }
 
-    /// Claude: a ring of `capacity` frames, a power of two, for tests that
-    /// make many.
-    #[cfg(test)]
+    /// Claude: a ring of `capacity` frames, a power of two.
     pub fn with_capacity(sample_rate: f64, capacity: usize) -> Self {
         Self::starting_at(sample_rate, 0, 0, capacity)
     }

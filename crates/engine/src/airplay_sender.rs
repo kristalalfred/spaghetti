@@ -48,19 +48,20 @@ impl AirPlayOutput {
         Ok(playout)
     }
 
+    /// Claude: and the ring the route's source feeds it through.
     pub fn open(
         browser: &airplay::Browser,
         receiver: airplay::ReceiverId,
         playout: Playout,
-        ring: Arc<Ring>,
         volume: Arc<AtomicU32>,
-    ) -> Self {
+    ) -> (Self, Arc<Ring>) {
         let playout_delay = finish_delay(&playout);
+        let ring = playout.ring();
         let health = playout.health();
         let meter = Arc::new(FlowMeter::new());
         let cycles = Arc::new(Cycles::new());
         let mut renderer = Renderer {
-            ring,
+            ring: Arc::clone(&ring),
             playout,
             fader: Fader::new(
                 f32::from_bits(volume.load(Ordering::Relaxed)),
@@ -82,7 +83,7 @@ impl AirPlayOutput {
             let output = host_ticks(render.play_at, anchor, now, frequency);
             renderer.render(&mut render.channels, now, output);
         });
-        Self {
+        let output = Self {
             stream,
             playout_delay,
             receiver: receiver_name,
@@ -91,7 +92,8 @@ impl AirPlayOutput {
             cycles,
             reported_glitches: [0; 5],
             reported_state: None,
-        }
+        };
+        (output, ring)
     }
 
     pub fn finish(self) -> airplay::Finishing {
