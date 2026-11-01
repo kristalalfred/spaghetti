@@ -965,7 +965,7 @@ fn an_output_drifting_slowly_is_not_calibrated_and_says_it_kept_moving() {
     let held = moving(Moving::Drifting { per_second: 0.0003 });
     let Err(CalibrationFailure::Unsettled {
         role: Role::Output,
-        ms_per_second,
+        movement: Movement::AgainstReference { ms_per_second },
         after_seconds,
     }) = held.result
     else {
@@ -1012,7 +1012,7 @@ fn an_output_settling_as_slowly_as_a_receiver_measured_is_not_calibrated() {
     });
     let Err(CalibrationFailure::Unsettled {
         role: Role::Output,
-        ms_per_second,
+        movement: Movement::AgainstSchedule { ms_per_second },
         ..
     }) = held.result
     else {
@@ -1040,7 +1040,9 @@ fn an_output_that_sways_with_its_trains_drifts_within_them_and_is_not_calibrated
         rising: TRAINS_FROM + TRAINS_EVERY + 1.3,
     });
     let Err(CalibrationFailure::Unsettled {
-        role: Role::Output, ..
+        role: Role::Output,
+        movement: Movement::AgainstReference { .. },
+        ..
     }) = held.result
     else {
         panic!("{:?}", held.result)
@@ -1059,7 +1061,7 @@ fn an_output_that_steps_between_its_trains_is_not_calibrated() {
     });
     let Err(CalibrationFailure::Unsettled {
         role: Role::Output,
-        ms_per_second,
+        movement: Movement::BetweenTrains { ms_per_second },
         ..
     }) = held.result
     else {

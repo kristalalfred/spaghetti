@@ -65,8 +65,8 @@ mod no_hal;
 use no_hal::{audio, bus, device_output, input, tap};
 
 pub use calibration::{
-    Calibrated, Calibrating, Calibration, CalibrationFailure, CalibrationState, ProbeFailure,
-    Recording, RecordingFailure, Residual, Role,
+    Calibrated, Calibrating, Calibration, CalibrationFailure, CalibrationState, Movement,
+    ProbeFailure, Recording, RecordingFailure, Residual, Role,
 };
 pub use host_time::HostTime;
 pub use program_io::{

@@ -58,6 +58,11 @@ const NEAR_SECONDS: f64 = 0.003;
 const AGREEMENT_SECONDS: f64 = 0.001;
 /// Claude: how many probes of a train make a match.
 const AGREEING: usize = 4;
+/// Claude: how many standard errors, against the arrivals' scatter about
+/// their line, a train's slope must stand from zero for its timing to have
+/// moved rather than its arrivals to have scattered: past the 99% two-sided
+/// t value for four arrivals, 9.9, and for five, 5.8.
+const TREND: f64 = 10.0;
 
 fn ratio(db: f64) -> f64 {
     10f64.powf(db / 20.0)
@@ -377,10 +382,11 @@ impl Detector {
     }
 
     /// Claude: how the arrivals moved, `(k, samples off the layout)` sorted by
-    /// the latter, when there are enough to make a match and they lie within
-    /// `AGREEMENT_SECONDS` of a line through their probes' times, as the
-    /// arrivals of a destination whose timing moves steadily do; none when
-    /// they scatter, as probes heard by different paths do.
+    /// the latter, when there are enough to make a match, they lie within
+    /// `AGREEMENT_SECONDS` of a line through their probes' times, and that
+    /// line's slope stands `TREND` standard errors from zero, as the arrivals
+    /// of a destination whose timing moves steadily do; none when they
+    /// scatter, as probes heard by different paths do.
     fn moved(&self, arrivals: &[(usize, f64)]) -> Option<ProbeFailure> {
         if arrivals.len() < AGREEING {
             return None;
@@ -390,11 +396,19 @@ impl Detector {
             .map(|&(k, at)| (TRAIN[k], at / self.rate))
             .collect();
         let (slope, mean_t, mean_at) = fit(&points);
-        let on_a_line = points
+        let residuals: Vec<f64> = points
             .iter()
-            .all(|(t, at)| (at - (mean_at + slope * (t - mean_t))).abs() <= AGREEMENT_SECONDS);
+            .map(|(t, at)| at - (mean_at + slope * (t - mean_t)))
+            .collect();
+        let on_a_line = residuals
+            .iter()
+            .all(|residual| residual.abs() <= AGREEMENT_SECONDS);
+        let scatter = residuals.iter().map(|r| r * r).sum::<f64>() / (points.len() - 2) as f64;
+        let spread_of_times: f64 = points.iter().map(|(t, _)| (t - mean_t).powi(2)).sum();
+        let standard_error = (scatter / spread_of_times).sqrt();
+        let trending = slope.abs() > TREND * standard_error;
         let spread = arrivals[arrivals.len() - 1].1 - arrivals[0].1;
-        on_a_line.then(|| ProbeFailure::Moved {
+        (on_a_line && trending).then(|| ProbeFailure::Moved {
             spread_ms: spread / self.rate * 1e3,
             ms_per_second: slope * 1e3,
         })
@@ -822,6 +836,30 @@ mod tests {
             said.contains("leaving 3 measurable where 4 must agree"),
             "{said}"
         );
+    }
+
+    /// Claude: arrivals that lie within 1 ms of a line through their probes'
+    /// times but scatter about it with no trend, three of them agreeing, did
+    /// not move: they disagree.
+    #[test]
+    fn arrivals_near_a_flat_line_without_a_trend_disagree_rather_than_moved() {
+        let paths: Vec<Path> = [-0.000_652, 0.000_569, -0.000_001, 0.000_625, -0.000_542]
+            .into_iter()
+            .enumerate()
+            .map(|(k, scatter)| Path {
+                delay: 0.02 + scatter,
+                gain: 0.3,
+                probes: Some(vec![k]),
+            })
+            .collect();
+        let (span, sound_at) = recorded(48_000.0, &paths, 1e-5);
+        let failure = Detector::new(48_000.0)
+            .measure(&span, sound_at)
+            .unwrap_err();
+        let ProbeFailure::Disagree { spread_ms } = failure else {
+            panic!("{failure:?}")
+        };
+        assert!((spread_ms - 1.277).abs() < 0.02, "{spread_ms}");
     }
 
     /// Claude: a train played by a receiver that slews its clock 2.3 ms a

@@ -105,12 +105,12 @@ pub enum CalibrationFailure {
         failure: ProbeFailure,
     },
     Recording(RecordingFailure),
-    /// Claude: a leg's timing kept moving, `ms_per_second` a second against
-    /// its schedule `after_seconds` after it started playing, when the
-    /// calibration stopped waiting for it to settle.
+    /// Claude: a leg's timing kept moving, as `movement` measured it
+    /// `after_seconds` after the leg started playing, when the calibration
+    /// stopped waiting for it to settle.
     Unsettled {
         role: Role,
-        ms_per_second: f64,
+        movement: Movement,
         after_seconds: f64,
     },
     /// Claude: the router, or a program input or output the calibration
@@ -133,13 +133,12 @@ impl std::fmt::Display for CalibrationFailure {
             Self::Recording(failure) => failure.fmt(f),
             Self::Unsettled {
                 role,
-                ms_per_second,
+                movement,
                 after_seconds,
             } => write!(
                 f,
-                "the {role}'s timing kept moving: {ms_per_second:+.3} ms a second against its \
-                 schedule {after_seconds:.0} s after it started playing, where a settled one \
-                 moves under 0.02"
+                "the {role}'s timing kept moving {after_seconds:.0} s after it started playing: \
+                 {movement}"
             ),
             Self::EndpointRemoved => f.write_str("a program input or output it used was removed"),
             Self::Cancelled => f.write_str("cancelled"),
@@ -148,6 +147,57 @@ impl std::fmt::Display for CalibrationFailure {
 }
 
 impl std::error::Error for CalibrationFailure {}
+
+/// Claude: what showed a leg still moving when a calibration stopped waiting
+/// for it to settle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Movement {
+    /// Claude: its probes, within one train, moved this fast against their
+    /// schedules, too far for one train's arrivals to agree.
+    AgainstSchedule { ms_per_second: f64 },
+    /// Claude: the output's probes, within one train, drifted this fast
+    /// against the reference trains' around it.
+    AgainstReference { ms_per_second: f64 },
+    /// Claude: the reference trains drifted within themselves at rates this
+    /// far apart.
+    ReferenceDrifts { apart_ms_per_second: f64 },
+    /// Claude: the output's lateness against the reference moved this fast
+    /// between its latest two trains.
+    BetweenTrains { ms_per_second: f64 },
+}
+
+impl std::fmt::Display for Movement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let steady = job::STEADY_DRIFT * 1e3;
+        match self {
+            Self::AgainstSchedule { ms_per_second } => write!(
+                f,
+                "within a train its probes moved {ms_per_second:+.3} ms a second against their \
+                 schedules, too far for one train's arrivals to agree within 1 ms"
+            ),
+            Self::AgainstReference { ms_per_second } => write!(
+                f,
+                "within a train it drifted {ms_per_second:+.3} ms a second against the reference \
+                 trains around it, where a settled output drifts under {steady}"
+            ),
+            Self::ReferenceDrifts {
+                apart_ms_per_second,
+            } => write!(
+                f,
+                "its trains drifted within themselves at rates {apart_ms_per_second:.3} ms a \
+                 second apart, where a settled reference's differ by under {steady}"
+            ),
+            Self::BetweenTrains { ms_per_second } => write!(
+                f,
+                "against the reference it moved {ms_per_second:+.3} ms a second between its \
+                 trains, where a settled output moves under {:.2} ms between trains about {:.1} s \
+                 apart",
+                job::STEADY_SPAN * 1e3,
+                job::OUTPUT_TRAINS_APART,
+            ),
+        }
+    }
+}
 
 /// Claude: why a train was not measured.
 #[derive(Debug, Clone, PartialEq)]

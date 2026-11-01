@@ -20,8 +20,8 @@ use super::emitter::{self, Emitter};
 use super::probe::{MIN_RECORDING_RATE, TRAIN, TRAIN_SECONDS};
 use super::recorder::Recorder;
 use super::{
-    Calibrated, CalibrationFailure, CalibrationState, ProbeFailure, RecordingFailure, Residual,
-    Role,
+    Calibrated, CalibrationFailure, CalibrationState, Movement, ProbeFailure, RecordingFailure,
+    Residual, Role,
 };
 
 const TICK: Duration = Duration::from_millis(5);
@@ -47,11 +47,14 @@ pub(super) const RECORDING_LAG: f64 = 2.0;
 /// second, for its leg to count as settled. A receiver settling
 /// exponentially with a time constant of a minute, as one was measured to,
 /// drifts this little only within 1.2 ms of where it settles.
-const STEADY_DRIFT: f64 = 0.000_02;
+pub(super) const STEADY_DRIFT: f64 = 0.000_02;
 /// Claude: how far apart two successive output trains' lateness against the
 /// reference may lie, about 10.6 s apart, for the output to count as
 /// settled: at that time constant, within 1.3 ms of where it settles.
-const STEADY_SPAN: f64 = 0.000_25;
+pub(super) const STEADY_SPAN: f64 = 0.000_25;
+/// Claude: how far apart, in seconds, successive output trains sound: two
+/// trains' searches, early, probes and late.
+pub(super) const OUTPUT_TRAINS_APART: f64 = 2.0 * (EARLY + TRAIN_SECONDS + LATE);
 /// Claude: how many output trains, each between two reference trains, a
 /// calibration plays before it stops waiting for the output to settle.
 const MOST_OUTPUT_TRAINS: usize = 5;
@@ -656,25 +659,32 @@ impl Job {
         let moving = (output - 3..=output + 1)
             .rev()
             .find_map(|train| match measured[train] {
-                Outcome::Moving { ms_per_second } => Some((role_of(train), *ms_per_second)),
+                Outcome::Moving { ms_per_second } => Some((
+                    role_of(train),
+                    Movement::AgainstSchedule {
+                        ms_per_second: *ms_per_second,
+                    },
+                )),
                 Outcome::Steady(_) => None,
             });
-        let (role, ms_per_second) = moving.unwrap_or_else(|| {
+        let (role, movement) = moving.unwrap_or_else(|| {
             let window: Vec<&Measured> = (output - 3..=output + 1)
                 .filter_map(|train| measured[train].steady())
                 .collect();
-            movement(&window).map_or_else(
-                || {
-                    let seconds = (window[3].at - window[1].at) / ticks;
-                    let moved = lateness(&window, 3) - lateness(&window, 1);
-                    (Role::Output, moved / seconds * 1e3)
-                },
-                |(role, drift)| (role, drift * 1e3),
-            )
+            movement(&window).unwrap_or_else(|| {
+                let seconds = (window[3].at - window[1].at) / ticks;
+                let moved = lateness(&window, 3) - lateness(&window, 1);
+                (
+                    Role::Output,
+                    Movement::BetweenTrains {
+                        ms_per_second: moved / seconds * 1e3,
+                    },
+                )
+            })
         });
         CalibrationFailure::Unsettled {
             role,
-            ms_per_second,
+            movement,
             after_seconds: self
                 .leg(role)
                 .running_since
@@ -795,18 +805,28 @@ fn index(role: Role) -> usize {
 /// first: an output train against the reference trains around it, or the
 /// reference trains against one another. A recording whose dates drift
 /// steadily drifts every train alike, which cancels.
-fn movement(window: &[&Measured]) -> Option<(Role, f64)> {
+fn movement(window: &[&Measured]) -> Option<(Role, Movement)> {
     for output in [3, 1] {
         let reference = (window[output - 1].drift + window[output + 1].drift) / 2.0;
         let drift = window[output].drift - reference;
         if drift.abs() > STEADY_DRIFT {
-            return Some((Role::Output, drift));
+            return Some((
+                Role::Output,
+                Movement::AgainstReference {
+                    ms_per_second: drift * 1e3,
+                },
+            ));
         }
     }
     let references = [window[0].drift, window[2].drift, window[4].drift];
     let lowest = references.iter().copied().fold(f64::INFINITY, f64::min);
     let highest = references.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    (highest - lowest > STEADY_DRIFT).then(|| (Role::Reference, window[4].drift - window[0].drift))
+    (highest - lowest > STEADY_DRIFT).then_some((
+        Role::Reference,
+        Movement::ReferenceDrifts {
+            apart_ms_per_second: (highest - lowest) * 1e3,
+        },
+    ))
 }
 
 /// Claude: how much later than the reference output train `train` of a
@@ -815,4 +835,76 @@ fn lateness(window: &[&Measured], train: usize) -> f64 {
     let (first, output, second) = (window[train - 1], window[train], window[train + 1]);
     let along = (output.at - first.at) / (second.at - first.at);
     output.residual - (first.residual + (second.residual - first.residual) * along)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn train(at: f64, drift_ms_per_second: f64) -> Measured {
+        Measured {
+            residual: 0.0,
+            spread: 0.0,
+            at,
+            drift: drift_ms_per_second / 1e3,
+        }
+    }
+
+    /// Claude: reference trains drifting 0, 0.03 and 0 ms a second, around
+    /// output trains that drift 0, fail as reference trains whose drifts lie
+    /// 0.03 ms a second apart: not as 0, which the first and last alone give.
+    #[test]
+    fn reference_trains_drifting_apart_report_how_far_apart() {
+        let window = [
+            train(0.0, 0.0),
+            train(5.3, 0.0),
+            train(10.6, 0.03),
+            train(15.9, 0.0),
+            train(21.2, 0.0),
+        ];
+        let window: Vec<&Measured> = window.iter().collect();
+        let Some((
+            Role::Reference,
+            Movement::ReferenceDrifts {
+                apart_ms_per_second,
+            },
+        )) = movement(&window)
+        else {
+            panic!("{:?}", movement(&window))
+        };
+        assert!(
+            (apart_ms_per_second - 0.03).abs() < 1e-9,
+            "{apart_ms_per_second}"
+        );
+        let said = CalibrationFailure::Unsettled {
+            role: Role::Reference,
+            movement: Movement::ReferenceDrifts {
+                apart_ms_per_second,
+            },
+            after_seconds: 30.0,
+        }
+        .to_string();
+        assert!(
+            said.contains("the reference's timing kept moving")
+                && said.contains("at rates 0.030 ms a second apart"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn an_output_drifting_against_the_reference_trains_around_it_reports_that() {
+        let window = [
+            train(0.0, 0.01),
+            train(5.3, 0.01),
+            train(10.6, 0.01),
+            train(15.9, 0.05),
+            train(21.2, 0.01),
+        ];
+        let window: Vec<&Measured> = window.iter().collect();
+        let Some((Role::Output, Movement::AgainstReference { ms_per_second })) = movement(&window)
+        else {
+            panic!("{:?}", movement(&window))
+        };
+        assert!((ms_per_second - 0.04).abs() < 1e-9, "{ms_per_second}");
+    }
 }
