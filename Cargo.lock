@@ -43,6 +43,7 @@ dependencies = [
  "num-bigint",
  "plist",
  "sha2",
+ "socket2 0.6.3",
  "tracing",
  "tracing-subscriber",
 ]

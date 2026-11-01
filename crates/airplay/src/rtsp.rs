@@ -2,10 +2,9 @@ use std::fmt::{self, Write as _};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::thread;
 use std::time::{Duration, Instant};
 
+use socket2::{Domain, Socket, Type};
 use tracing::debug;
 
 use crate::hap;
@@ -191,6 +190,9 @@ pub(crate) struct Connection {
     cseq: u32,
     common: Vec<(&'static str, String)>,
     channel: Option<hap::Channel>,
+    /// Claude: a request went out only in part, so the receiver can make
+    /// nothing more of the connection.
+    broken: bool,
 }
 
 impl Connection {
@@ -225,6 +227,7 @@ impl Connection {
                         cseq: 0,
                         common,
                         channel: None,
+                        broken: false,
                     });
                 }
                 Err(e) if e.kind() == ErrorKind::Interrupted => return Err(OpenError::Stopped),
@@ -271,17 +274,62 @@ impl Connection {
         self.channel = Some(hap::Channel::new(keys));
     }
 
-    /// Claude: sends a request and returns its CSeq.
-    pub(crate) fn send(&mut self, request: &Request) -> Result<u32, String> {
+    /// Claude: sends a request and returns its CSeq, giving up at `deadline`
+    /// or soon after `abort` turns true. A request given up on part sent
+    /// breaks the connection.
+    pub(crate) fn send(
+        &mut self,
+        request: &Request,
+        deadline: Instant,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<u32, String> {
+        if self.broken {
+            return Err(format!(
+                "could not send {}: an earlier request went out only in part",
+                request.method
+            ));
+        }
         self.cseq += 1;
         let mut bytes = encode_request(request, self.cseq, &self.common);
         debug!(peer = %self.peer, request = %described(&bytes), "RTSP request");
         if let Some(channel) = &mut self.channel {
             bytes = channel.seal(&bytes);
         }
-        self.stream
-            .write_all(&bytes)
-            .map_err(|e| format!("could not send {} ({e})", request.method))?;
+        let mut sent = 0;
+        while sent < bytes.len() {
+            let failed = |reason: String| format!("could not send {} ({reason})", request.method);
+            let left = deadline.saturating_duration_since(Instant::now());
+            let given_up = if abort() {
+                Some("stopped".to_string())
+            } else if left.is_zero() {
+                Some(failed("the receiver took no more in time".into()))
+            } else {
+                None
+            };
+            if let Some(reason) = given_up {
+                self.broken = sent > 0;
+                return Err(reason);
+            }
+            self.stream
+                .set_write_timeout(Some(left.min(ABORT_CHECK)))
+                .map_err(|e| failed(e.to_string()))?;
+            match self.stream.write(&bytes[sent..]) {
+                Ok(0) => {
+                    self.broken = true;
+                    return Err(failed("the connection closed".into()));
+                }
+                Ok(n) => sent += n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                    ) => {}
+                Err(e) => {
+                    self.broken = true;
+                    return Err(failed(e.to_string()));
+                }
+            }
+        }
         Ok(self.cseq)
     }
 
@@ -296,11 +344,8 @@ impl Connection {
         if abort() {
             return Err("stopped".into());
         }
-        self.stream
-            .set_write_timeout(Some(timeout))
-            .map_err(|e| e.to_string())?;
-        let cseq = self.send(request)?;
         let deadline = Instant::now() + timeout;
+        let cseq = self.send(request, deadline, abort)?;
         loop {
             while let Some(response) = self.next_response()? {
                 if response.cseq() == Some(cseq) {
@@ -365,9 +410,9 @@ impl Connection {
     }
 }
 
-/// Claude: connects on a thread of its own so that `abort` can cut the wait
-/// short; an abandoned attempt ends by itself within `timeout`. Nothing is
-/// attempted once `abort` is true.
+/// Claude: connects within `timeout` on the calling thread, checking `abort`
+/// as it waits; an attempt given up closes its socket at once, so it never
+/// connects later. Nothing is attempted once `abort` is true.
 pub(crate) fn connect(
     address: SocketAddr,
     timeout: Duration,
@@ -376,20 +421,45 @@ pub(crate) fn connect(
     if abort() {
         return Err(ErrorKind::Interrupted.into());
     }
-    let (sender, receiver) = mpsc::channel();
-    thread::Builder::new()
-        .name("airplay-connect".into())
-        .spawn(move || {
-            let _ = sender.send(TcpStream::connect_timeout(&address, timeout));
-        })?;
-    loop {
-        match receiver.recv_timeout(ABORT_CHECK) {
-            Ok(result) => return result,
-            Err(RecvTimeoutError::Timeout) if !abort() => {}
-            Err(RecvTimeoutError::Timeout) => return Err(ErrorKind::Interrupted.into()),
-            Err(RecvTimeoutError::Disconnected) => return Err(ErrorKind::Other.into()),
-        }
+    let deadline = Instant::now() + timeout;
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_nonblocking(true)?;
+    match socket.connect(&address.into()) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(ErrorKind::TimedOut, "connection timed out"));
+            }
+            if writable(socket.as_raw_fd(), left.min(ABORT_CHECK)) {
+                if let Some(e) = socket.take_error()? {
+                    return Err(e);
+                }
+                break;
+            }
+            if abort() {
+                return Err(ErrorKind::Interrupted.into());
+            }
+        },
+        Err(e) => return Err(e),
     }
+    socket.set_nonblocking(false)?;
+    Ok(socket.into())
+}
+
+fn writable(fd: RawFd, timeout: Duration) -> bool {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let ms = timeout.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32;
+    let ready = unsafe { libc::poll(&mut pollfd, 1, ms) };
+    ready > 0 && pollfd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) != 0
 }
 
 pub(crate) enum OpenError {
@@ -504,6 +574,8 @@ fn redacted(value: &plist::Value, out: &mut String) {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use super::*;
 
     #[test]
@@ -656,7 +728,10 @@ mod tests {
             headers: vec![("X-Apple-HKP", "4".into())],
             body: Some(("application/octet-stream", &[7u8; 1100][..])),
         };
-        connection.send(&request("OPTIONS")).unwrap();
+        let soon = Instant::now() + Duration::from_secs(1);
+        connection
+            .send(&request("OPTIONS"), soon, &|| false)
+            .unwrap();
         let response = connection
             .exchange(&request("POST"), Duration::from_secs(2), &|| false)
             .unwrap();
@@ -666,6 +741,56 @@ mod tests {
         assert!(plaintext.contains("POST * RTSP/1.0\r\nCSeq: 2\r\n"));
         assert!(!wire.windows(4).any(|w| w == b"RTSP" || w == b"CSeq"));
         assert_eq!(wire.len(), plaintext.len() + 18 * 4);
+    }
+
+    /// Claude: a request far larger than the kernel buffers on both ends, to
+    /// a peer that never reads it.
+    #[test]
+    fn a_stalled_write_gives_up_when_stopped_or_late_and_breaks_the_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let open = || {
+            Connection::open(
+                &[address],
+                Duration::from_secs(1),
+                Instant::now() + Duration::from_secs(1),
+                vec![],
+                &|| false,
+            )
+            .map_err(|e| e.to_string())
+            .unwrap()
+        };
+        let body = vec![0u8; 32 << 20];
+        let large = Request {
+            method: "POST",
+            uri: "*",
+            headers: vec![],
+            body: Some(("application/octet-stream", &body)),
+        };
+        let small = Request {
+            method: "OPTIONS",
+            uri: "*",
+            headers: vec![],
+            body: None,
+        };
+        let later = || Instant::now() + Duration::from_secs(5);
+
+        let mut stopped = open();
+        let stop_at = Instant::now() + Duration::from_millis(200);
+        let sent = stopped.send(&large, later(), &|| Instant::now() >= stop_at);
+        let after = Instant::now().duration_since(stop_at);
+        assert_eq!(sent, Err("stopped".into()));
+        assert!(after < ABORT_CHECK + Duration::from_millis(50), "{after:?}");
+        assert!(stopped.send(&small, later(), &|| false).is_err());
+
+        let mut late = open();
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let sent = late.send(&large, deadline, &|| false).unwrap_err();
+        let after = Instant::now().duration_since(deadline);
+        assert!(sent.contains("took no more in time"), "{sent}");
+        assert!(after < ABORT_CHECK + Duration::from_millis(50), "{after:?}");
+        let refused = late.exchange(&small, Duration::from_secs(1), &|| false);
+        assert!(refused.unwrap_err().contains("only in part"));
     }
 
     #[test]

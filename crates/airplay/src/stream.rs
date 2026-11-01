@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -87,14 +87,6 @@ impl Stream {
             command: AtomicU8::new(Command::Play as u8),
             clock: Clock::start(),
             playout_delay: OnceLock::new(),
-            finish_bound: settings
-                .as_ref()
-                .map_or(Duration::ZERO, |s| s.latency + s.teardown_timeout),
-            stop_bound: settings
-                .as_ref()
-                .map_or(Duration::ZERO, |s| s.teardown_timeout + 2 * POLL_SLICE),
-            ended: Mutex::new(false),
-            ending: Condvar::new(),
         });
         let browser = browser.shared().clone();
         let turn = browser.turns.take(receiver.clone());
@@ -102,10 +94,7 @@ impl Stream {
             let shared = shared.clone();
             thread::Builder::new()
                 .name("airplay-stream".into())
-                .spawn(move || {
-                    let _ended = Ended(&shared);
-                    run(&shared, &browser, &receiver, turn, settings, render);
-                })
+                .spawn(move || run(&shared, &browser, &receiver, turn, settings, render))
                 .map_err(|e| format!("could not start the stream's thread ({e})"))
         });
         let thread = thread
@@ -125,29 +114,29 @@ impl Stream {
     /// Codex: stops rendering and returns at once. The session keeps answering
     /// the receiver through the last packet's end plus `playout_delay`, for a
     /// receiver that sounds frames later than `Render::play_at`, then tears down.
+    /// Waiting on the result returns at most `LATENCY`, `playout_delay` and the
+    /// teardown timeout from now, with a poll slice or two.
     pub fn finish(mut self, playout_delay: Duration) -> Finishing {
         self.shared.playout_delay.set(playout_delay).unwrap();
         self.shared
             .command
             .store(Command::Finish as u8, Ordering::Release);
         Finishing {
-            deadline: Instant::now() + self.shared.finish_bound + playout_delay,
-            shared: self.shared.clone(),
             thread: self.thread.take(),
         }
     }
 
     /// Claude: stops rendering and sending and tears the session down without
     /// letting the receiver play out what it holds, which it may still play.
-    /// Waiting on the result returns once the session's thread released its
-    /// sockets, at most the teardown timeout and two poll slices from now.
+    /// Every wait the session makes from now on, connecting, sending, reading
+    /// or tearing down, gives up once stopped or within the teardown timeout,
+    /// so waiting on the result returns at most that and a poll slice or two
+    /// from now.
     pub fn stop(mut self) -> Finishing {
         self.shared
             .command
             .store(Command::Stop as u8, Ordering::Release);
         Finishing {
-            deadline: Instant::now() + self.shared.stop_bound,
-            shared: self.shared.clone(),
             thread: self.thread.take(),
         }
     }
@@ -168,12 +157,10 @@ impl Drop for Stream {
     }
 }
 
-/// Claude: a stream playing out its last packets. The receiver is still taken
-/// until it is finished.
+/// Claude: a stream playing out its last packets, or tearing down. The
+/// receiver is still taken until it is finished.
 pub struct Finishing {
-    shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
-    deadline: Instant,
 }
 
 impl Finishing {
@@ -181,22 +168,11 @@ impl Finishing {
         self.thread.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
-    /// Codex: blocks until the session has torn down, at most `LATENCY` plus
-    /// `playout_delay` and the teardown timeout from `finish`. A session still
-    /// running then, held up by its renderer, keeps the receiver taken until it ends.
+    /// Codex: blocks until the session's thread has torn down and released
+    /// its sockets, within the bound `finish` or `stop` gives. A renderer that
+    /// blocks holds it up, and keeps the receiver taken, until it returns.
     pub fn wait(mut self) {
-        let Some(thread) = self.thread.take() else {
-            return;
-        };
-        let ended = self.shared.lock_ended();
-        let timeout = self.deadline.saturating_duration_since(Instant::now());
-        let (ended, _) = self
-            .shared
-            .ending
-            .wait_timeout_while(ended, timeout, |ended| !*ended)
-            .unwrap_or_else(PoisonError::into_inner);
-        if *ended {
-            drop(ended);
+        if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
@@ -207,21 +183,6 @@ struct Shared {
     command: AtomicU8,
     clock: Clock,
     playout_delay: OnceLock<Duration>,
-    finish_bound: Duration,
-    stop_bound: Duration,
-    ended: Mutex<bool>,
-    ending: Condvar,
-}
-
-/// Claude: tells a waiting `Finishing` that the session's thread is done, after
-/// it has released everything, however it ends.
-struct Ended<'a>(&'a Shared);
-
-impl Drop for Ended<'_> {
-    fn drop(&mut self) {
-        *self.0.lock_ended() = true;
-        self.0.ending.notify_all();
-    }
 }
 
 impl Shared {
@@ -235,10 +196,6 @@ impl Shared {
 
     fn set_status(&self, status: Status) {
         *self.status.lock().unwrap_or_else(PoisonError::into_inner) = status;
-    }
-
-    fn lock_ended(&self) -> MutexGuard<'_, bool> {
-        self.ended.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -697,7 +654,10 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
                 }
             };
             if let Err(reason) = step {
-                return End::Lost(reason);
+                return match self.shared.command() {
+                    Command::Stop => End::Stopped,
+                    _ => End::Lost(reason),
+                };
             }
         }
     }
@@ -896,7 +856,10 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
                 headers: vec![],
                 body: None,
             };
-            let cseq = self.session.connection.send(&request)?;
+            let shared = self.shared;
+            let stopped = || shared.command() == Command::Stop;
+            let deadline = now + self.settings.answer_timeout;
+            let cseq = self.session.connection.send(&request, deadline, &stopped)?;
             self.keepalive.outstanding = Some((cseq, now));
         }
         if let Some(last) = self.timing.last_request()

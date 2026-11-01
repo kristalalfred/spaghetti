@@ -1664,7 +1664,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn finishing_is_bounded_while_the_renderer_blocks_but_the_receiver_stays_taken() {
+    fn finishing_waits_out_a_blocked_renderer_and_the_receiver_stays_taken_meanwhile() {
         let fake = Fake::start(Behavior::default());
         let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
         let (release, held) = mpsc::channel::<()>();
@@ -1689,20 +1689,21 @@ pub(crate) mod tests {
         let bound = LATENCY + settings().teardown_timeout;
         let (waited, wait_returned) = mpsc::channel();
         let finishing = thread::spawn(move || {
-            let started = Instant::now();
             stream.finish(Duration::ZERO).wait();
-            let _ = waited.send(started.elapsed());
+            let _ = waited.send(Instant::now());
         });
-        let elapsed = wait_returned.recv_timeout(bound + PROMPT);
+        let early = wait_returned.recv_timeout(bound + PROMPT);
         let taken = next.status() == Status::Connecting;
+        let released = Instant::now();
         drop(release);
+        let returned = wait_returned
+            .recv_timeout(bound + PROMPT)
+            .expect("finishing never returned");
         finishing.join().unwrap();
-        let elapsed = elapsed.expect("finishing waited past its bound");
-        assert!(
-            elapsed >= bound && elapsed < bound + PROMPT,
-            "waited {elapsed:?}"
-        );
+        assert!(early.is_err(), "finishing returned while the session still ran");
         assert!(taken, "the receiver was freed while the session still ran");
+        let after = returned.duration_since(released);
+        assert!(after < bound + PROMPT, "returned {after:?} after the renderer");
         assert!(wait_until(Duration::from_secs(2), || streaming(&next)));
     }
 
@@ -1760,6 +1761,33 @@ pub(crate) mod tests {
         assert!(fake.methods().iter().any(|method| method == "TEARDOWN"));
         std::thread::sleep(Duration::from_millis(50));
         assert!(fake.audio().len() <= sent + 1);
+    }
+
+    /// Claude: an asleep fake drops each SYN, so the attempt is pending; once
+    /// it wakes, an attempt still pending would connect at its next SYN.
+    #[test]
+    fn a_stream_stopped_while_its_connection_is_pending_ends_at_once_and_never_connects() {
+        let fake = Fake::asleep(Behavior::default());
+        let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+        let pending = Settings {
+            connect_timeout: Duration::from_secs(5),
+            wake_window: Duration::from_secs(10),
+            ..settings()
+        };
+        let stream = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(pending),
+            Renders::default().renderer(None),
+        );
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(stream.status(), Status::Connecting);
+        let stopped_at = Instant::now();
+        stream.stop().wait();
+        assert!(stopped_at.elapsed() < PROMPT, "{:?}", stopped_at.elapsed());
+        fake.wake();
+        thread::sleep(Duration::from_millis(2500));
+        assert_eq!(fake.accepted(), 0, "a stopped stream's attempt connected");
     }
 
     #[test]
