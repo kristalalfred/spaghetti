@@ -10,6 +10,13 @@ tokio = { version = "1", features = ["full"] }
 edition = "2024"
 license = "MIT"
 
+# Claude: the engine's tests play and analyse audio through generic code, such
+# as rubato's resampler and rustfft's transforms, compiled into the engine at
+# its own level. Unoptimized, they use most of the machine and starve its
+# timing-sensitive tests.
+[profile.test]
+opt-level = 1
+
 [profile.dev.package.rubato]
 opt-level = 3
 
