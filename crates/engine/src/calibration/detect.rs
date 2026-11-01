@@ -189,7 +189,7 @@ impl Detector {
         let late_ms = |index: usize, k: usize| {
             (span.date(index as f64) - sound_at[k]) / ticks_per_second * 1e3
         };
-        let strongest = self.strongest_train(&envelope);
+        let strongest = self.strongest_train(&envelope, background);
         debug!(
             background_dbfs = %format!("{:.1}", db(background / self.floor) + FLOOR_DBFS),
             first_strongest_ms = %format!("{:+.2}", late_ms(strongest[0], 0)),
@@ -366,9 +366,10 @@ impl Detector {
     }
 
     /// Claude: each probe's strongest peak where the train is strongest: the
-    /// alignment of the layout whose probes' loudest envelope within
-    /// `NEAR_SECONDS` of their places sums highest.
-    fn strongest_train(&self, envelope: &[f64]) -> [usize; TRAIN.len()] {
+    /// alignment of the layout with the most probes heard within
+    /// `NEAR_SECONDS` of their places, and of those, the loudest in decibels
+    /// summed, so that one loud sound cannot outweigh a whole train.
+    fn strongest_train(&self, envelope: &[f64], background: f64) -> [usize; TRAIN.len()] {
         let block = ((NEAR_SECONDS * self.rate) as usize).max(1);
         let blocks: Vec<f64> = envelope
             .chunks(block)
@@ -376,7 +377,8 @@ impl Detector {
             .collect();
         let places = TRAIN.map(|offset| (offset * self.rate) as usize / block);
         let near = |at: usize| at.saturating_sub(1)..(at + 2).min(blocks.len());
-        let score = |alignment: usize| -> f64 {
+        let heard = background * ratio(HEARD_DB);
+        let score = |alignment: usize| -> (usize, f64) {
             places
                 .iter()
                 .map(|place| {
@@ -384,11 +386,20 @@ impl Detector {
                         .map(|b| blocks[b])
                         .fold(0.0, f64::max)
                 })
-                .sum()
+                .fold((0, 0.0), |(count, sum), level| {
+                    (
+                        count + usize::from(level >= heard),
+                        sum + db(level.max(background) / background),
+                    )
+                })
         };
         let span = blocks.len().saturating_sub(places[TRAIN.len() - 1]);
-        let best = (0..span.max(1))
-            .max_by(|&a, &b| score(a).total_cmp(&score(b)))
+        let scores: Vec<(usize, f64)> = (0..span.max(1)).map(score).collect();
+        let best = (0..scores.len())
+            .max_by(|&a, &b| {
+                let ((count_a, sum_a), (count_b, sum_b)) = (scores[a], scores[b]);
+                count_a.cmp(&count_b).then(sum_a.total_cmp(&sum_b))
+            })
             .unwrap_or(0);
         places.map(|place| {
             let around = near(best + place);
@@ -595,7 +606,7 @@ mod tests {
     fn level_db(gain: f64, noise: f64) -> f64 {
         let template: Vec<f32> = probe(48_000.0);
         let energy: f64 = template.iter().map(|s| f64::from(*s).powi(2)).sum();
-        let peak = gain / LEVEL * energy;
+        let peak = gain * energy;
         20.0 * (peak / (1.1774 * noise * energy.sqrt())).log10()
     }
 
@@ -631,6 +642,29 @@ mod tests {
             }) => assert!(above_background_db < 20.0, "{above_background_db}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Claude: a quieter train, its probes about 35 dB over the background,
+    /// and one loud noise burst after it, as a knock or a word: the train is
+    /// still found where it arrived.
+    #[test]
+    fn one_loud_disturbance_does_not_displace_a_quieter_train() {
+        let (gain, noise) = (0.01, 1e-3);
+        assert!(
+            (30.0..40.0).contains(&level_db(gain, noise)),
+            "{}",
+            level_db(gain, noise)
+        );
+        let (mut span, sound_at) = recorded(48_000.0, &paths(&[(0.031, gain)]), noise);
+        let mut deviates = Noise(7);
+        let burst = (3.9 * 48_000.0) as usize..(4.0 * 48_000.0) as usize;
+        for sample in &mut span.samples[burst] {
+            *sample += (0.3 * deviates.normal()) as f32;
+        }
+        let measured = Detector::new(48_000.0)
+            .measure(&span, sound_at)
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        assert!((measured.residual - 0.031).abs() < 1e-5, "{measured:?}");
     }
 
     /// Claude: one probe heard loudly and the others not at all says so,
