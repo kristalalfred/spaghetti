@@ -488,20 +488,41 @@ fn the_reference_cancels_the_microphones_bias_constant_or_drifting() {
 }
 
 #[test]
-fn an_echo_is_never_taken_for_the_direct_path() {
+fn a_direct_path_under_a_stronger_echo_is_the_arrival() {
     for echo in [(0.102, 0.316), (0.009, 0.5)] {
         let mut output = Place::at(12.5, 2.0);
         output.paths = vec![(0.002, 0.1), echo];
         let setup = Setup::new(output, Place::at(3.2, 1.0));
-        match run(&setup, |_, _| {}).result {
-            Ok(calibrated) => assert_measures(&setup, &calibrated),
-            Err(CalibrationFailure::Probes {
-                role: Role::Output,
-                failure: ProbeFailure::Ambiguous,
-            }) => {}
-            Err(other) => panic!("echo {echo:?}: {other}"),
-        }
+        assert_measures(&setup, &calibrated(&setup));
     }
+}
+
+/// Claude: rooms after what a built-in microphone heard: built-in speakers
+/// that ring ahead of their arrival, 31 and 32 dB under it, and a soundbar
+/// whose drivers arrive near-equal over 2 ms, sounding 19 dB under 2.6 ms
+/// ahead, then reflected 14 and 20 ms later, 3 and 6 dB under.
+#[test]
+fn speakers_ringing_ahead_or_arriving_in_clusters_measure_at_their_first_arrival() {
+    let under = |db: f64| 10f64.powf(-db / 20.0);
+    let mut reference = Place::at(0.35, 4.0);
+    reference.paths = vec![
+        (0.004, 0.3),
+        (0.004 - 0.00175, 0.3 * under(32.0)),
+        (0.004 - 0.00277, 0.3 * under(31.0)),
+        (0.010, 0.3 * under(10.0)),
+    ];
+    let mut output = Place::at(-43.4, 3.0);
+    output.paths = vec![
+        (0.003, 0.25),
+        (0.0035, 0.25 * under(0.6)),
+        (0.00425, 0.25 * under(0.4)),
+        (0.00475, 0.26),
+        (0.0004, 0.26 * under(19.0)),
+        (0.017, 0.26 * under(3.0)),
+        (0.023, 0.26 * under(6.0)),
+    ];
+    let setup = Setup::new(output, reference);
+    assert_measures(&setup, &calibrated(&setup));
 }
 
 #[test]

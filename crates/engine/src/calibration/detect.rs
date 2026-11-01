@@ -1,9 +1,12 @@
 //! Claude: finding a train in a recording. A matched filter turns the
-//! recording into the envelope of its correlation with the probe; a train
-//! matches where at least four of its five probes peak at their places in the
-//! layout. The earliest match that stands clear of the background is the
-//! arrival, unless a fainter one comes earlier still, and a match that is no
-//! more than a later, stronger match's own sidelobes is no arrival at all.
+//! recording into the envelope of its correlation with the probe. The
+//! strongest train in it gives each probe its strongest peak; each probe's
+//! arrival is then the earliest peak within `ARRIVAL_DB` of that one, up to
+//! `LOOKBACK_SECONDS` before it, that no later, stronger peak's sidelobes
+//! explain. So a direct path heard under a later echo is still found, while a
+//! speaker's pre-ringing and the probe's sidelobes, which stand further under
+//! the arrival, never are. The train is measured where at least four probes'
+//! arrivals agree with its layout.
 
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
@@ -12,22 +15,45 @@ use super::ProbeFailure;
 use super::probe::{LEVEL, TRAIN, probe};
 use super::recorder::Span;
 
-/// Claude: a match's probes stand this far above the background to be
-/// detected, and this far to count against a later detected match.
-const DETECTED_DB: f64 = 20.0;
-const STRUCTURAL_DB: f64 = 10.0;
+/// Claude: the train is heard when at least `AGREEING` probes peak this far
+/// above the background.
+const HEARD_DB: f64 = 20.0;
 /// Claude: the least background the detector assumes: what a probe recorded
 /// this far below full scale makes of the envelope. Any microphone's own noise
 /// lies above it, and a recording silent to the last bit, as a virtual
 /// device's loopback is, has no background of its own for faint numerical
 /// residue to stand out against.
 const FLOOR_DBFS: f64 = -120.0;
-/// Claude: an earlier match counts only when it stands this far above what a
-/// later, stronger match's sidelobes put there.
-const SIDELOBE_MARGIN_DB: f64 = 10.0;
-/// Claude: how far a probe's peak may lie from its place in the layout, so
-/// the probes of a match agree within twice this.
-const PLACE_SECONDS: f64 = 0.0005;
+/// Claude: an arrival stands at most this far under its probe's strongest peak.
+const ARRIVAL_DB: f64 = 15.0;
+/// Claude: a peak that stands under the arrival bound but no further than
+/// this under the strongest peak, and more than `RINGING_SECONDS` before the
+/// arrival, could be a direct path heard just too faintly, so the probe is
+/// ambiguous rather than measured on the later path.
+const AMBIGUITY_DB: f64 = 21.0;
+/// Claude: how far ahead of its arrival a speaker's own response may sound:
+/// measured, built-in speakers ring up to 2.8 ms ahead, 27 to 32 dB under,
+/// and an AirPlay soundbar sounds 19 dB under 2.6 ms ahead of its first
+/// arrival. Paths 4 ms apart differ by 1.4 m, more than inside one speaker.
+const RINGING_SECONDS: f64 = 0.004;
+/// Claude: a peak no more than this above what a later, stronger peak's
+/// sidelobes put there is one of them.
+const SIDELOBE_MARGIN_DB: f64 = 6.0;
+/// Claude: how far in lag a recorded sidelobe may stray from the template's:
+/// a span about half the sidelobes' spacing, so the template's sidelobes are
+/// taken by their upper envelope, and a speaker that reshapes them a little
+/// is allowed for.
+const SIDELOBE_SLACK_SECONDS: f64 = 0.0001;
+/// Claude: how far before its probe's strongest peak an arrival may lie. The
+/// previous probe of a train starts at least 0.5 s earlier.
+const LOOKBACK_SECONDS: f64 = 0.35;
+/// Claude: how far from its place in the layout a probe's strongest peak may
+/// lie, wide enough for a cluster of near-equal arrivals and the drift of a
+/// train.
+const NEAR_SECONDS: f64 = 0.003;
+/// Claude: how far the arrivals of the probes of a train may stray from one
+/// another's places in the layout.
+const AGREEMENT_SECONDS: f64 = 0.001;
 /// Claude: how many probes of a train make a match.
 const AGREEING: usize = 4;
 
@@ -38,13 +64,13 @@ fn ratio(db: f64) -> f64 {
 /// Claude: where a train sounded, against where it was scheduled to.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Measured {
-    /// Claude: how much later than scheduled the probes found arrived, on
+    /// Claude: how much later than scheduled the agreeing probes arrived, on
     /// average, in seconds.
     pub residual: f64,
     /// Claude: how far apart their arrivals lay, against their schedules.
     pub spread: f64,
-    /// Claude: when the probes found were scheduled to sound, on average, in
-    /// host ticks, so it and the residual weigh them alike.
+    /// Claude: when the agreeing probes were scheduled to sound, on average,
+    /// in host ticks, so it and the residual weigh them alike.
     pub at: f64,
 }
 
@@ -53,41 +79,12 @@ pub struct Detector {
     template: Vec<f32>,
     /// Claude: the template's spectrum at the latest FFT size it was needed at.
     spectrum: (usize, Vec<Complex<f64>>),
-    /// Claude: the envelope of the template's correlation with itself, by
-    /// lag in samples, 1 at lag 0.
-    autocorrelation: Vec<f64>,
+    /// Claude: the upper envelope of the template's correlation with itself,
+    /// by lag in samples, 1 at lag 0.
+    sidelobes: Vec<f64>,
     /// Claude: the envelope a probe recorded at `FLOOR_DBFS` makes.
     floor: f64,
     planner: FftPlanner<f64>,
-}
-
-/// Claude: a train's probes as one alignment of the layout finds them: the
-/// peak index and envelope of each probe found.
-#[derive(Debug, Clone)]
-struct Match {
-    alignment: usize,
-    peaks: [Option<(f64, f64)>; TRAIN.len()],
-}
-
-impl Match {
-    fn found(&self) -> impl Iterator<Item = (usize, f64, f64)> + '_ {
-        self.peaks
-            .iter()
-            .enumerate()
-            .filter_map(|(k, peak)| peak.map(|(index, level)| (k, index, level)))
-    }
-
-    /// Claude: whether at least `AGREEING` probes stand `factor` above `floor`.
-    fn stands(&self, floor: f64, factor: f64) -> bool {
-        self.found()
-            .filter(|(_, _, level)| *level >= floor * factor)
-            .count()
-            >= AGREEING
-    }
-
-    fn strength(&self) -> f64 {
-        self.found().map(|(_, _, level)| level).sum()
-    }
 }
 
 impl Detector {
@@ -96,7 +93,7 @@ impl Detector {
         let mut detector = Self {
             rate,
             spectrum: (0, Vec::new()),
-            autocorrelation: Vec::new(),
+            sidelobes: Vec::new(),
             floor: 0.0,
             planner: FftPlanner::new(),
             template: template.clone(),
@@ -104,8 +101,14 @@ impl Detector {
         let mut autocorrelation = detector.envelope(&template);
         autocorrelation.truncate(template.len());
         let peak = autocorrelation[0];
-        autocorrelation.iter_mut().for_each(|a| *a /= peak);
-        detector.autocorrelation = autocorrelation;
+        let slack = (SIDELOBE_SLACK_SECONDS * rate).round() as usize;
+        detector.sidelobes = (0..autocorrelation.len())
+            .map(|lag| {
+                let around =
+                    lag.saturating_sub(slack)..(lag + slack + 1).min(autocorrelation.len());
+                autocorrelation[around].iter().copied().fold(0.0, f64::max) / peak
+            })
+            .collect();
         detector.floor = peak * ratio(FLOOR_DBFS) / LEVEL;
         detector
     }
@@ -148,37 +151,58 @@ impl Detector {
         }
         let mut envelope = self.envelope(samples);
         envelope.truncate(samples.len() - self.template.len() + 1);
-        let peak = envelope.iter().copied().fold(0.0, f64::max);
         let mut sorted = envelope.clone();
         let middle = sorted.len() / 2;
         let background = *sorted.select_nth_unstable_by(middle, f64::total_cmp).1;
         let background = background.max(self.floor);
 
-        let matches = self.matches(&envelope, background);
-        let arrival = matches
+        let strongest = self.strongest_train(&envelope);
+        let heard: Vec<(usize, usize)> = strongest
             .iter()
-            .filter(|m| m.stands(background, ratio(DETECTED_DB)))
-            .filter(|m| !self.is_sidelobe(m, &matches))
-            .min_by_key(|m| m.alignment)
-            .ok_or_else(|| ProbeFailure::NotFound {
-                above_background_db: 20.0 * (peak / background).log10(),
-            })?;
-        let earlier = matches.iter().any(|m| {
-            m.alignment < arrival.alignment
-                && m.stands(background, ratio(STRUCTURAL_DB))
-                && !self.is_sidelobe(m, &matches)
-        });
-        if earlier {
+            .enumerate()
+            .filter(|(_, peak)| envelope[**peak] >= background * ratio(HEARD_DB))
+            .map(|(k, peak)| (k, *peak))
+            .collect();
+        if heard.len() < AGREEING {
+            let loudest = strongest.iter().map(|&p| envelope[p]).fold(0.0, f64::max);
+            return Err(ProbeFailure::NotFound {
+                above_background_db: 20.0 * (loudest / background).log10(),
+            });
+        }
+
+        let offset = |k: usize| (TRAIN[k] * self.rate).round();
+        let mut arrivals: Vec<(usize, f64)> = heard
+            .iter()
+            .filter_map(|&(k, peak)| {
+                let arrival = self.arrival(&envelope, peak)?;
+                Some((k, arrival as f64 - offset(k)))
+            })
+            .collect();
+        arrivals.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let agreement = AGREEMENT_SECONDS * self.rate;
+        let agreeing = (0..arrivals.len())
+            .map(|first| {
+                let count = arrivals[first..]
+                    .iter()
+                    .take_while(|(_, at)| at - arrivals[first].1 <= agreement)
+                    .count();
+                &arrivals[first..first + count]
+            })
+            .max_by_key(|agreeing| agreeing.len())
+            .unwrap_or(&[]);
+        if agreeing.len() < AGREEING {
             return Err(ProbeFailure::Ambiguous);
         }
 
-        let tick = |index: f64| span.date(index);
         let ticks_per_second = crate::host_time::ticks_per_second();
-        let mut probes: Vec<(f64, f64)> = arrival
-            .found()
-            .map(|(k, index, _)| {
-                let late = (tick(refine(&envelope, index)) - sound_at[k]) / ticks_per_second;
-                (late, sound_at[k])
+        let mut probes: Vec<(f64, f64)> = agreeing
+            .iter()
+            .map(|&(k, at)| {
+                let index = refine(&envelope, at + offset(k));
+                (
+                    (span.date(index) - sound_at[k]) / ticks_per_second,
+                    sound_at[k],
+                )
             })
             .collect();
         probes.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -190,88 +214,83 @@ impl Detector {
         })
     }
 
-    /// Claude: every alignment of the layout at which at least `AGREEING`
-    /// probes peak `STRUCTURAL_DB` above `background` within `PLACE_SECONDS`
-    /// of their places, each peak taken once.
-    fn matches(&self, envelope: &[f64], background: f64) -> Vec<Match> {
-        let floor = background * ratio(STRUCTURAL_DB);
-        let place = (PLACE_SECONDS * self.rate).round() as usize;
-        let offsets: Vec<usize> = TRAIN
-            .iter()
-            .map(|offset| (offset * self.rate).round() as usize)
+    /// Claude: each probe's strongest peak where the train is strongest: the
+    /// alignment of the layout whose probes' loudest envelope within
+    /// `NEAR_SECONDS` of their places sums highest.
+    fn strongest_train(&self, envelope: &[f64]) -> [usize; TRAIN.len()] {
+        let block = ((NEAR_SECONDS * self.rate) as usize).max(1);
+        let blocks: Vec<f64> = envelope
+            .chunks(block)
+            .map(|chunk| chunk.iter().copied().fold(0.0, f64::max))
             .collect();
-        let peaks: Vec<usize> = (1..envelope.len().saturating_sub(1))
-            .filter(|&i| {
-                envelope[i] >= floor
-                    && envelope[i] > envelope[i - 1]
-                    && envelope[i] >= envelope[i + 1]
-            })
-            .collect();
-        let strongest_near = |at: usize| {
-            let from = at.saturating_sub(place);
-            let to = (at + place + 1).min(envelope.len());
-            let first = peaks.partition_point(|&p| p < from);
-            peaks[first..]
+        let places = TRAIN.map(|offset| (offset * self.rate) as usize / block);
+        let near = |at: usize| at.saturating_sub(1)..(at + 2).min(blocks.len());
+        let score = |alignment: usize| -> f64 {
+            places
                 .iter()
-                .take_while(|&&p| p < to)
-                .copied()
-                .max_by(|&a, &b| envelope[a].total_cmp(&envelope[b]))
+                .map(|place| {
+                    near(alignment + place)
+                        .map(|b| blocks[b])
+                        .fold(0.0, f64::max)
+                })
+                .sum()
         };
-        let mut alignments: Vec<usize> = peaks
-            .iter()
-            .flat_map(|&p| offsets.iter().filter_map(move |&o| p.checked_sub(o)))
-            .collect();
-        alignments.sort_unstable();
-        alignments.dedup();
-        let mut matches: Vec<Match> = Vec::new();
-        for alignment in alignments {
-            let mut found = [None; TRAIN.len()];
-            for (k, offset) in offsets.iter().enumerate() {
-                found[k] = strongest_near(alignment + offset).map(|p| (p as f64, envelope[p]));
-            }
-            if found.iter().flatten().count() < AGREEING {
-                continue;
-            }
-            let candidate = Match {
-                alignment,
-                peaks: found,
-            };
-            match matches.last_mut() {
-                Some(last) if last.peaks == candidate.peaks => {}
-                Some(last)
-                    if alignment - last.alignment <= place
-                        && candidate.strength() > last.strength() =>
-                {
-                    *last = candidate
-                }
-                Some(last) if alignment - last.alignment <= place => {}
-                _ => matches.push(candidate),
-            }
-        }
-        matches
+        let span = blocks.len().saturating_sub(places[TRAIN.len() - 1]);
+        let best = (0..span.max(1))
+            .max_by(|&a, &b| score(a).total_cmp(&score(b)))
+            .unwrap_or(0);
+        places.map(|place| {
+            let around = near(best + place);
+            let from = around.start * block;
+            let to = (around.end * block).min(envelope.len());
+            (from..to.max(from + 1).min(envelope.len()))
+                .max_by(|&a, &b| envelope[a].total_cmp(&envelope[b]))
+                .unwrap_or(from.min(envelope.len() - 1))
+        })
     }
 
-    /// Claude: whether `candidate` is no more than the sidelobes of a later,
-    /// stronger match: fewer than `AGREEING` of its probes stand
-    /// `SIDELOBE_MARGIN_DB` above what that match's own probes put there.
-    fn is_sidelobe(&self, candidate: &Match, matches: &[Match]) -> bool {
-        matches
-            .iter()
-            .filter(|m| m.alignment > candidate.alignment && m.strength() > candidate.strength())
-            .any(|stronger| {
-                let clear = candidate
-                    .found()
-                    .filter(|(k, index, level)| {
-                        stronger.peaks[*k].is_none_or(|(at, strength)| {
-                            let lag = (at - index).round().abs() as usize;
-                            let lobe = self.autocorrelation.get(lag).copied().unwrap_or(0.0);
-                            *level >= strength * lobe * ratio(SIDELOBE_MARGIN_DB)
-                        })
-                    })
-                    .count();
-                clear < AGREEING
+    /// Claude: the earliest peak within `ARRIVAL_DB` of `strongest`, at most
+    /// `LOOKBACK_SECONDS` before it, that no later peak's sidelobes explain;
+    /// None when a peak in the band down to `AMBIGUITY_DB` comes more than
+    /// `RINGING_SECONDS` before that.
+    fn arrival(&self, envelope: &[f64], strongest: usize) -> Option<usize> {
+        let level = envelope[strongest];
+        let from = strongest
+            .saturating_sub((LOOKBACK_SECONDS * self.rate) as usize)
+            .max(1);
+        let candidates: Vec<usize> = (from..strongest)
+            .filter(|&i| {
+                is_peak(envelope, i)
+                    && envelope[i] >= level * ratio(-AMBIGUITY_DB)
+                    && !self.is_sidelobe(envelope, i)
             })
+            .collect();
+        let arrival = candidates
+            .iter()
+            .copied()
+            .find(|&i| envelope[i] >= level * ratio(-ARRIVAL_DB))
+            .unwrap_or(strongest);
+        let ringing = (RINGING_SECONDS * self.rate) as usize;
+        match candidates.first() {
+            Some(&earliest) if earliest + ringing < arrival => None,
+            _ => Some(arrival),
+        }
     }
+
+    /// Claude: whether a later, stronger peak's sidelobes explain the peak at
+    /// `i`.
+    fn is_sidelobe(&self, envelope: &[f64], i: usize) -> bool {
+        let end = (i + self.sidelobes.len()).min(envelope.len() - 1);
+        (i + 1..end).any(|j| {
+            envelope[j] > envelope[i]
+                && is_peak(envelope, j)
+                && envelope[j] * self.sidelobes[j - i] * ratio(SIDELOBE_MARGIN_DB) >= envelope[i]
+        })
+    }
+}
+
+fn is_peak(envelope: &[f64], i: usize) -> bool {
+    envelope[i] > envelope[i - 1] && envelope[i] >= envelope[i + 1]
 }
 
 /// Claude: the peak at `index` placed between samples by the parabola
@@ -326,10 +345,29 @@ mod tests {
 
     const SOUND: f64 = 0.5;
 
+    /// Claude: a response: each path's delay in seconds and its gain, heard
+    /// on every probe or only on those `probes` names.
+    #[derive(Clone)]
+    struct Path {
+        delay: f64,
+        gain: f64,
+        probes: Option<Vec<usize>>,
+    }
+
+    fn paths(taps: &[(f64, f64)]) -> Vec<Path> {
+        taps.iter()
+            .map(|&(delay, gain)| Path {
+                delay,
+                gain,
+                probes: None,
+            })
+            .collect()
+    }
+
     /// Claude: a 5.3 s recording at `rate` of a train scheduled to sound
-    /// `SOUND` s in, arriving along each of `paths` (its delay in seconds and
-    /// gain), over noise of `noise` RMS, and when each probe was scheduled.
-    fn recorded(rate: f64, paths: &[(f64, f64)], noise: f64) -> (Span, [f64; 5]) {
+    /// `SOUND` s in, arriving along each of `paths`, over noise of `noise`
+    /// RMS, and when each probe was scheduled.
+    fn recorded(rate: f64, paths: &[Path], noise: f64) -> (Span, [f64; 5]) {
         let ticks = host_time::ticks_per_second();
         let origin = 1e12;
         let mut deviates = Noise(0x9e37_79b9_7f4a_7c15 ^ rate.to_bits());
@@ -338,10 +376,15 @@ mod tests {
                 let t = i as f64 / rate;
                 let train: f64 = paths
                     .iter()
-                    .flat_map(|(delay, gain)| {
-                        TRAIN
-                            .iter()
-                            .map(move |offset| gain * probe_at(t - SOUND - offset - delay))
+                    .flat_map(|path| {
+                        TRAIN.iter().enumerate().map(move |(k, offset)| {
+                            let heard = path.probes.as_ref().is_none_or(|on| on.contains(&k));
+                            if heard {
+                                path.gain * probe_at(t - SOUND - offset - path.delay)
+                            } else {
+                                0.0
+                            }
+                        })
                     })
                     .sum();
                 (train + noise * deviates.normal()) as f32
@@ -351,9 +394,13 @@ mod tests {
         (Span::linear(samples, origin, ticks / rate), sound_at)
     }
 
-    fn measure(rate: f64, paths: &[(f64, f64)], noise: f64) -> Result<Measured, ProbeFailure> {
-        let (span, sound_at) = recorded(rate, paths, noise);
+    fn measure(rate: f64, taps: &[(f64, f64)], noise: f64) -> Result<Measured, ProbeFailure> {
+        let (span, sound_at) = recorded(rate, &paths(taps), noise);
         Detector::new(rate).measure(&span, sound_at)
+    }
+
+    fn db(db: f64) -> f64 {
+        10f64.powf(db / 20.0)
     }
 
     #[test]
@@ -376,8 +423,10 @@ mod tests {
     /// over noise of `noise` RMS at 48 kHz: the probe's energy against the
     /// median envelope of filtered noise, 1.177 standard deviations of it.
     fn level_db(gain: f64, noise: f64) -> f64 {
-        let energy: f64 = probe(48_000.0).iter().map(|s| f64::from(*s).powi(2)).sum();
-        20.0 * (gain * energy / (1.1774 * noise * energy.sqrt())).log10()
+        let template: Vec<f32> = probe(48_000.0);
+        let energy: f64 = template.iter().map(|s| f64::from(*s).powi(2)).sum();
+        let peak = gain / LEVEL * energy;
+        20.0 * (peak / (1.1774 * noise * energy.sqrt())).log10()
     }
 
     #[test]
@@ -390,9 +439,9 @@ mod tests {
             (0.3, 0.02),
         ] {
             let delay = 0.0371;
-            let measured = measure(48_000.0, &[(delay, gain)], noise);
             let label = format!("gain {gain}, noise {noise}");
-            let measured = measured.unwrap_or_else(|e| panic!("{label}: {e:?}"));
+            let measured = measure(48_000.0, &[(delay, gain)], noise)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
             assert!(
                 (measured.residual - delay).abs() * 48_000.0 < 0.2,
                 "{label}: {measured:?}"
@@ -402,8 +451,8 @@ mod tests {
 
     #[test]
     fn a_train_that_does_not_stand_20_db_clear_is_not_found() {
-        let (gain, noise) = (0.001, 0.01);
-        assert!(level_db(gain, noise) < 10.0);
+        let (gain, noise) = (0.0002, 0.01);
+        assert!(level_db(gain, noise) < 10.0, "{}", level_db(gain, noise));
         match measure(48_000.0, &[(0.02, gain)], noise) {
             Err(ProbeFailure::NotFound {
                 above_background_db,
@@ -413,15 +462,15 @@ mod tests {
     }
 
     #[test]
-    fn later_copies_of_the_train_are_not_the_arrival() {
+    fn later_copies_of_the_train_within_the_bound_leave_the_direct_path_the_arrival() {
         for echoes in [
             vec![(0.04, 0.8)],
             vec![(0.3, 1.0)],
             vec![(0.007, 1.0), (0.05, 0.9)],
         ] {
-            let mut paths = vec![(0.012, 1.0)];
-            paths.extend(echoes.iter().map(|(after, gain)| (0.012 + after, *gain)));
-            let measured = measure(48_000.0, &paths, 1e-3).unwrap();
+            let mut taps = vec![(0.012, 1.0)];
+            taps.extend(echoes.iter().map(|(after, gain)| (0.012 + after, *gain)));
+            let measured = measure(48_000.0, &taps, 1e-3).unwrap();
             assert!(
                 (measured.residual - 0.012).abs() < 1e-5,
                 "{echoes:?}: {measured:?}"
@@ -429,46 +478,157 @@ mod tests {
         }
     }
 
+    /// Claude: a direct path just inside the arrival bound under a later
+    /// echo is the arrival, one in the band below it is ambiguous, and one
+    /// further under leaves the echo the arrival.
     #[test]
-    fn a_direct_path_under_a_stronger_echo_is_found_or_ambiguous_never_the_echo() {
-        let noise = 1e-3;
-        for after in [0.007, 0.02, 0.1] {
-            for under_db in [0.0, 6.0, 10.0, 20.0] {
-                let direct = 0.5 * 10f64.powf(-under_db / 20.0);
-                assert!(level_db(direct, noise) > 30.0);
-                let paths = [(0.012, direct), (0.012 + after, 0.5)];
-                match measure(48_000.0, &paths, noise) {
-                    Ok(measured) => assert!(
-                        (measured.residual - 0.012).abs() < 1e-4,
-                        "echo {after} s later, direct {under_db} dB under: {measured:?}"
+    fn a_direct_path_under_an_echo_is_found_ambiguous_or_lost_by_how_far_under() {
+        for after in [0.02, 0.1] {
+            for (under_db, expected) in [
+                (0.0, Some(0.0)),
+                (10.0, Some(0.0)),
+                (14.5, Some(0.0)),
+                (15.5, None),
+                (18.0, None),
+                (20.5, None),
+                (21.5, Some(after)),
+                (30.0, Some(after)),
+            ] {
+                let taps = [(0.012, 0.3 * db(-under_db)), (0.012 + after, 0.3)];
+                let label = format!("echo {after} s later, direct {under_db} dB under");
+                match (measure(48_000.0, &taps, 1e-5), expected) {
+                    (Ok(measured), Some(late)) => assert!(
+                        (measured.residual - 0.012 - late).abs() < 2e-5,
+                        "{label}: {measured:?}"
                     ),
-                    Err(ProbeFailure::Ambiguous) => {}
-                    Err(other) => {
-                        panic!("echo {after} s later, direct {under_db} dB under: {other}")
-                    }
+                    (Err(ProbeFailure::Ambiguous), None) => {}
+                    (result, _) => panic!("{label}: {result:?}"),
                 }
             }
         }
     }
 
     #[test]
-    fn a_direct_path_heard_short_of_detection_before_an_echo_is_ambiguous() {
-        let noise = 0.01;
-        let direct = 0.002;
-        let level = level_db(direct, noise);
-        assert!((12.0..18.0).contains(&level), "{level} dB");
-        let paths = [(0.012, direct), (0.112, 0.5)];
+    fn a_direct_path_far_under_a_close_echo_aligns_to_the_echo() {
+        let taps = [(0.012, 0.3 * db(-30.0)), (0.015, 0.3)];
+        let measured = measure(48_000.0, &taps, 1e-4).unwrap();
+        assert!((measured.residual - 0.012).abs() <= 0.0035, "{measured:?}");
+    }
+
+    #[test]
+    fn a_near_equal_earlier_arrival_on_some_probes_only_is_ambiguous() {
+        let mut taps = paths(&[(0.012, 0.3)]);
+        taps.push(Path {
+            delay: 0.002,
+            gain: 0.29,
+            probes: Some(vec![0, 2]),
+        });
+        let (span, sound_at) = recorded(48_000.0, &taps, 1e-4);
         assert_eq!(
-            measure(48_000.0, &paths, noise),
+            Detector::new(48_000.0).measure(&span, sound_at),
             Err(ProbeFailure::Ambiguous)
         );
+        taps[1].probes = Some(vec![3]);
+        let (span, sound_at) = recorded(48_000.0, &taps, 1e-4);
+        let measured = Detector::new(48_000.0).measure(&span, sound_at).unwrap();
+        assert!((measured.residual - 0.012).abs() < 1e-5, "{measured:?}");
+    }
+
+    /// Claude: a speaker whose response rings ahead of its arrival, 27 to 32
+    /// dB under it, within 3 ms: the main path is the arrival.
+    #[test]
+    fn pre_ringing_under_the_band_is_neither_an_arrival_nor_ambiguous() {
+        let taps = [
+            (0.020, 0.3),
+            (0.020 - 0.0012, 0.3 * db(-29.0)),
+            (0.020 - 0.0026, 0.3 * db(-31.0)),
+            (0.020 - 0.0018, 0.3 * db(-27.5)),
+        ];
+        let measured = measure(48_000.0, &taps, 1e-5).unwrap();
+        assert!((measured.residual - 0.020).abs() < 1e-5, "{measured:?}");
+    }
+
+    /// Claude: a speaker with several drivers: near-equal arrivals within
+    /// 2 ms, then strong reflections 14 and 20 ms after the first. The first
+    /// arrival is the arrival.
+    #[test]
+    fn a_cluster_of_near_equal_arrivals_is_measured_at_its_first() {
+        let first = 0.031;
+        let taps = [
+            (first, 0.25),
+            (first + 0.0005, 0.25 * db(-0.6)),
+            (first + 0.00125, 0.25 * db(-0.4)),
+            (first + 0.00175, 0.26),
+            (first + 0.014, 0.25 * db(-3.0)),
+            (first + 0.020, 0.25 * db(-6.0)),
+        ];
+        let measured = measure(48_000.0, &taps, 1e-5).unwrap();
+        assert!((measured.residual - first).abs() < 5e-5, "{measured:?}");
     }
 
     #[test]
     fn residue_far_below_any_microphone_in_a_silent_recording_is_no_arrival() {
-        let residue = 10f64.powf(-150.0 / 20.0) / 0.5;
-        let paths = [(0.012 - 0.188, residue), (0.012, 0.3)];
-        let measured = measure(48_000.0, &paths, 0.0).unwrap();
+        let residue = 10f64.powf(-150.0 / 20.0) / LEVEL;
+        let measured = measure(48_000.0, &[(0.012 - 0.188, residue), (0.012, 0.3)], 0.0).unwrap();
         assert!((measured.residual - 0.012).abs() < 1e-5, "{measured:?}");
+    }
+
+    /// Claude: speakers built as measured ones sound, each found at its
+    /// first arrival on every probe without ambiguity: built-in speakers that
+    /// ring ahead of a sharp arrival, 27 to 32 dB under it within 3 ms, and a
+    /// soundbar whose drivers arrive near-equal over 2 ms, the strongest of
+    /// them changing from probe to probe, reflected 14 and 20 ms after its
+    /// strongest, and sounding 19 dB under that 2.6 ms ahead of its first
+    /// arrival: 4.6 ms ahead of the strongest on some probes.
+    #[test]
+    fn speakers_shaped_as_measured_are_found_at_their_first_arrival() {
+        let built_in = 0.000_35;
+        let speakers = paths(&[
+            (built_in, 0.3),
+            (built_in - 0.001_75, 0.3 * db(-32.0)),
+            (built_in - 0.002_77, 0.3 * db(-31.0)),
+        ]);
+        let first = -0.040_08;
+        let strongest = 0.25 * db(1.0);
+        let cluster = [
+            (0.0, 0.0),
+            (0.000_6, -0.3),
+            (0.001_3, -0.2),
+            (0.002_0, -0.4),
+        ];
+        let mut soundbar = Vec::new();
+        for (probes, strongest_after) in [(vec![0, 2, 4], 0.002_0), (vec![1, 3], 0.000_6)] {
+            let mut on = |delay: f64, gain: f64| {
+                soundbar.push(Path {
+                    delay,
+                    gain,
+                    probes: Some(probes.clone()),
+                })
+            };
+            for (after, under_db) in cluster {
+                let gain = if after == strongest_after {
+                    strongest
+                } else {
+                    0.25 * db(under_db)
+                };
+                on(first + after, gain);
+            }
+            on(first - 0.002_6, strongest * db(-19.0));
+            on(first + strongest_after + 0.014, strongest * db(-3.0));
+            on(first + strongest_after + 0.020, strongest * db(-6.0));
+        }
+        for (label, paths, arrival) in [
+            ("built-in", speakers, built_in),
+            ("soundbar", soundbar, first),
+        ] {
+            let (span, sound_at) = recorded(48_000.0, &paths, 1e-5);
+            let measured = Detector::new(48_000.0)
+                .measure(&span, sound_at)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert!(
+                (measured.residual - arrival).abs() < 5e-5 && measured.spread < 1e-4,
+                "{label}: {measured:?}"
+            );
+        }
     }
 }
