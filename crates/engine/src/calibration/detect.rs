@@ -1,9 +1,9 @@
 //! Claude: finding a train in a recording. A matched filter turns the
 //! recording into the envelope of its correlation with the probe. The
 //! strongest train in it gives each probe its strongest peak; each probe's
-//! arrival is then the earliest peak within `ARRIVAL_DB` of that one, up to
-//! `LOOKBACK_SECONDS` before it, that no later, stronger peak's sidelobes
-//! explain. So a direct path heard under a later echo is still found, while a
+//! arrival is then the earliest peak heard within `ARRIVAL_DB` of that one,
+//! up to `LOOKBACK_SECONDS` before it, that no later, stronger peak's
+//! sidelobes explain. So a direct path heard under a later echo is still found, while a
 //! speaker's pre-ringing and the probe's sidelobes, which stand further under
 //! the arrival, never are. The train is measured where at least four probes'
 //! arrivals agree with its layout.
@@ -16,7 +16,8 @@ use super::probe::{LEVEL, TRAIN, probe};
 use super::recorder::Span;
 
 /// Claude: the train is heard when at least `AGREEING` probes peak this far
-/// above the background.
+/// above the background, and only a peak this far above it is an arrival or
+/// makes a probe ambiguous: noise peaks well under it.
 const HEARD_DB: f64 = 20.0;
 /// Claude: the least background the detector assumes: what a probe recorded
 /// this far below full scale makes of the envelope. Any microphone's own noise
@@ -174,7 +175,7 @@ impl Detector {
         let mut arrivals: Vec<(usize, f64)> = heard
             .iter()
             .filter_map(|&(k, peak)| {
-                let arrival = self.arrival(&envelope, peak)?;
+                let arrival = self.arrival(&envelope, peak, background)?;
                 Some((k, arrival as f64 - offset(k)))
             })
             .collect();
@@ -253,7 +254,7 @@ impl Detector {
     /// `LOOKBACK_SECONDS` before it, that no later peak's sidelobes explain;
     /// None when a peak in the band down to `AMBIGUITY_DB` comes more than
     /// `RINGING_SECONDS` before that.
-    fn arrival(&self, envelope: &[f64], strongest: usize) -> Option<usize> {
+    fn arrival(&self, envelope: &[f64], strongest: usize, background: f64) -> Option<usize> {
         let level = envelope[strongest];
         let from = strongest
             .saturating_sub((LOOKBACK_SECONDS * self.rate) as usize)
@@ -262,6 +263,7 @@ impl Detector {
             .filter(|&i| {
                 is_peak(envelope, i)
                     && envelope[i] >= level * ratio(-AMBIGUITY_DB)
+                    && envelope[i] >= background * ratio(HEARD_DB)
                     && !self.is_sidelobe(envelope, i)
             })
             .collect();
