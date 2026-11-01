@@ -6,12 +6,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+use crate::airplay_sender::AirPlayOutput;
 use crate::host_time;
 use crate::input::InputSource;
 use crate::program_io::{InputShared, OutputShared};
 use crate::reservations::Reservation;
 use crate::ring::Ring;
 use crate::route_output::{Output, Target};
+use crate::{audio, device_output};
 
 use super::detect::Detector;
 use super::emitter::{self, Emitter};
@@ -40,10 +42,20 @@ const STALL: f64 = 0.5;
 pub(super) const RECORDING_LAG: f64 = 2.0;
 const SEQUENCE: [Role; 3] = [Role::Reference, Role::Output, Role::Reference];
 
+/// Claude: what a leg plays to as the router checked it, before anything is
+/// looked up, built or opened for it.
+pub enum Planned {
+    Device { uid: String },
+    AirPlay { receiver: airplay::ReceiverId },
+    Program { output: Arc<OutputShared> },
+}
+
 /// Claude: one destination as the calibration plays to it.
 pub struct Leg {
     role: Role,
+    planned: Option<Planned>,
     target: Option<Target>,
+    delay_ms: u32,
     delay: f64,
     latency_offset_ms: i32,
     /// Claude: the program output it plays to, whose removal ends the job.
@@ -60,15 +72,22 @@ struct Playing {
 }
 
 impl Leg {
-    pub fn new(role: Role, target: Target, delay: f64, latency_offset_ms: Option<i32>) -> Self {
-        let program = match &target {
-            Target::Program { output, .. } => Some(Arc::clone(output)),
+    pub fn new(
+        role: Role,
+        planned: Planned,
+        delay_ms: u32,
+        latency_offset_ms: Option<i32>,
+    ) -> Self {
+        let program = match &planned {
+            Planned::Program { output } => Some(Arc::clone(output)),
             _ => None,
         };
         Self {
             role,
-            target: Some(target),
-            delay,
+            planned: Some(planned),
+            target: None,
+            delay_ms,
+            delay: f64::from(delay_ms) / 1000.0,
             latency_offset_ms: latency_offset_ms.unwrap_or(0),
             program,
             playing: None,
@@ -78,6 +97,48 @@ impl Leg {
 
     fn removed(&self) -> bool {
         self.program.as_ref().is_some_and(|output| output.ended())
+    }
+
+    /// Claude: finds the device, checks the schedule as a route on the
+    /// emitter's timing would be checked, and builds what plays it, opening
+    /// nothing.
+    fn resolve(&mut self) -> Result<(), CalibrationFailure> {
+        let Some(planned) = self.planned.take() else {
+            return Ok(());
+        };
+        let timing = emitter::timing();
+        let (delay, offset) = (self.delay, Some(self.latency_offset_ms));
+        let target = match planned {
+            Planned::Device { uid } => audio::find_device_by_uid(&uid)
+                .ok_or_else(|| format!("device '{uid}' not found"))
+                .and_then(|device| {
+                    device_output::check_schedule(device, &timing, delay, offset)?;
+                    Ok(Target::Device {
+                        device,
+                        delay: Some(delay),
+                        latency_offset_ms: offset,
+                    })
+                }),
+            Planned::AirPlay { receiver } => AirPlayOutput::playout(&timing, self.delay_ms, offset)
+                .map(|playout| Target::AirPlay {
+                    receiver,
+                    playout: Box::new(playout),
+                }),
+            Planned::Program { output } => {
+                output
+                    .check_schedule(&timing, delay, offset)
+                    .map(|()| Target::Program {
+                        output,
+                        delay: Some(delay),
+                        latency_offset_ms: offset,
+                    })
+            }
+        };
+        self.target = Some(target.map_err(|reason| CalibrationFailure::Unavailable {
+            role: self.role,
+            reason,
+        })?);
+        Ok(())
     }
 
     fn open(&mut self, now: u64) -> Result<(), CalibrationFailure> {
@@ -118,8 +179,11 @@ impl Leg {
 
 /// Claude: what the job records through.
 pub enum Feed {
-    /// Claude: an input device, which the job captures itself.
-    Input(InputSource),
+    /// Claude: an input device, which the job finds and captures itself.
+    Input {
+        device_uid: String,
+        source: Option<InputSource>,
+    },
     /// Claude: a program input, which feeds the job a ring it leases.
     Program(Arc<InputShared>),
 }
@@ -207,13 +271,15 @@ impl Job {
         &mut self.legs[index(role)]
     }
 
-    /// Claude: opens, then ticks until done, reporting each state.
+    /// Claude: prepares and opens, then ticks until done, reporting each
+    /// state.
     pub fn run(
         &mut self,
         cancelled: &dyn Fn() -> bool,
         report: &dyn Fn(CalibrationState),
         pause: &dyn Fn(Duration),
     ) -> Result<Calibrated, CalibrationFailure> {
+        self.prepare(cancelled)?;
         self.open(host_time::now(), cancelled)?;
         loop {
             if cancelled() {
@@ -227,13 +293,9 @@ impl Job {
         }
     }
 
-    /// Claude: starts the recording, then both legs, which play dated
-    /// silence from `now` on.
-    pub fn open(
-        &mut self,
-        now: u64,
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<(), CalibrationFailure> {
+    /// Claude: finds and checks what both legs play to and the device the
+    /// recording captures, opening nothing.
+    pub fn prepare(&mut self, cancelled: &dyn Fn() -> bool) -> Result<(), CalibrationFailure> {
         #[cfg(test)]
         while self
             .hold
@@ -245,11 +307,44 @@ impl Job {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+        for leg in &mut self.legs {
+            if cancelled() {
+                return Err(CalibrationFailure::Cancelled);
+            }
+            leg.resolve()?;
+        }
+        if cancelled() {
+            return Err(CalibrationFailure::Cancelled);
+        }
+        if let Feed::Input { device_uid, source } = &mut self.feed
+            && source.is_none()
+        {
+            let created = InputSource::create(device_uid).map_err(|reason| {
+                CalibrationFailure::Recording(RecordingFailure::Unavailable(reason))
+            })?;
+            *source = Some(created);
+        }
+        Ok(())
+    }
+
+    /// Claude: starts the recording, then both legs, which play dated
+    /// silence from `now` on.
+    pub fn open(
+        &mut self,
+        now: u64,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), CalibrationFailure> {
         self.started = now;
         let unavailable =
             |reason| CalibrationFailure::Recording(RecordingFailure::Unavailable(reason));
         let listening = match &mut self.feed {
-            Feed::Input(input) => {
+            Feed::Input { source: None, .. } => {
+                return Err(unavailable("the input device was not prepared".into()));
+            }
+            Feed::Input {
+                source: Some(input),
+                ..
+            } => {
                 let sample_rate = input.timing().map_err(unavailable)?.sample_rate;
                 let ring = Arc::new(Ring::new(sample_rate));
                 let sink = input.add_sink(Arc::clone(&ring)).map_err(unavailable)?;
@@ -311,11 +406,14 @@ impl Job {
         }
         if listening.recorder.has_ended() {
             return Err(match &self.feed {
-                Feed::Input(input) => CalibrationFailure::Recording(RecordingFailure::Unavailable(
-                    input
-                        .failure()
-                        .unwrap_or_else(|| "the input device ended".into()),
-                )),
+                Feed::Input { source, .. } => {
+                    CalibrationFailure::Recording(RecordingFailure::Unavailable(
+                        source
+                            .as_ref()
+                            .and_then(InputSource::failure)
+                            .unwrap_or_else(|| "the input device ended".into()),
+                    ))
+                }
                 Feed::Program(_) => CalibrationFailure::EndpointRemoved,
             });
         }
@@ -491,7 +589,11 @@ impl Job {
     fn release(&mut self) {
         if let Some(listening) = self.listening.take() {
             match &mut self.feed {
-                Feed::Input(input) => input.remove_sink(listening.sink as usize),
+                Feed::Input {
+                    source: Some(input),
+                    ..
+                } => input.remove_sink(listening.sink as usize),
+                Feed::Input { source: None, .. } => {}
                 Feed::Program(input) => input.withdraw_sink(listening.sink),
             }
         }

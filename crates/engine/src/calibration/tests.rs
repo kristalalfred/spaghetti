@@ -461,6 +461,7 @@ fn run(setup: &Setup, hook: impl Fn(f64, &Job)) -> Run {
         }));
     }
     let result = (|| {
+        job.prepare(&|| false)?;
         job.open(room.ticks(0.0), &|| false)?;
         let mut t = 0.0;
         loop {
@@ -1091,6 +1092,74 @@ mod lifecycle {
         assert!(cancelled.elapsed() < Duration::from_millis(200));
         router.create_route(1, to("output", 200), 1.0).unwrap();
         drop(hold);
+    }
+
+    #[test]
+    fn calibrating_looks_up_no_device_on_the_calling_thread() {
+        use crate::device_lookup::{self, STALLED, UID};
+
+        let (mut router, _outputs, _microphone, _tone) = studio();
+        let stalled = Destination::Device {
+            uid: UID.into(),
+            delay_ms: Some(200),
+            latency_offset_ms: None,
+        };
+        let cases = [
+            (
+                Calibration {
+                    output: stalled,
+                    ..calibration()
+                },
+                CalibrationFailure::Unavailable {
+                    role: Role::Output,
+                    reason: format!("device '{UID}' not found"),
+                },
+            ),
+            (
+                Calibration {
+                    recording: Recording::Input {
+                        device_uid: UID.into(),
+                    },
+                    ..calibration()
+                },
+                CalibrationFailure::Recording(RecordingFailure::Unavailable(format!(
+                    "input device '{UID}' not found"
+                ))),
+            ),
+        ];
+        for (calibration, failure) in cases {
+            STALLED.store(true, Ordering::Release);
+            let (called, watched) = std::sync::mpsc::channel::<()>();
+            let watchdog = std::thread::spawn(move || {
+                if watched.recv_timeout(Duration::from_secs(2)).is_err() {
+                    STALLED.store(false, Ordering::Release);
+                }
+            });
+            let started = Instant::now();
+            let calibrating = router.calibrate(calibration).unwrap();
+            let returned = started.elapsed();
+            let _ = called.send(());
+            watchdog.join().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let threads = loop {
+                let threads = device_lookup::take_threads();
+                if !threads.is_empty() || Instant::now() > deadline {
+                    break threads;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            let while_stalled = calibrating.state();
+            STALLED.store(false, Ordering::Release);
+            assert!(returned < Duration::from_millis(50), "{returned:?}");
+            assert!(!threads.is_empty(), "the device was never looked up");
+            assert!(!threads.contains(&std::thread::current().id()));
+            assert_eq!(while_stalled, CalibrationState::Waiting(Role::Reference));
+            assert_eq!(done(&calibrating, Duration::from_secs(2)), Err(failure));
+            assert!(
+                router.program_output_idle("output") && router.program_output_idle("reference")
+            );
+            assert!(router.program_input_idle("microphone"));
+        }
     }
 
     #[test]

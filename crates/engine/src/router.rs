@@ -11,10 +11,7 @@ use spaghetti_common::ipc_protocol::{
 use crate::airplay_sender::AirPlayOutput;
 use crate::audio;
 use crate::bus::DeviceBus;
-use crate::calibration::{
-    Calibrating, Calibration, Feed, Job, Leg, Recording, Role, emitter_timing,
-};
-use crate::device_output;
+use crate::calibration::{Calibrating, Calibration, Feed, Job, Leg, Planned, Recording, Role};
 use crate::flow::{FlowMeter, Link};
 use crate::input::InputSource;
 use crate::mixer::{Cycles, FADE_LIMIT, IDLE};
@@ -582,7 +579,10 @@ impl Router {
             return Err(format!("the output and the reference are both {a}"));
         }
         let feed = match recording {
-            Recording::Input { device_uid } => Feed::Input(InputSource::create(&device_uid)?),
+            Recording::Input { device_uid } => Feed::Input {
+                device_uid,
+                source: None,
+            },
             Recording::Program { input } => Feed::Program(self.programs.input(&input)?),
         };
         let reservation = self.reservations.reserve(endpoints)?;
@@ -600,7 +600,7 @@ impl Router {
     fn calibration_leg(
         &self,
         role: Role,
-        mut destination: Destination,
+        destination: Destination,
     ) -> Result<(Leg, Option<Endpoint>), String> {
         let (delay_ms, latency_offset_ms) = match &destination {
             Destination::Device {
@@ -632,32 +632,36 @@ impl Router {
         {
             return Err(format!("program output '{output}' already has route {route_id}"));
         }
-        let timing = emitter_timing();
-        let target = resolve(
-            &mut destination,
-            &timing,
-            &self.programs,
-            &self.reservations,
-            self.routes
-                .iter()
-                .map(|(&id, route)| (id, &route.destination)),
-        )?;
-        let delay = f64::from(delay_ms) / 1000.0;
-        match &target {
-            Target::Device { device, .. } => {
-                device_output::check_schedule(*device, &timing, delay, latency_offset_ms)?
+        let (planned, endpoint) = match destination {
+            Destination::Device { uid, .. } => (Planned::Device { uid }, None),
+            Destination::AirPlay { receiver, .. } => {
+                let id: airplay::ReceiverId = receiver.parse().map_err(|reason| {
+                    format!("invalid AirPlay receiver id '{receiver}': {reason}")
+                })?;
+                validate_receiver_available(
+                    id.as_str(),
+                    self.routes
+                        .iter()
+                        .map(|(&id, route)| (id, &route.destination)),
+                )?;
+                let endpoint = Endpoint::AirPlay(id.to_string());
+                self.reservations.check(&endpoint)?;
+                (Planned::AirPlay { receiver: id }, Some(endpoint))
             }
-            Target::Program { output, .. } => {
-                output.check_schedule(&timing, delay, latency_offset_ms)?
+            Destination::Program { output: name, .. } => {
+                let endpoint = Endpoint::ProgramOutput(name.clone());
+                self.reservations.check(&endpoint)?;
+                let output = self.programs.output(&name)?;
+                (Planned::Program { output }, Some(endpoint))
             }
-            Target::AirPlay { .. } | Target::Srt(_) | Target::WebRtc(_) => {}
-        }
-        let endpoint = match destination {
-            Destination::AirPlay { receiver, .. } => Some(Endpoint::AirPlay(receiver)),
-            Destination::Program { output, .. } => Some(Endpoint::ProgramOutput(output)),
-            _ => None,
+            Destination::Srt(_) | Destination::WebRtc(_) => {
+                unreachable!("refused above as not on a delay")
+            }
         };
-        Ok((Leg::new(role, target, delay, latency_offset_ms), endpoint))
+        Ok((
+            Leg::new(role, planned, delay_ms, latency_offset_ms),
+            endpoint,
+        ))
     }
 
     /// Return every route ID currently targeting the given device UID.

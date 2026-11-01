@@ -9,6 +9,8 @@ pub mod audio {
     pub type DeviceId = Infallible;
 
     pub fn find_device_by_uid(_uid: &str) -> Option<DeviceId> {
+        #[cfg(test)]
+        crate::device_lookup::looking_up(_uid);
         None
     }
 }

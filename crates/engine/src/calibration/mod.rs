@@ -24,8 +24,7 @@ mod recorder;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use emitter::timing as emitter_timing;
-pub(crate) use job::{Feed, Job, Leg};
+pub(crate) use job::{Feed, Job, Leg, Planned};
 
 /// Claude: what to calibrate: `output` against `reference`, both destinations
 /// on a delay, as heard through `recording`.

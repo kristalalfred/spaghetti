@@ -12,6 +12,8 @@ pub type DeviceId = AudioObjectID;
 
 /// Find a CoreAudio device by its UID string.
 pub fn find_device_by_uid(target_uid: &str) -> Option<AudioObjectID> {
+    #[cfg(test)]
+    crate::device_lookup::looking_up(target_uid);
     let device_ids = get_all_devices()?;
 
     device_ids

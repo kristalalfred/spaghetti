@@ -12,6 +12,8 @@ mod calibration;
 mod clock;
 mod codec;
 mod delivery;
+#[cfg(test)]
+mod device_lookup;
 mod flow;
 mod host_time;
 mod leases;
