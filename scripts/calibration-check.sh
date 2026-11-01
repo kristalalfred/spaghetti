@@ -52,11 +52,14 @@ helper="$root/target/release/examples/shairport_to_device"
 uid=$(spaghetti --json devices create "$name" \
     | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["uid"])')
 
-# Claude: prints "late_ms of the output, late_ms of the reference, offset".
+# Claude: prints "late_ms of the output, late_ms of the reference, offset",
+# and both spreads on standard error.
 measure() {
     "$cli" --json calibrate "$@" --microphone "$uid" | python3 -I -c '
 import json, sys
 r = json.load(sys.stdin)
+print("spreads: output {:.4f} ms, reference {:.4f} ms".format(
+    r["output"]["spread_ms"], r["reference"]["spread_ms"]), file=sys.stderr)
 print(r["output"]["late_ms"], r["reference"]["late_ms"], r["latency_offset_ms"])'
 }
 
