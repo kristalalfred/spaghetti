@@ -9,13 +9,19 @@ use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
 use super::ProbeFailure;
-use super::probe::{TRAIN, probe};
+use super::probe::{LEVEL, TRAIN, probe};
 use super::recorder::Span;
 
 /// Claude: a match's probes stand this far above the background to be
 /// detected, and this far to count against a later detected match.
 const DETECTED_DB: f64 = 20.0;
 const STRUCTURAL_DB: f64 = 10.0;
+/// Claude: the least background the detector assumes: what a probe recorded
+/// this far below full scale makes of the envelope. Any microphone's own noise
+/// lies above it, and a recording silent to the last bit, as a virtual
+/// device's loopback is, has no background of its own for faint numerical
+/// residue to stand out against.
+const FLOOR_DBFS: f64 = -120.0;
 /// Claude: an earlier match counts only when it stands this far above what a
 /// later, stronger match's sidelobes put there.
 const SIDELOBE_MARGIN_DB: f64 = 10.0;
@@ -50,6 +56,8 @@ pub struct Detector {
     /// Claude: the envelope of the template's correlation with itself, by
     /// lag in samples, 1 at lag 0.
     autocorrelation: Vec<f64>,
+    /// Claude: the envelope a probe recorded at `FLOOR_DBFS` makes.
+    floor: f64,
     planner: FftPlanner<f64>,
 }
 
@@ -89,6 +97,7 @@ impl Detector {
             rate,
             spectrum: (0, Vec::new()),
             autocorrelation: Vec::new(),
+            floor: 0.0,
             planner: FftPlanner::new(),
             template: template.clone(),
         };
@@ -97,6 +106,7 @@ impl Detector {
         let peak = autocorrelation[0];
         autocorrelation.iter_mut().for_each(|a| *a /= peak);
         detector.autocorrelation = autocorrelation;
+        detector.floor = peak * ratio(FLOOR_DBFS) / LEVEL;
         detector
     }
 
@@ -142,7 +152,7 @@ impl Detector {
         let mut sorted = envelope.clone();
         let middle = sorted.len() / 2;
         let background = *sorted.select_nth_unstable_by(middle, f64::total_cmp).1;
-        let background = background.max(peak * 1e-12);
+        let background = background.max(self.floor);
 
         let matches = self.matches(&envelope, background);
         let arrival = matches
@@ -452,5 +462,13 @@ mod tests {
             measure(48_000.0, &paths, noise),
             Err(ProbeFailure::Ambiguous)
         );
+    }
+
+    #[test]
+    fn residue_far_below_any_microphone_in_a_silent_recording_is_no_arrival() {
+        let residue = 10f64.powf(-150.0 / 20.0) / 0.5;
+        let paths = [(0.012 - 0.188, residue), (0.012, 0.3)];
+        let measured = measure(48_000.0, &paths, 0.0).unwrap();
+        assert!((measured.residual - 0.012).abs() < 1e-5, "{measured:?}");
     }
 }

@@ -12,7 +12,7 @@ const PROBE_SECONDS: f64 = 0.2;
 const LOW_HZ: f64 = 500.0;
 const HIGH_HZ: f64 = 6000.0;
 const TAPER_SECONDS: f64 = 0.01;
-const LEVEL: f64 = 0.5;
+pub const LEVEL: f64 = 0.5;
 
 /// Claude: the probe at `t` seconds from its start: a sweep from `LOW_HZ` to
 /// `HIGH_HZ` over `PROBE_SECONDS` with raised-cosine ends, peaking at `LEVEL`,
