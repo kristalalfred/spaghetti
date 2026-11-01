@@ -37,6 +37,7 @@ use crate::flow::{FlowMeter, Link};
 use crate::host_time;
 use crate::ring::{CHANNELS, Captured, Ring};
 use crate::sinks::{MAX_SINKS, Sinks, SourceTiming};
+use crate::watch::{Watch, Watcher};
 
 /// Claude: how the first input stream's frames lie in the buffers an IOProc is
 /// handed. A stream's buffers come first in the list, before other streams'.
@@ -222,20 +223,22 @@ struct Shared {
     ended: OnceLock<String>,
 }
 
-/// Claude: what the IOProc and the property listener read, for as long as
-/// the capture runs.
+/// Claude: what the IOProc and the property listeners read. The listeners'
+/// calls keep it alive past the capture, so a call after the capture closed
+/// finds `closed` set and changes nothing.
 struct Running {
     shared: Arc<Shared>,
     device: AudioObjectID,
     format: InputFormat,
     logged_once: AtomicBool,
+    closed: AtomicBool,
 }
 
-impl Running {
-    /// Claude: called on the HAL's notification thread. Ends capture when the
-    /// device is gone or no longer reads as it did when capture started.
-    fn check(&self) {
-        if self.shared.ended.get().is_some() {
+impl Watcher for Running {
+    /// Claude: ends capture when the device is gone or no longer reads as it
+    /// did when capture started.
+    fn changed(&self) {
+        if self.closed.load(Ordering::Acquire) || self.shared.ended.get().is_some() {
             return;
         }
         let alive = audio::get_u32(
@@ -300,25 +303,13 @@ fn watched(device: AudioObjectID, stream: AudioObjectID) -> [(AudioObjectID, u32
     ]
 }
 
-unsafe extern "C" fn input_changed(
-    _object: AudioObjectID,
-    _addresses: u32,
-    _changed: *const AudioObjectPropertyAddress,
-    client: *mut std::ffi::c_void,
-) -> OSStatus {
-    if let Some(running) = unsafe { client.cast::<Running>().as_ref() } {
-        running.check();
-    }
-    0
-}
-
 /// Claude: a running IOProc on the device, and the listeners that end it on a
 /// change. Whatever it acquired it releases when dropped, however far its
 /// start got.
 struct Capture {
     running: Arc<Running>,
     ioproc: AudioDeviceIOProcID,
-    listening: Vec<(AudioObjectID, AudioObjectPropertyAddress)>,
+    watch: Option<Watch>,
     started: bool,
 }
 
@@ -337,9 +328,10 @@ impl Capture {
                 device,
                 format,
                 logged_once: AtomicBool::new(false),
+                closed: AtomicBool::new(false),
             }),
             ioproc: None,
-            listening: Vec::new(),
+            watch: None,
             started: false,
         };
         let client = Arc::as_ptr(&capture.running).cast_mut().cast();
@@ -350,21 +342,11 @@ impl Capture {
             capture.ioproc = None;
             return Err(format!("AudioDeviceCreateIOProcID failed: {status:#010x}"));
         }
+        let watch = capture
+            .watch
+            .insert(Watch::new(Arc::clone(&capture.running)));
         for (object, selector, scope) in watched(device, stream) {
-            let address = AudioObjectPropertyAddress {
-                mSelector: selector,
-                mScope: scope,
-                mElement: kAudioObjectPropertyElementMain,
-            };
-            let status = unsafe {
-                AudioObjectAddPropertyListener(object, &address, Some(input_changed), client)
-            };
-            if status != 0 {
-                return Err(format!(
-                    "could not watch the input device's property {selector:#x}: {status:#010x}"
-                ));
-            }
-            capture.listening.push((object, address));
+            watch.add(object, selector, scope)?;
         }
         let now = InputFormat::read(device)?;
         if now != capture.running.format {
@@ -385,17 +367,13 @@ impl Capture {
 impl Drop for Capture {
     fn drop(&mut self) {
         let device = self.running.device;
-        let client = Arc::as_ptr(&self.running).cast_mut().cast();
-        unsafe {
-            if self.started {
-                AudioDeviceStop(device, self.ioproc);
-            }
-            for (object, address) in &self.listening {
-                AudioObjectRemovePropertyListener(*object, address, Some(input_changed), client);
-            }
-            if self.ioproc.is_some() {
-                AudioDeviceDestroyIOProcID(device, self.ioproc);
-            }
+        self.running.closed.store(true, Ordering::Release);
+        if self.started {
+            unsafe { AudioDeviceStop(device, self.ioproc) };
+        }
+        self.watch = None;
+        if self.ioproc.is_some() {
+            unsafe { AudioDeviceDestroyIOProcID(device, self.ioproc) };
         }
     }
 }

@@ -50,6 +50,8 @@ mod device_output;
 mod input;
 #[cfg(target_os = "macos")]
 mod tap;
+#[cfg(target_os = "macos")]
+mod watch;
 
 #[cfg(not(target_os = "macos"))]
 mod no_hal;
