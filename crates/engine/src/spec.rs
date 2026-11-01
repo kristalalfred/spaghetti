@@ -16,6 +16,11 @@ pub enum SourceSpec {
     WebRtc(WebRtcPeer),
     /// Claude: the program input registered under this name.
     Program { input: String },
+    /// Claude: what a Core Audio input device captures, from its first input
+    /// stream: its first two channels, or its one channel on both. Each frame
+    /// is dated by when it reached the device, its input latency counted back
+    /// from the device's time stamp, and counted by the device's frame count.
+    Input { device_uid: String },
 }
 
 /// Claude: where a route plays its source.
@@ -72,6 +77,9 @@ pub struct SourceInfo {
     /// the program input's name.
     pub label: String,
     pub status: FlowStatus,
+    /// Claude: why the source stopped, or why it could not start the last time
+    /// a route needed it.
+    pub failure: Option<String>,
     /// Claude: a WebRTC peer's offer or answer, once it has one.
     pub local_description: Option<String>,
 }
@@ -128,17 +136,13 @@ impl From<wire::Destination> for Destination {
 }
 
 /// Claude: a source or destination that only means something in the
-/// process that registered it.
+/// process that made it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InProcess(pub String);
 
 impl std::fmt::Display for InProcess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} exists only in the process that registered it",
-            self.0
-        )
+        write!(f, "{} exists only in the process that made it", self.0)
     }
 }
 
@@ -153,6 +157,9 @@ impl TryFrom<SourceSpec> for wire::SourceSpec {
             SourceSpec::Srt(socket) => Ok(Self::Srt(socket)),
             SourceSpec::WebRtc(peer) => Ok(Self::WebRtc(peer)),
             SourceSpec::Program { input } => Err(InProcess(format!("program input '{input}'"))),
+            SourceSpec::Input { device_uid } => Err(InProcess(format!(
+                "a source of input device '{device_uid}'"
+            ))),
         }
     }
 }
@@ -319,6 +326,10 @@ mod tests {
         assert_eq!(refused, InProcess("program output 'speaker'".into()));
         let refused = wire::SourceSpec::try_from(SourceSpec::Program {
             input: "mic".into(),
+        });
+        assert!(refused.is_err());
+        let refused = wire::SourceSpec::try_from(SourceSpec::Input {
+            device_uid: "BuiltInMicrophoneDevice".into(),
         });
         assert!(refused.is_err());
     }

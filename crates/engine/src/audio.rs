@@ -4,7 +4,7 @@ use core_foundation_sys::string::CFStringRef;
 use coreaudio_sys::*;
 use spaghetti_common::ipc_protocol::SystemDeviceInfo;
 
-use crate::tap;
+use crate::{abl, tap};
 use std::mem;
 use std::ptr;
 
@@ -74,8 +74,9 @@ pub fn list_all_devices() -> Vec<SystemDeviceInfo> {
         .into_iter()
         .filter_map(|id| {
             let uid = get_device_uid(id).filter(|uid| !uid.starts_with(tap::AGGREGATE_UID_PREFIX))?;
-            let name = get_device_name(id).unwrap_or_else(|| uid.clone());
-            let channels = get_output_channel_count(id);
+            let name = device_name(id).unwrap_or_else(|| uid.clone());
+            let channels = stream_configuration(id, kAudioObjectPropertyScopeOutput)
+                .map_or(0, |buffers| buffers.iter().sum());
             Some(SystemDeviceInfo {
                 uid,
                 name,
@@ -87,7 +88,7 @@ pub fn list_all_devices() -> Vec<SystemDeviceInfo> {
 }
 
 /// Get the human-readable name of a device via `kAudioObjectPropertyName`.
-fn get_device_name(device_id: AudioObjectID) -> Option<String> {
+pub(crate) fn device_name(device_id: AudioObjectID) -> Option<String> {
     let property_address = AudioObjectPropertyAddress {
         mSelector: kAudioObjectPropertyName,
         mScope: kAudioObjectPropertyScopeGlobal,
@@ -116,30 +117,22 @@ fn get_device_name(device_id: AudioObjectID) -> Option<String> {
     Some(cf_string.to_string())
 }
 
-/// Sum the output channel count across all output-scope stream buffers.
-fn get_output_channel_count(device_id: AudioObjectID) -> u32 {
+/// Claude: the channels of each buffer the device's streams in `scope` fill,
+/// in the order an IOProc is handed them.
+pub(crate) fn stream_configuration(device_id: AudioObjectID, scope: u32) -> Option<Vec<u32>> {
     let property_address = AudioObjectPropertyAddress {
         mSelector: kAudioDevicePropertyStreamConfiguration,
-        mScope: kAudioObjectPropertyScopeOutput,
+        mScope: scope,
         mElement: kAudioObjectPropertyElementMain,
     };
-
     let mut data_size: u32 = 0;
     let status = unsafe {
-        AudioObjectGetPropertyDataSize(
-            device_id,
-            &property_address,
-            0,
-            ptr::null(),
-            &mut data_size,
-        )
+        AudioObjectGetPropertyDataSize(device_id, &property_address, 0, ptr::null(), &mut data_size)
     };
-    if status != 0 || data_size < mem::size_of::<AudioBufferList>() as u32 {
-        return 0;
+    if status != 0 || (data_size as usize) < mem::size_of::<AudioBufferList>() {
+        return None;
     }
-
-    // Allocate a buffer large enough to hold the variable-length AudioBufferList.
-    let mut buf = vec![0u8; data_size as usize];
+    let mut words = vec![0u64; (data_size as usize).div_ceil(mem::size_of::<u64>())];
     let status = unsafe {
         AudioObjectGetPropertyData(
             device_id,
@@ -147,20 +140,19 @@ fn get_output_channel_count(device_id: AudioObjectID) -> u32 {
             0,
             ptr::null(),
             &mut data_size,
-            buf.as_mut_ptr().cast(),
+            words.as_mut_ptr().cast(),
         )
     };
     if status != 0 {
-        return 0;
+        return None;
     }
-
-    // Safety: buf is large enough and properly aligned for AudioBufferList.
-    let list = unsafe { &*(buf.as_ptr() as *const AudioBufferList) };
-    let n = list.mNumberBuffers as usize;
-    // The mBuffers field is declared as [AudioBuffer; 1] but is actually n elements.
-    let buffers =
-        unsafe { std::slice::from_raw_parts(list.mBuffers.as_ptr(), n) };
-    buffers.iter().map(|b| b.mNumberChannels).sum()
+    let buffers = unsafe { abl::buffers(words.as_ptr().cast()) };
+    Some(
+        buffers
+            .iter()
+            .map(|buffer| buffer.mNumberChannels)
+            .collect(),
+    )
 }
 
 /// Claude: the rate the device runs at.
@@ -193,7 +185,7 @@ pub fn output_latency_frames(device_id: AudioObjectID) -> u32 {
         kAudioDevicePropertyLatency,
         kAudioObjectPropertyScopeOutput,
     );
-    let stream = first_output_stream(device_id).and_then(|stream| {
+    let stream = first_stream(device_id, kAudioObjectPropertyScopeOutput).and_then(|stream| {
         get_u32(
             stream,
             kAudioStreamPropertyLatency,
@@ -203,7 +195,7 @@ pub fn output_latency_frames(device_id: AudioObjectID) -> u32 {
     device.unwrap_or(0) + stream.unwrap_or(0)
 }
 
-fn get_u32(object: AudioObjectID, selector: u32, scope: u32) -> Option<u32> {
+pub(crate) fn get_u32(object: AudioObjectID, selector: u32, scope: u32) -> Option<u32> {
     let property_address = AudioObjectPropertyAddress {
         mSelector: selector,
         mScope: scope,
@@ -224,10 +216,10 @@ fn get_u32(object: AudioObjectID, selector: u32, scope: u32) -> Option<u32> {
     (status == 0).then_some(value)
 }
 
-fn first_output_stream(device_id: AudioObjectID) -> Option<AudioObjectID> {
+pub(crate) fn first_stream(device_id: AudioObjectID, scope: u32) -> Option<AudioObjectID> {
     let property_address = AudioObjectPropertyAddress {
         mSelector: kAudioDevicePropertyStreams,
-        mScope: kAudioObjectPropertyScopeOutput,
+        mScope: scope,
         mElement: kAudioObjectPropertyElementMain,
     };
     let mut streams = [0 as AudioObjectID; 16];
@@ -243,6 +235,28 @@ fn first_output_stream(device_id: AudioObjectID) -> Option<AudioObjectID> {
         )
     };
     (status == 0 && size >= mem::size_of::<AudioObjectID>() as u32).then_some(streams[0])
+}
+
+/// Claude: the format a stream hands its clients.
+pub(crate) fn virtual_format(stream: AudioObjectID) -> Option<AudioStreamBasicDescription> {
+    let property_address = AudioObjectPropertyAddress {
+        mSelector: kAudioStreamPropertyVirtualFormat,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut format: AudioStreamBasicDescription = unsafe { mem::zeroed() };
+    let mut size = mem::size_of::<AudioStreamBasicDescription>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            stream,
+            &property_address,
+            0,
+            ptr::null(),
+            &mut size,
+            (&mut format as *mut AudioStreamBasicDescription).cast(),
+        )
+    };
+    (status == 0).then_some(format)
 }
 
 /// Get the UID string for a given audio device.

@@ -47,12 +47,14 @@ mod device_manager;
 #[cfg(target_os = "macos")]
 mod device_output;
 #[cfg(target_os = "macos")]
+mod input;
+#[cfg(target_os = "macos")]
 mod tap;
 
 #[cfg(not(target_os = "macos"))]
 mod no_hal;
 #[cfg(not(target_os = "macos"))]
-use no_hal::{audio, bus, device_output, tap};
+use no_hal::{audio, bus, device_output, input, tap};
 
 pub use host_time::HostTime;
 pub use program_io::{

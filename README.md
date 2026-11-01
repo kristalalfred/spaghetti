@@ -115,7 +115,7 @@ fn example(captured: &[f32], left: &mut [f32], right: &mut [f32]) -> Result<(), 
 | Removal | `remove_program_input` destroys the sources made from the input. `remove_program_output` fades out and destroys the routes to the output. The real-time ends keep working: an input feeds nothing, an output renders silence. Drop them outside the real-time thread. |
 | State | `Router::list_routes` reports each device or program route's `Playback`: `Playing` when the output's latest render played the route's source at any volume, `Silent` while the route waits for audio or for its schedule or after a refused render, and `Stopped` when the output has not rendered for 100 ms plus 4096 frames at its rate. `list_sources` reports a program source as `Idle` without routes, then `Connected`, `Flowing` while the input pushes, and `Stalled` 3 s after it stops. |
 
-The engine also builds for iOS (`aarch64-apple-ios`, `aarch64-apple-ios-sim`). Those targets have no Core Audio HAL: process taps, device outputs and the virtual-device functions are unavailable, and a `SourceSpec::Tap` or `Destination::Device` is refused when it is created. Program I/O, SRT, WebRTC and AirPlay remain available.
+The engine also builds for iOS (`aarch64-apple-ios`, `aarch64-apple-ios-sim`). Those targets have no Core Audio HAL: process taps, input and output devices and the virtual-device functions are unavailable, and a `SourceSpec::Tap`, `SourceSpec::Input` or `Destination::Device` is refused when it is created. Program I/O, SRT, WebRTC and AirPlay remain available.
 
 ```sh
 just check-ios

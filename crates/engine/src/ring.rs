@@ -16,6 +16,7 @@ const RUN_TOLERANCE_SECONDS: f64 = 0.001;
 /// middle of rewriting before it keeps the one it read last.
 const READ_ATTEMPTS: usize = 8;
 const NO_TIME: u64 = u64::MAX;
+const NO_POSITION: u64 = u64::MAX;
 
 /// Claude: when a push's first frame was captured, as far as its source knows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +26,13 @@ pub enum Captured {
     /// Claude: the host time read as the frame was captured. A push dated off
     /// where the previous one ended starts a new run.
     Measured(u64),
+    /// Claude: measured, and placed by the capturing device's own frame count:
+    /// `position` is the device's sample time of the first frame. A push that
+    /// does not start at the very frame where the previous one ended also
+    /// starts a new run, however close its date, so a run holds every frame
+    /// the device captured over it exactly once.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Counted { at: u64, position: u64 },
     /// Claude: the host time estimated through another clock, whose estimate
     /// may move between pushes. The source marks its own discontinuities.
     Estimated(u64),
@@ -116,10 +124,11 @@ impl Publication {
 }
 
 /// Claude: the record of one push: where its frames went, its run, when its
-/// first frame was captured or `NO_TIME`, and when it arrived. The producer
-/// writes it before publishing the push and leaves it alone until the consumer
-/// is past it.
-struct Segment([AtomicU64; 5]);
+/// first frame was captured or `NO_TIME`, when it arrived, and the capturing
+/// device's position of its first frame or `NO_POSITION`. The producer writes
+/// it before publishing the push and leaves it alone until the consumer is
+/// past it.
+struct Segment([AtomicU64; 6]);
 
 #[derive(Clone, Copy)]
 struct Push {
@@ -128,6 +137,7 @@ struct Push {
     run: u64,
     captured: u64,
     arrival: u64,
+    position: u64,
 }
 
 impl Segment {
@@ -136,17 +146,20 @@ impl Segment {
     }
 
     fn write(&self, push: Push) {
-        for (word, value) in
-            self.0
-                .iter()
-                .zip([push.start, push.len, push.run, push.captured, push.arrival])
-        {
+        for (word, value) in self.0.iter().zip([
+            push.start,
+            push.len,
+            push.run,
+            push.captured,
+            push.arrival,
+            push.position,
+        ]) {
             word.store(value, Ordering::Relaxed);
         }
     }
 
     fn read(&self) -> Push {
-        let [start, len, run, captured, arrival] =
+        let [start, len, run, captured, arrival, position] =
             std::array::from_fn(|i| self.0[i].load(Ordering::Relaxed));
         Push {
             start,
@@ -154,7 +167,17 @@ impl Segment {
             run,
             captured,
             arrival,
+            position,
         }
+    }
+
+    /// Claude: whether a push from `position` follows this one frame for
+    /// frame, as far as both carry a position.
+    fn followed_at(&self, position: u64) -> bool {
+        let push = self.read();
+        position == NO_POSITION
+            || push.position == NO_POSITION
+            || push.position.wrapping_add(push.len) == position
     }
 }
 
@@ -170,8 +193,8 @@ fn ahead(position: u64, from: u64) -> i64 {
 /// push it came in: its capture time when the source dates its frames, else its
 /// arrival. The frames come in runs. The first push starts one, and a run ends
 /// where audio went missing: a push the ring had no room for, a measured push
-/// dated off where the previous one ended, or a discontinuity the producer
-/// marks. The producer publishes each push, its record and its run together
+/// dated off where the previous one ended, a counted push placed off where the
+/// previous one ended, or a discontinuity the producer marks. The producer publishes each push, its record and its run together
 /// once its frames are written. The consumer reads only a run it took
 /// (`take_discontinuity`), which drops what it has not read of the earlier runs.
 pub struct Ring {
@@ -311,12 +334,20 @@ impl Ring {
         }
         let expected = self.next_capture.load(Ordering::Relaxed);
         let (continues, next) = match captured {
-            Captured::Measured(at) => (
+            Captured::Measured(at) | Captured::Counted { at, .. } => (
                 expected == NO_TIME || at.abs_diff(expected) as f64 <= self.tolerance_ticks,
                 at + (frames as f64 * self.ticks_per_frame).round() as u64,
             ),
             Captured::Unknown | Captured::Estimated(_) => (true, NO_TIME),
         };
+        let position = match captured {
+            Captured::Counted { position, .. } => position,
+            Captured::Unknown | Captured::Measured(_) | Captured::Estimated(_) => NO_POSITION,
+        };
+        let continues = continues
+            && self
+                .segment(latest.pushed.wrapping_sub(1))
+                .followed_at(position);
         self.next_capture.store(next, Ordering::Relaxed);
         let mut published = Published {
             head: head.wrapping_add(frames as u64),
@@ -343,9 +374,12 @@ impl Ring {
             run: published.run,
             captured: match captured {
                 Captured::Unknown => NO_TIME,
-                Captured::Measured(at) | Captured::Estimated(at) => at,
+                Captured::Measured(at) | Captured::Counted { at, .. } | Captured::Estimated(at) => {
+                    at
+                }
             },
             arrival: now,
+            position,
         });
         self.publication.write(published);
         true
@@ -716,6 +750,61 @@ mod tests {
         assert!(ring.take_discontinuity().is_none());
         assert_eq!(ring.available(), 960);
         assert_eq!(ring.discontinuities(), 0);
+    }
+
+    /// Claude: pushes `frames` frames of `value`, the device's frame `position`
+    /// first, captured at `seconds` as `push_measured` dates them.
+    fn push_counted(ring: &Ring, seconds: f64, position: u64, frames: usize, value: f32) -> bool {
+        ring.push_with(
+            frames,
+            0,
+            Captured::Counted {
+                at: ticks(100.0 + seconds),
+                position,
+            },
+            |_, _| value,
+        )
+    }
+
+    #[test]
+    fn counted_pushes_continue_one_run_only_frame_for_frame() {
+        let frame = 1.0 / RATE;
+        let ring = Ring::new(RATE);
+        assert!(push_counted(&ring, 0.0, 1000, 480, 1.0));
+        assert!(push_counted(&ring, 0.01, 1480, 480, 2.0));
+        assert_eq!(ring.discontinuities(), 0);
+        assert!(push_counted(&ring, 0.02 + frame, 1961, 480, 3.0));
+        assert_eq!(ring.discontinuities(), 1, "a lost frame continued the run");
+        assert!(push_counted(&ring, 0.03 + frame, 2441, 480, 4.0));
+        assert_eq!(ring.discontinuities(), 1);
+        assert!(push_counted(&ring, 0.04, 2920, 480, 5.0));
+        assert_eq!(
+            ring.discontinuities(),
+            2,
+            "a repeated frame continued the run"
+        );
+        assert!(ring.take_discontinuity().is_some());
+        assert_eq!(front(&ring), 5.0);
+        assert_eq!(ring.available(), 479);
+    }
+
+    #[test]
+    fn counted_pushes_still_end_a_run_where_their_dates_jump() {
+        let ring = Ring::new(RATE);
+        assert!(push_counted(&ring, 0.0, 0, 480, 1.0));
+        assert!(push_counted(&ring, 0.012, 480, 480, 2.0));
+        assert_eq!(ring.discontinuities(), 1);
+    }
+
+    #[test]
+    fn a_push_without_a_position_continues_a_counted_run_by_its_date() {
+        let ring = Ring::new(RATE);
+        assert!(push_counted(&ring, 0.0, 0, 480, 1.0));
+        assert!(push_measured(&ring, 0.01, 480, 2.0));
+        assert!(push_counted(&ring, 0.02, 7, 480, 3.0));
+        assert_eq!(ring.discontinuities(), 0);
+        assert!(push_counted(&ring, 0.03, 480, 480, 4.0));
+        assert_eq!(ring.discontinuities(), 1);
     }
 
     /// Claude: the controller's first reproduction: a 10 ms gap between two

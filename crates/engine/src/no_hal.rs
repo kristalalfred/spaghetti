@@ -1,5 +1,5 @@
 //! Claude: what the router names of the Core Audio HAL where there is none,
-//! as on iOS: process taps, device buses and device outputs. Every type here
+//! as on iOS: process taps, input devices, device buses and device outputs. Every type here
 //! is uninhabited, so their constructors are the only code that runs, and a
 //! source or route that needs one is refused when it is created.
 
@@ -37,6 +37,47 @@ pub mod tap {
         }
 
         pub fn set_processes(&mut self, _pids: &[u32]) -> Result<(), String> {
+            match self.never {}
+        }
+
+        pub fn timing(&mut self) -> Result<SourceTiming, String> {
+            match self.never {}
+        }
+
+        pub fn add_sink(&mut self, _ring: Arc<Ring>) -> Result<usize, String> {
+            match self.never {}
+        }
+
+        pub fn remove_sink(&mut self, _slot: usize) {
+            match self.never {}
+        }
+    }
+}
+
+pub mod input {
+    use std::convert::Infallible;
+    use std::sync::Arc;
+
+    use spaghetti_common::ipc_protocol::FlowStatus;
+
+    use crate::ring::Ring;
+    use crate::sinks::SourceTiming;
+
+    pub struct InputSource {
+        pub label: String,
+        never: Infallible,
+    }
+
+    impl InputSource {
+        pub fn create(_device_uid: &str) -> Result<Self, String> {
+            Err("input devices need macOS".into())
+        }
+
+        pub fn status(&self) -> FlowStatus {
+            match self.never {}
+        }
+
+        pub fn failure(&self) -> Option<String> {
             match self.never {}
         }
 

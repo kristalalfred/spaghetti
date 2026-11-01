@@ -16,6 +16,9 @@ check-ios:
 airplay-interop:
     ./scripts/airplay-interop.sh
 
+input-loopback:
+    ./scripts/input-loopback.sh
+
 install:
     ./scripts/install.sh
 

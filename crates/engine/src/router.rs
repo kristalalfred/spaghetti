@@ -13,6 +13,7 @@ use crate::audio;
 use crate::bus::DeviceBus;
 use crate::device_output::DeviceOutput;
 use crate::flow::{FlowMeter, Link};
+use crate::input::InputSource;
 use crate::mixer::{Cycles, FADE_LIMIT, IDLE};
 use crate::program_io::{
     InputShared, OutputShared, ProgramInput, ProgramOutput, ProgramRoute, ProgramSource,
@@ -32,6 +33,7 @@ enum Source {
     Srt(SrtSource),
     WebRtc(WebRtcSource),
     Program(ProgramSource),
+    Input(InputSource),
 }
 
 impl Source {
@@ -45,6 +47,7 @@ impl Source {
             SourceSpec::Program { input } => programs
                 .input(input)
                 .map(|shared| Self::Program(ProgramSource::open(shared))),
+            SourceSpec::Input { device_uid } => InputSource::create(device_uid).map(Self::Input),
         }
     }
 
@@ -54,6 +57,7 @@ impl Source {
             Self::Srt(srt) => Ok(srt.timing()),
             Self::WebRtc(webrtc) => Ok(webrtc.timing()),
             Self::Program(program) => Ok(program.timing()),
+            Self::Input(input) => input.timing(),
         }
     }
 
@@ -63,6 +67,7 @@ impl Source {
             Self::Srt(srt) => srt.add_sink(ring),
             Self::WebRtc(webrtc) => webrtc.add_sink(ring),
             Self::Program(program) => program.add_sink(ring),
+            Self::Input(input) => input.add_sink(ring),
         }
     }
 
@@ -72,6 +77,7 @@ impl Source {
             Self::Srt(srt) => srt.remove_sink(slot),
             Self::WebRtc(webrtc) => webrtc.remove_sink(slot),
             Self::Program(program) => program.remove_sink(slot),
+            Self::Input(input) => input.remove_sink(slot),
         }
     }
 
@@ -81,6 +87,7 @@ impl Source {
             Self::Srt(srt) => &srt.label,
             Self::WebRtc(webrtc) => &webrtc.label,
             Self::Program(program) => &program.label,
+            Self::Input(input) => &input.label,
         }
     }
 
@@ -90,6 +97,14 @@ impl Source {
             Self::Srt(srt) => srt.status(),
             Self::WebRtc(webrtc) => webrtc.status(),
             Self::Program(program) => program.status(),
+            Self::Input(input) => input.status(),
+        }
+    }
+
+    fn failure(&self) -> Option<String> {
+        match self {
+            Self::Input(input) => input.failure(),
+            Self::Tap(_) | Self::Srt(_) | Self::WebRtc(_) | Self::Program(_) => None,
         }
     }
 
@@ -349,6 +364,7 @@ impl Router {
                 tag: entry.tag.clone(),
                 label: entry.source.label().to_string(),
                 status: self.source_status(id, &entry.source),
+                failure: entry.source.failure(),
                 local_description: entry.source.peer().and_then(PeerLink::local_description),
             })
             .collect()
@@ -786,7 +802,10 @@ fn validate_schedule_source(source: &SourceSpec, destination: &Destination) -> R
         Destination::Srt(_) | Destination::WebRtc(_) => false,
     };
     let dated = match source {
-        SourceSpec::Tap { .. } | SourceSpec::WebRtc(_) | SourceSpec::Program { .. } => true,
+        SourceSpec::Tap { .. }
+        | SourceSpec::WebRtc(_)
+        | SourceSpec::Program { .. }
+        | SourceSpec::Input { .. } => true,
         SourceSpec::Srt(_) => false,
     };
     if scheduled && !dated {
