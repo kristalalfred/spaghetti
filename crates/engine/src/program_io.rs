@@ -141,12 +141,20 @@ impl<'a> Frames<'a> {
     }
 }
 
-/// Claude: a program's audio rate must be a rate.
+/// Claude: the highest rate a program input or output may run at. A route
+/// holds the same time at any rate, in memory that grows with it.
+pub const MAX_PROGRAM_RATE: f64 = 768_000.0;
+
+/// Claude: a program's audio rate must be a rate, at most `MAX_PROGRAM_RATE`.
 fn checked_rate(sample_rate: f64) -> Result<f64, String> {
-    if sample_rate.is_finite() && sample_rate > 0.0 {
-        Ok(sample_rate)
-    } else {
+    if !(sample_rate.is_finite() && sample_rate > 0.0) {
         Err(format!("{sample_rate} Hz is not a sample rate"))
+    } else if sample_rate > MAX_PROGRAM_RATE {
+        Err(format!(
+            "{sample_rate} Hz is above the {MAX_PROGRAM_RATE} Hz a program may run at"
+        ))
+    } else {
+        Ok(sample_rate)
     }
 }
 
@@ -1211,8 +1219,8 @@ mod tests {
             (mic, "speaker", 5500, Some(300), true),
             (mic, "speaker", 10_000, None, false),
             (mic, "late", 10_000, None, true),
-            (fast, "speaker", 1200, None, true),
-            (fast, "speaker", 1400, None, false),
+            (fast, "speaker", 5300, None, true),
+            (fast, "speaker", 5500, None, false),
         ] {
             let created =
                 router.create_route(source, offset_to(output, Some(delay_ms), offset_ms), 1.0);
@@ -1267,6 +1275,28 @@ mod tests {
                 .create_route(source, to("speaker", None), 1.0)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn rates_past_the_highest_a_program_may_run_at_are_refused() {
+        let mut router = Router::new();
+        for (name, rate) in [("a", -1.0), ("b", f64::INFINITY), ("c", 768_001.0)] {
+            assert!(router.add_program_input(name, rate).is_err(), "{rate} Hz");
+            assert!(
+                router
+                    .add_program_output(name, rate, Duration::ZERO)
+                    .is_err(),
+                "{rate} Hz"
+            );
+        }
+        let _input = router.add_program_input("d", MAX_PROGRAM_RATE).unwrap();
+        let source = program_source(&mut router, "d");
+        let _output = router
+            .add_program_output("d", MAX_PROGRAM_RATE, Duration::ZERO)
+            .unwrap();
+        router
+            .create_route(source, to("d", Some(5300)), 1.0)
+            .unwrap();
     }
 
     #[test]

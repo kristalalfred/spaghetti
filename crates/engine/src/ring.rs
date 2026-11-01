@@ -5,7 +5,10 @@ use std::time::{Duration, Instant};
 use crate::host_time;
 
 pub const CHANNELS: usize = 2;
-pub const CAPACITY_FRAMES: usize = 1 << 18;
+/// Claude: a ring holds as long as this many frames last at this rate,
+/// 5.46 s, at least, whatever its own rate.
+const HELD_FRAMES: usize = 1 << 18;
+const HELD_RATE: f64 = 48_000.0;
 /// Claude: a ring keeps a record of each push it holds, up to one per this
 /// many frames of its capacity on average.
 const FRAMES_PER_SEGMENT: usize = 16;
@@ -242,9 +245,17 @@ pub struct LastPush {
 // time. `seen` is the consumer's alone.
 unsafe impl Sync for Ring {}
 
+/// Claude: how many frames a ring at `sample_rate` holds: the fewest, in a
+/// power of two, that last as long as `HELD_FRAMES` at `HELD_RATE`.
+pub fn capacity_frames(sample_rate: f64) -> usize {
+    ((sample_rate * HELD_FRAMES as f64 / HELD_RATE).ceil() as usize)
+        .next_power_of_two()
+        .max(FRAMES_PER_SEGMENT)
+}
+
 impl Ring {
     pub fn new(sample_rate: f64) -> Self {
-        Self::starting_at(sample_rate, 0, 0, CAPACITY_FRAMES)
+        Self::starting_at(sample_rate, 0, 0, capacity_frames(sample_rate))
     }
 
     /// Claude: a ring of `capacity` frames, a power of two, for tests that
@@ -638,7 +649,7 @@ mod tests {
         let mut written = 0;
         let mut read = 0;
         let mut dst = vec![0.0; 1000 * CHANNELS];
-        while written <= CAPACITY_FRAMES * 3 {
+        while written <= capacity_frames(RATE) * 3 {
             assert!(push_counting(&ring, written, 700));
             written += 700;
             ring.take_discontinuity();
@@ -654,7 +665,7 @@ mod tests {
     #[test]
     fn refuses_pushes_that_do_not_fit() {
         let ring = Ring::new(RATE);
-        assert!(push_counting(&ring, 0, CAPACITY_FRAMES - 10));
+        assert!(push_counting(&ring, 0, capacity_frames(RATE) - 10));
         assert!(!push_counting(&ring, 0, 11));
         assert!(push_counting(&ring, 0, 10));
         assert!(ring.take_discontinuity().is_some());
@@ -828,7 +839,7 @@ mod tests {
     fn an_overflowed_push_ends_the_run_before_it() {
         let ring = Ring::new(RATE);
         let block = 480;
-        let blocks = CAPACITY_FRAMES / block;
+        let blocks = capacity_frames(RATE) / block;
         for i in 0..blocks {
             assert!(push_measured(&ring, i as f64 * 0.01, block, 1.0));
             if i == 0 {
@@ -961,7 +972,7 @@ mod tests {
     /// it: frames come out in order, dated, and runs end where they should.
     #[test]
     fn positions_and_runs_carry_on_across_the_end_of_their_counts() {
-        let ring = Ring::starting_at(RATE, u64::MAX - 1000, u64::MAX - 1, CAPACITY_FRAMES);
+        let ring = Ring::starting_at(RATE, u64::MAX - 1000, u64::MAX - 1, capacity_frames(RATE));
         for block in 0..4 {
             assert!(push_measured(&ring, block as f64 * 0.01, 480, block as f32));
         }
@@ -1075,9 +1086,33 @@ mod tests {
     }
 
     #[test]
+    fn a_ring_holds_as_long_at_every_rate_as_at_48_khz() {
+        assert_eq!(capacity_frames(48_000.0), 1 << 18);
+        let held = (1 << 18) as f64 / 48_000.0;
+        for rate in [
+            8_000.0, 16_000.0, 22_050.0, 44_100.0, 48_000.0, 88_200.0, 96_000.0, 176_400.0,
+            192_000.0, 384_000.0, 768_000.0,
+        ] {
+            let capacity = capacity_frames(rate);
+            assert!(capacity.is_power_of_two(), "{rate} Hz: {capacity} frames");
+            assert!(
+                capacity as f64 / rate >= held,
+                "{rate} Hz: {capacity} frames"
+            );
+            assert!(
+                (capacity / 2) as f64 / rate < held,
+                "{rate} Hz: {capacity} frames"
+            );
+            let ring = Ring::new(rate);
+            assert!(push_counting(&ring, 0, capacity));
+            assert!(!push_counting(&ring, 0, 1));
+        }
+    }
+
+    #[test]
     fn counts_overflows() {
         let ring = Ring::new(RATE);
-        assert!(push_counting(&ring, 0, CAPACITY_FRAMES));
+        assert!(push_counting(&ring, 0, capacity_frames(RATE)));
         assert!(!push_counting(&ring, 0, 1));
         assert_eq!(ring.overflows(), 1);
     }

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::delivery::DeliverySpan;
 use crate::mixer::{Cycles, IDLE, RAMP};
-use crate::ring::{CAPACITY_FRAMES, CHANNELS, LastPush, Ring};
+use crate::ring::{CHANNELS, LastPush, Ring, capacity_frames};
 use crate::sinks::SourceTiming;
 use crate::spec::Playback;
 
@@ -328,7 +328,7 @@ impl Playout {
         let rate = self.health.source_rate;
         let reserve =
             self.resampler.input_frames_max() + (RESCHEDULE_SECONDS * rate).ceil() as usize;
-        CAPACITY_FRAMES.saturating_sub(reserve) as f64 / rate
+        capacity_frames(rate).saturating_sub(reserve) as f64 / rate
     }
 
     pub fn minimum_delay(&self, render_ahead: f64) -> f64 {
@@ -1545,15 +1545,25 @@ mod tests {
     }
 
     #[test]
-    fn held_audio_limit_supports_shared_delays_at_48_and_96_khz() {
-        for rate in [48000.0, 96000.0] {
+    fn every_source_rate_holds_at_least_the_delay_48_khz_holds() {
+        let limit_at = |rate: f64| {
             let timing = SourceTiming {
                 sample_rate: rate,
                 delivery: Arc::new(DeliverySpan::new(rate)),
             };
-            let playout = Playout::new(&timing, 44100.0, TICKS_PER_SECOND, None).unwrap();
-            let limit = playout.max_held_seconds();
-            assert!(limit >= 2.5, "{rate} Hz: only {limit} s held");
+            Playout::new(&timing, 44100.0, TICKS_PER_SECOND, None)
+                .unwrap()
+                .max_held_seconds()
+        };
+        let at_48_khz = limit_at(48000.0);
+        assert!(at_48_khz > 5.3, "only {at_48_khz} s held at 48 kHz");
+        for rate in [16000.0, 44100.0, 48000.0, 96000.0, 192000.0] {
+            let timing = SourceTiming {
+                sample_rate: rate,
+                delivery: Arc::new(DeliverySpan::new(rate)),
+            };
+            let limit = limit_at(rate);
+            assert!(limit >= at_48_khz, "{rate} Hz: only {limit} s held");
             for latency in [-0.047, 0.0, 0.083] {
                 let schedule = Schedule {
                     delay: limit + latency + 1.0 / rate,
@@ -1701,7 +1711,7 @@ mod tests {
     /// than its ring holds.
     #[test]
     fn plays_the_first_dated_frame_on_schedule_after_undated_ones() {
-        let longer_than_the_ring = (CAPACITY_FRAMES as f64 / 48000.0).ceil() + 1.0;
+        let longer_than_the_ring = (capacity_frames(48000.0) as f64 / 48000.0).ceil() + 1.0;
         for undated in [0.2, longer_than_the_ring] {
             let pushes = on_time(48000.0, 960, 100.0);
             let mut sim = Sim::scheduled(48000.0, 48000.0, 0.0, SCHEDULE, pushes, 0.0013);
