@@ -44,13 +44,17 @@ const STALL: f64 = 0.5;
 /// audio a train needs.
 pub(super) const RECORDING_LAG: f64 = 2.0;
 /// Claude: the most a train's arrivals may drift within it, in seconds a
-/// second, for its leg to count as settled. A receiver settling
-/// exponentially with a time constant of a minute, as one was measured to,
-/// drifts this little only within 1.2 ms of where it settles.
+/// second, for its leg to count as settled. This and `STEADY_SPAN` are
+/// acceptance gates chosen from one receiver's settling curve, not accuracy
+/// bounds. Only an output settling exponentially with a time constant of at
+/// most about a minute, as that receiver did, is within about 1.2 ms of where
+/// it settles when it drifts this little (the drift times the time
+/// constant). A slower one passes further off: 10 ms settling with a time
+/// constant of 600 s passes both gates about 9.7 ms from where it ends.
 pub(super) const STEADY_DRIFT: f64 = 0.000_02;
 /// Claude: how far apart two successive output trains' lateness against the
 /// reference may lie, about 10.6 s apart, for the output to count as
-/// settled: at that time constant, within 1.3 ms of where it settles.
+/// settled: under the same model, within about 1.3 ms of where it settles.
 pub(super) const STEADY_SPAN: f64 = 0.000_25;
 /// Claude: how far apart, in seconds, successive output trains sound: two
 /// trains' searches, early, probes and late.
