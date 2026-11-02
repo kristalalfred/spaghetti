@@ -1231,7 +1231,7 @@ mod tests {
     }
 
     #[test]
-    fn a_gap_in_capture_drops_what_was_queued_before_it_and_keeps_the_schedule() {
+    fn a_gap_in_capture_plays_what_was_queued_before_it_and_keeps_the_schedule() {
         let mut router = Router::new();
         let mut input = router.add_program_input("mic", RATE).unwrap();
         let mut output = router
@@ -1272,18 +1272,29 @@ mod tests {
             (heard - 0.5).abs() < 2.0 / RATE,
             "the click was heard at {heard} s"
         );
-        let around_click =
-            ((heard - 0.25 - 0.005) * RATE) as usize..((heard - 0.25 + 0.005) * RATE) as usize;
+        let captured = |from: f64, to: f64| {
+            let frame = |seconds: f64| ((seconds - 0.15) * RATE) as usize;
+            &after[frame(from)..frame(to)]
+        };
+        let queued = captured(0.15, 0.2);
+        assert!((queued[0] - 0.1).abs() < 0.01);
+        assert!(queued.windows(2).all(|pair| pair[1] <= pair[0] + 1e-3));
+        assert!(captured(0.2, 0.25).iter().all(|s| s.abs() < 1e-3));
+        let around_click = (heard - 0.1 - 0.005)..(heard - 0.1 + 0.005);
         let stale = after
             .iter()
             .enumerate()
-            .filter(|(frame, _)| !around_click.contains(frame))
+            .filter(|(frame, _)| {
+                let at = 0.15 + *frame as f64 / RATE;
+                at >= 0.2 && !around_click.contains(&at)
+            })
             .map(|(_, sample)| *sample)
             .fold(f32::MIN, f32::max);
         assert!(
             stale < 0.01,
             "what was captured before the gap played after it: {stale}"
         );
+        assert!(captured(0.3, 0.39).iter().all(|s| (s + 0.1).abs() < 0.01));
     }
 
     #[test]

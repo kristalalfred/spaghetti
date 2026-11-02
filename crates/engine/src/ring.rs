@@ -199,7 +199,8 @@ fn ahead(position: u64, from: u64) -> i64 {
 /// dated off where the previous one ended, a counted push placed off where the
 /// previous one ended, or a discontinuity the producer marks. The producer publishes each push, its record and its run together
 /// once its frames are written. The consumer reads only a run it took
-/// (`take_discontinuity`), which drops what it has not read of the earlier runs.
+/// (`take_discontinuity`), which drops what it has not read of the earlier runs,
+/// and can tell when a newer run waits behind the one it reads (`run_ended`).
 pub struct Ring {
     samples: Box<[UnsafeCell<f32>]>,
     segments: Box<[Segment]>,
@@ -495,6 +496,13 @@ impl Ring {
     /// Claude: consumer only. How many frames it may read now.
     pub fn available(&self) -> usize {
         self.readable(&self.view()).1
+    }
+
+    /// Claude: consumer only. Whether the producer started a run after the
+    /// one the consumer took, so that what this run holds is all it will.
+    pub fn run_ended(&self) -> bool {
+        self.reading.load(Ordering::Relaxed)
+            && self.view().run != self.taken.load(Ordering::Relaxed)
     }
 
     /// Claude: consumer only. Drops what the producer pushed before its latest

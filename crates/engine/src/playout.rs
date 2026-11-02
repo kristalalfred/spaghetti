@@ -105,8 +105,8 @@ pub struct Playout {
     fill_avg: f64,
     controller: FillController,
     schedule: Option<Scheduled>,
-    fade_in_frames: usize,
-    /// Claude: frames played since priming, up to `fade_in_frames`.
+    fade_frames: usize,
+    /// Claude: frames played since priming, up to `fade_frames`.
     faded: usize,
     health: Arc<PlayoutHealth>,
 }
@@ -342,7 +342,7 @@ impl Playout {
             primed: false,
             fill_avg: 0.0,
             controller: FillController::new(source_rate),
-            fade_in_frames: (RAMP.as_secs_f64() * source_rate).ceil() as usize,
+            fade_frames: (RAMP.as_secs_f64() * source_rate).ceil() as usize,
             faded: 0,
             schedule: schedule.map(|schedule| Scheduled {
                 delay: schedule.delay * ticks_per_second,
@@ -446,6 +446,17 @@ impl Playout {
     /// time in the same ticks the producer stamps its pushes with, and `output`
     /// the host time at which the device outputs the render's first frame.
     pub fn render(&mut self, ring: &Ring, out: &mut [&mut [f32]; CHANNELS], now: u64, output: u64) {
+        // Claude: what played before a discontinuity does not lead into what
+        // follows it, so the playout primes on the new run as on a new route:
+        // at once on its fill, or on a schedule once it has played, or found
+        // too late, what the run it took holds, each frame at its own time.
+        // A reset resampler takes its largest chunk, so this comes before the
+        // render sizes it.
+        let take = self.schedule.is_none() || ring.available() == 0;
+        if take && ring.take_discontinuity().is_some() && self.primed {
+            self.primed = false;
+            self.resampler.reset();
+        }
         let frames = out[0].len();
         if frames == 0
             || frames > MAX_RENDER_FRAMES
@@ -455,12 +466,6 @@ impl Playout {
             silence(out);
             self.health.playing.store(false, Ordering::Relaxed);
             return;
-        }
-        // Claude: what played before a discontinuity does not lead into what
-        // follows it, so the playout primes on the new run as on a new route.
-        if ring.take_discontinuity().is_some() && self.primed {
-            self.primed = false;
-            self.resampler.reset();
         }
         if self.schedule.is_some() {
             self.render_scheduled(ring, out, output);
@@ -536,13 +541,15 @@ impl Playout {
     /// undated or already too late, and starts the earliest one mid-render
     /// behind silence, so it plays on schedule to the frame. Primed, the
     /// controller trims the ratio against the lateness the way it trims a fill
-    /// error.
+    /// error. A run that a newer one follows plays to its last frame, fading
+    /// to silence over its last `RAMP`.
     fn render_scheduled(&mut self, ring: &Ring, out: &mut [&mut [f32]; CHANNELS], output: u64) {
         let frames = out[0].len();
         let need = self.resampler.input_frames_next();
         if !self.primed {
             ring.discard_undated();
         }
+        let ending = ring.run_ended();
         let schedule = self.schedule.as_ref().expect("a scheduled playout");
         let heard = output as f64
             + schedule.latency
@@ -571,14 +578,14 @@ impl Playout {
             } else {
                 lead = (-lateness).round() as usize;
             }
-            if lead >= need || ring.available() < need - lead {
+            if lead >= need || (ring.available() < need - lead && !ending) {
                 silence(out);
                 return;
             }
             self.primed = true;
             self.faded = 0;
             self.schedule.as_mut().expect("scheduled").lateness_avg = 0.0;
-        } else if ring.available() < need {
+        } else if ring.available() < need && !ending {
             self.reprime(Glitch::Underrun, 0.0, 0, out);
             return;
         } else if lateness.abs() > RESCHEDULE_SECONDS * self.health.source_rate {
@@ -601,8 +608,12 @@ impl Playout {
         );
 
         self.input[..lead * CHANNELS].fill(0.0);
+        let left = ring.available();
         let got = ring.pop_into(&mut self.input[lead * CHANNELS..need * CHANNELS]);
         self.fade_in(lead, got);
+        if ending {
+            self.fade_out(lead, got, left);
+        }
         self.indexing.partial_len = (lead + got < need).then_some(lead + got);
         if !self.resample(need, out) {
             silence(out);
@@ -614,11 +625,26 @@ impl Playout {
 
     /// Claude: scales `frames` input frames from `from` on along the fade-in.
     fn fade_in(&mut self, from: usize, frames: usize) {
-        let fading = frames.min(self.fade_in_frames.saturating_sub(self.faded));
+        let fading = frames.min(self.fade_frames.saturating_sub(self.faded));
         for frame in from..from + fading {
             self.faded += 1;
-            let gain = self.faded as f32 / self.fade_in_frames as f32;
+            let gain = self.faded as f32 / self.fade_frames as f32;
             for sample in &mut self.input[frame * CHANNELS..][..CHANNELS] {
+                *sample *= gain;
+            }
+        }
+    }
+
+    /// Claude: scales `frames` input frames from `from` on, the first of the
+    /// `left` frames a run still holds, along a fade to silence at its last.
+    fn fade_out(&mut self, from: usize, frames: usize, left: usize) {
+        for frame in 0..frames {
+            let after = left - frame - 1;
+            if after >= self.fade_frames {
+                continue;
+            }
+            let gain = after as f32 / self.fade_frames as f32;
+            for sample in &mut self.input[(from + frame) * CHANNELS..][..CHANNELS] {
                 *sample *= gain;
             }
         }
@@ -1941,6 +1967,67 @@ mod tests {
         let played = render_heard(&mut playout, &ring, heard + 0.01);
         assert!(playout.is_playing());
         assert!(played.iter().any(|sample| *sample != 0.0));
+    }
+
+    /// Claude: a capture whose dates step back starts a run that overlaps the
+    /// one playing. The playing run plays to its end, fading out, and the new
+    /// one starts on its own schedule where the old one ended.
+    #[test]
+    fn a_playing_route_plays_out_its_run_before_a_new_run_that_overlaps_it() {
+        let timing = SourceTiming {
+            sample_rate: 48000.0,
+            delivery: Arc::new(DeliverySpan::new(0.0)),
+        };
+        let schedule = Schedule {
+            delay: 0.1,
+            latency: 0.0,
+        };
+        let mut playout = Playout::new(&timing, 48000.0, TICKS_PER_SECOND, Some(schedule)).unwrap();
+        let ring = Ring::new(48000.0);
+        let measured = |seconds: f64| Captured::Measured((seconds * TICKS_PER_SECOND) as u64);
+        let push = |from: f64, value: f32| {
+            for block in 0..30 {
+                ring.push_with(480, 0, measured(from + block as f64 * 0.01), |_, _| value);
+            }
+        };
+        push(100.0, 0.5);
+        let mut played = Vec::new();
+        for render in 0..50 {
+            if render == 10 {
+                push(100.25, -0.5);
+            }
+            played.extend(render_heard(
+                &mut playout,
+                &ring,
+                100.1 + render as f64 * 0.01,
+            ));
+        }
+        assert_eq!(ring.discontinuities(), 1);
+        let health = playout.health().report();
+        assert_eq!(
+            (health.underruns, health.reprimes, health.resyncs),
+            (0, 0, 0)
+        );
+        let captured = |from: f64, to: f64| {
+            let frame = |seconds: f64| ((seconds - 100.0) * 48000.0) as usize;
+            &played[frame(from)..frame(to)]
+        };
+        assert!(
+            captured(100.06, 100.245)
+                .iter()
+                .all(|s| (s - 0.5).abs() < 0.01)
+        );
+        let fading = captured(100.25, 100.3);
+        assert!(fading.windows(2).all(|pair| pair[1] <= pair[0] + 0.01));
+        assert!((fading[fading.len() / 2] - 0.25).abs() < 0.05);
+        let rising = captured(100.3, 100.35);
+        assert!(rising.windows(2).all(|pair| pair[1] <= pair[0] + 0.01));
+        assert!((rising[rising.len() / 2] + 0.25).abs() < 0.05);
+        assert!(
+            captured(100.355, 100.49)
+                .iter()
+                .all(|s| (s + 0.5).abs() < 0.01)
+        );
     }
 
     /// Claude: the output's peak over `frames` frames from `at`.

@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_run_discards_old_audio_and_waits_for_its_own_capture_time() {
+    fn a_new_run_plays_after_what_the_old_one_holds_each_at_its_own_capture_time() {
         let rate = f64::from(airplay::SAMPLE_RATE);
         let timing = SourceTiming {
             sample_rate: rate,
@@ -367,33 +367,46 @@ mod tests {
             Captured::Measured(start - ticks(0.5)),
             |_, _| 0.5,
         ));
-        for i in 0..16 {
-            let now = start + ticks(i as f64 * 352.0 / rate);
+        // Claude: each render plays what was captured 0.5 s before it ran.
+        let mut played = Vec::new();
+        let mut render = |renderer: &mut Renderer, packet: usize| {
+            let now = start + ticks((packet * 352) as f64 / rate);
             renderer.render(&mut [&mut left, &mut right], now, now + ticks(2.0));
+            assert_eq!(left, right);
+            played.extend_from_slice(&left);
+        };
+        for packet in 0..16 {
+            render(&mut renderer, packet);
         }
-        assert!(left.iter().all(|s| (*s - 0.5).abs() < 0.01));
-        let bytes = renderer.meter.bytes();
         ring.discontinuity();
         assert!(ring.push_with(
             rate as usize,
             start + ticks(0.25),
-            Captured::Measured(start + ticks(0.5)),
+            Captured::Measured(start + ticks(0.6)),
             |_, _| -0.25,
         ));
-        renderer.render(
-            &mut [&mut left, &mut right],
-            start + ticks(0.25),
-            start + ticks(2.25),
-        );
-        assert!(left.iter().chain(right.iter()).all(|s| *s == 0.0));
-        assert_eq!(renderer.meter.bytes(), bytes);
-        assert_eq!(ring.discontinuities(), 1);
-        for i in 0..16 {
-            let now = start + ticks(1.0 + i as f64 * 352.0 / rate);
-            renderer.render(&mut [&mut left, &mut right], now, now + ticks(2.0));
+        for packet in 16..230 {
+            render(&mut renderer, packet);
         }
-        assert_eq!(left, right);
-        assert!(left.iter().all(|s| (*s + 0.25).abs() < 0.01));
-        assert!(renderer.meter.bytes() > bytes);
+        assert_eq!(ring.discontinuities(), 1);
+        let health = renderer.playout.health().report();
+        assert_eq!(
+            (health.underruns, health.reprimes, health.resyncs),
+            (0, 0, 0)
+        );
+        let captured = |frame: usize| frame as f64 / rate - 0.5;
+        let during = |from: f64, to: f64| {
+            played
+                .iter()
+                .enumerate()
+                .filter(move |(frame, _)| (from..to).contains(&captured(*frame)))
+                .map(|(_, sample)| *sample)
+        };
+        assert!(during(-0.44, 0.44).all(|s| (s - 0.5).abs() < 0.01));
+        let fading: Vec<f32> = during(0.45, 0.5).collect();
+        assert!(fading.windows(2).all(|pair| pair[1] <= pair[0] + 0.01));
+        assert!(fading[fading.len() / 2] > 0.15 && fading[fading.len() / 2] < 0.35);
+        assert!(during(0.502, 0.598).all(|s| s.abs() < 1e-3));
+        assert!(during(0.66, 1.3).all(|s| (s + 0.25).abs() < 0.01));
     }
 }
