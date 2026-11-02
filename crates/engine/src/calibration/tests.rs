@@ -1381,6 +1381,36 @@ fn an_output_heard_first_by_its_direct_path_settles_there() {
     assert_eq!(trains_played(&run), Calibrating::FEWEST_TRAINS);
 }
 
+/// Claude: a soundbar arriving 3 dB under a strongest path 0.6 ms later and
+/// sounding 2.4 ms ahead of its arrival 15 dB under its strongest on
+/// average, by up to 1.5 dB more or less from probe to probe, so that level
+/// noise leaves the pre-sound within 15 dB on two or three probes of each
+/// train, as live: every output train arrives at the main arrival as one
+/// train, and the calibration settles at once there.
+#[test]
+fn an_output_with_a_presound_near_the_arrival_bound_settles_at_its_arrival() {
+    let mut output = Place::at(31.5, 4.3);
+    output.paths = [(0.0, -3.0), (0.6, 0.0), (-2.4, -15.0)]
+        .map(|(after_ms, under_db)| (0.0043 + after_ms / 1000.0, 0.3 * db(under_db)))
+        .to_vec();
+    output.gains = Some(|burst, path| match path {
+        2 => db(15.0
+            - [
+                13.5, 16.5, 15.8, 14.4, 16.2, 16.0, 14.1, 13.8, 16.4, 15.3, 14.6, 15.9, 14.2, 16.1,
+                14.8, 16.3, 13.7, 15.6, 14.5, 15.2, 15.4, 14.0, 16.6, 13.9, 15.7,
+            ][burst.rem_euclid(25) as usize]),
+        _ => 1.0,
+    });
+    let setup = Setup::new(output, Place::at(5.4, 1.1));
+    let run = run(&setup, |_, _| {});
+    let calibrated = run
+        .result
+        .as_ref()
+        .unwrap_or_else(|failure| panic!("{failure}"));
+    assert_measures(&setup, calibrated);
+    assert_eq!(trains_played(&run), Calibrating::FEWEST_TRAINS);
+}
+
 #[test]
 fn a_calibration_waiting_for_its_output_to_settle_cancels() {
     let mut output = Place::at(23.3, 1.7);
