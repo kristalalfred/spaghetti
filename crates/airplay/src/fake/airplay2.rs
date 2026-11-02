@@ -154,6 +154,102 @@ fn a_stream_pairs_sets_up_records_and_plays_audio_the_receiver_opens() {
     }
 }
 
+/// Claude: after RECORD, and before any audio or sync packet, the stream
+/// flushes to its first packet, naming its sequence number and RTP time.
+#[test]
+fn a_flush_naming_the_first_packet_follows_record_before_any_packet() {
+    let fake = Fake::start(Behavior::default());
+    let browser = browser(&fake, false);
+    let stream = Stream::start_with(
+        &browser,
+        fake.id(),
+        Ok(airplay_2()),
+        Renders::default().renderer(None),
+    );
+    assert!(wait_until(HANDSHAKE, || {
+        fake.audio().len() >= 10 && !fake.syncs().is_empty()
+    }));
+    drop(stream);
+
+    let requests: Vec<FakeRequest> = fake.requests().into_iter().map(|(_, _, r)| r).collect();
+    let record = requests.iter().position(|r| r.method == "RECORD").unwrap();
+    let flush = &requests[record + 1];
+    assert_eq!(flush.method, "FLUSH");
+    assert_eq!(flush.uri, requests[record].uri);
+    let first = &fake.audio()[0].1;
+    assert_eq!(flush.header("Range"), Some("npt=0-"));
+    assert_eq!(
+        flush.header("RTP-Info"),
+        Some(format!("seq={};rtptime={}", first.seq, first.timestamp).as_str())
+    );
+    let seen = fake.seen();
+    let position = |wanted: &dyn Fn(&Seen) -> bool| seen.iter().position(wanted).unwrap();
+    let flushed =
+        position(&|s| matches!(s, Seen::Request { request, .. } if request.method == "FLUSH"));
+    assert!(flushed < position(&|s| matches!(s, Seen::Audio { .. })));
+    assert!(flushed < position(&|s| matches!(s, Seen::Control { .. })));
+}
+
+/// Claude: the stream's first packet plays one latency after the receiver
+/// answers its FLUSH: here 200 ms after the FLUSH arrived, and so 200 ms
+/// after RECORD was answered.
+#[test]
+fn the_first_packet_plays_one_latency_after_the_flush_is_answered() {
+    let slow = Duration::from_millis(200);
+    let fake = Fake::start(Behavior {
+        rtsp: Rtsp::SlowAt(Step::Flush, slow),
+        ..Behavior::default()
+    });
+    let browser = browser(&fake, false);
+    let renders = Renders::default();
+    let stream = Stream::start_with(&browser, fake.id(), Ok(airplay_2()), renders.renderer(None));
+    assert!(wait_until(HANDSHAKE, || renders.count() >= 1));
+    drop(stream);
+
+    let (flushed, _, _) = fake
+        .requests()
+        .into_iter()
+        .find(|(_, _, r)| r.method == "FLUSH")
+        .unwrap();
+    let after_answer = renders
+        .play_at(0)
+        .checked_duration_since(flushed + slow)
+        .expect("the first packet plays after the FLUSH is answered");
+    assert!(
+        after_answer >= LATENCY && after_answer < LATENCY + Duration::from_millis(100),
+        "{after_answer:?}"
+    );
+}
+
+/// Claude: a receiver that refuses the FLUSH, or never answers it, still
+/// gets the stream: at once, or once the answer timeout passes.
+#[test]
+fn a_refused_or_unanswered_flush_still_streams() {
+    for rtsp in [
+        Rtsp::RefuseAt(Step::Flush, 501),
+        Rtsp::IgnoreAt(Step::Flush),
+    ] {
+        let fake = Fake::start(Behavior {
+            rtsp,
+            ..Behavior::default()
+        });
+        let browser = browser(&fake, false);
+        let stream = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(airplay_2()),
+            Renders::default().renderer(None),
+        );
+        assert!(
+            wait_until(HANDSHAKE, || fake.audio().len() >= 10),
+            "{rtsp:?}"
+        );
+        assert!(streaming(&stream), "{rtsp:?}: {:?}", stream.status());
+        stream.finish(Duration::ZERO).wait();
+        assert!(fake.methods().contains(&"FLUSH".to_owned()), "{rtsp:?}");
+    }
+}
+
 #[test]
 fn airplay_2_sync_packets_map_each_packet_to_its_play_time() {
     check_sync_mapping(Protocol::AirPlay2, None, 1000, 5_000_000);
@@ -411,6 +507,7 @@ fn finishing_or_dropping_at_each_handshake_step_is_prompt() {
         Step::SessionSetup,
         Step::StreamSetup,
         Step::Record,
+        Step::Flush,
     ] {
         let fake = Fake::start(Behavior {
             rtsp: Rtsp::HangAt(step),

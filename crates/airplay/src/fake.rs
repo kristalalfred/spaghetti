@@ -35,6 +35,7 @@ pub(crate) enum Step {
     SessionSetup,
     StreamSetup,
     Record,
+    Flush,
     Feedback,
 }
 
@@ -44,6 +45,10 @@ pub(crate) enum Rtsp {
     Answer,
     /// Claude: answers nothing from this step on.
     HangAt(Step),
+    /// Claude: answers nothing at this step only.
+    IgnoreAt(Step),
+    /// Claude: answers this step only after this long.
+    SlowAt(Step, Duration),
     RefuseAt(Step, u16),
     SilentAfterRecord,
 }
@@ -603,11 +608,14 @@ impl Server {
                 continue;
             }
             let step = step_of(&request);
-            if let (Rtsp::HangAt(hang), Some(step)) = (self.behavior.rtsp, step)
-                && hang == step
-            {
-                silent = true;
-                continue;
+            match (self.behavior.rtsp, step) {
+                (Rtsp::HangAt(hang), Some(step)) if hang == step => {
+                    silent = true;
+                    continue;
+                }
+                (Rtsp::IgnoreAt(ignored), Some(step)) if ignored == step => continue,
+                (Rtsp::SlowAt(slow, delay), Some(step)) if slow == step => thread::sleep(delay),
+                _ => {}
             }
             let answer = match (self.behavior.rtsp, step) {
                 (Rtsp::RefuseAt(refused, status), Some(step)) if refused == step => {
@@ -874,6 +882,7 @@ fn step_of(request: &FakeRequest) -> Option<Step> {
         ("SETUP", _) if request.plist().contains_key("streams") => Some(Step::StreamSetup),
         ("SETUP", _) => Some(Step::SessionSetup),
         ("RECORD", _) => Some(Step::Record),
+        ("FLUSH", _) => Some(Step::Flush),
         ("POST", "/feedback") => Some(Step::Feedback),
         _ => None,
     }
@@ -885,6 +894,7 @@ fn status_line(status: u16) -> &'static str {
         403 => "403 Forbidden",
         470 => "470 Connection Authorization Required",
         500 => "500 Internal Server Error",
+        501 => "501 Not Implemented",
         _ => panic!("no status line for {status}"),
     }
 }
@@ -1700,10 +1710,16 @@ pub(crate) mod tests {
             .recv_timeout(bound + PROMPT)
             .expect("finishing never returned");
         finishing.join().unwrap();
-        assert!(early.is_err(), "finishing returned while the session still ran");
+        assert!(
+            early.is_err(),
+            "finishing returned while the session still ran"
+        );
         assert!(taken, "the receiver was freed while the session still ran");
         let after = returned.duration_since(released);
-        assert!(after < bound + PROMPT, "returned {after:?} after the renderer");
+        assert!(
+            after < bound + PROMPT,
+            "returned {after:?} after the renderer"
+        );
         assert!(wait_until(Duration::from_secs(2), || streaming(&next)));
     }
 
