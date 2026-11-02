@@ -1313,6 +1313,74 @@ fn an_output_never_heard_plays_every_train_and_a_reference_not_heard_ends_at_onc
     assert_eq!(trains_played(&ran), 1);
 }
 
+/// Claude: a soundbar heard mostly by a later path, as in a live session
+/// that measured it 4.5 ms late: a path 11.5 dB under its strongest, the
+/// strongest 1.8 ms after it, paths 19.5 and 76 ms after it, 1.2 and 17.4 dB
+/// under, and its direct path 4.3 ms ahead of it, as that session's trains
+/// logged it: on one or two probes of each train 18 to 20.5 dB under the
+/// strongest, on the rest past 21 dB. No output train is measured on the
+/// later path, and once the trains run out, the calibration fails as
+/// ambiguous.
+#[test]
+fn an_output_heard_mostly_by_a_later_path_is_refused_not_measured_late() {
+    let mut output = Place::at(31.5, 2.3);
+    output.paths = [
+        (0.0, -19.5),
+        (4.3, -11.5),
+        (6.1, 0.0),
+        (23.8, -1.2),
+        (80.3, -17.4),
+    ]
+    .map(|(after_ms, under_db)| (0.0023 + after_ms / 1000.0, 0.3 * db(under_db)))
+    .to_vec();
+    output.gains = Some(|burst, path| match path {
+        0 => db(19.5
+            - [
+                18.2, 19.4, 21.4, 21.8, 21.6, 21.4, 20.5, 21.8, 22.0, 21.6, 21.6, 19.4, 21.2, 18.3,
+                21.8, 21.4, 21.8, 18.2, 21.6, 22.0, 18.3, 21.6, 21.4, 21.8, 21.2,
+            ][burst.rem_euclid(25) as usize]),
+        _ => 1.0,
+    });
+    let ran = run(&Setup::new(output, Place::at(5.4, 1.1)), |_, _| {});
+    let Err(CalibrationFailure::Probes {
+        role: Role::Output,
+        failure:
+            ProbeFailure::Ambiguous {
+                ambiguous: 5,
+                measurable: 0,
+                ..
+            },
+    }) = ran.result
+    else {
+        panic!("{:?}", ran.result)
+    };
+    assert_eq!(trains_played(&ran), Calibrating::MOST_TRAINS);
+}
+
+/// Claude: the same soundbar as sessions that measured it right heard it:
+/// its direct path 14 dB under its strongest, which comes 1.1 ms after it on
+/// some probes and 2.4 ms after it on the others, and a reflection 18.2 ms
+/// after it 4 dB under. It settles at once, at its direct path.
+#[test]
+fn an_output_heard_first_by_its_direct_path_settles_there() {
+    let mut output = Place::at(31.5, 2.3);
+    output.paths = [(0.0, -14.0), (1.1, 0.0), (2.4, 0.0), (18.2, -4.0)]
+        .map(|(after_ms, under_db)| (0.0023 + after_ms / 1000.0, 0.3 * db(under_db)))
+        .to_vec();
+    output.gains = Some(|burst, path| match (burst.rem_euclid(5), path) {
+        (0 | 2 | 3, 2) | (1 | 4, 1) => db(-2.0),
+        _ => 1.0,
+    });
+    let setup = Setup::new(output, Place::at(5.4, 1.1));
+    let run = run(&setup, |_, _| {});
+    let calibrated = run
+        .result
+        .as_ref()
+        .unwrap_or_else(|failure| panic!("{failure}"));
+    assert_measures(&setup, calibrated);
+    assert_eq!(trains_played(&run), Calibrating::FEWEST_TRAINS);
+}
+
 #[test]
 fn a_calibration_waiting_for_its_output_to_settle_cancels() {
     let mut output = Place::at(23.3, 1.7);

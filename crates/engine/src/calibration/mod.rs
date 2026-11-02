@@ -221,9 +221,9 @@ pub enum ProbeFailure {
         required: usize,
         above_background_db: f64,
     },
-    /// Claude: enough probes were heard, but `ambiguous` of them matched
-    /// something before their arrival too faintly to measure and too clearly
-    /// to ignore, leaving `measurable` where `required` must agree.
+    /// Claude: enough probes were heard, but `ambiguous` of them were also
+    /// heard by one earlier path, too faintly to measure and too clearly to
+    /// ignore, leaving `measurable` where `required` must agree.
     Ambiguous {
         ambiguous: usize,
         measurable: usize,

@@ -9,17 +9,21 @@
 //! when every significant candidate is a group. Otherwise the loudest that is
 //! not fails it by its own arrivals, as `Moved` or `Disagree`, so that no
 //! quieter train or later echo stands in for a louder sound left unexplained.
-//! The train arrives with the earliest significant group, and an earlier group
-//! up to `AMBIGUITY_DB` under the loudest makes it ambiguous; no group under
-//! the significant ones removes or excludes anything. Each probe's arrival is
-//! then the earliest peak heard within `ARRIVAL_DB` of the arriving group's, up
-//! to `LOOKBACK_SECONDS` before it, that no later, stronger peak's sidelobes
+//! The train arrives with the earliest significant group; no group under the
+//! significant ones removes or excludes anything. Each probe's arrival is then
+//! the earliest peak heard within `ARRIVAL_DB` of the arriving group's, up to
+//! `LOOKBACK_SECONDS` before it, that no later, stronger peak's sidelobes
 //! explain and that is not where a significant group has another of its probes.
 //! So a direct path heard under a later echo is still found, while a speaker's
 //! pre-ringing and the probe's sidelobes, which stand further under the
 //! arrival, never are. The train is measured where at least four probes'
-//! arrivals agree with its layout; with no candidate heard, the best-ranked is
-//! measured, to say why it fails.
+//! arrivals agree with its layout, unless a path more than `PRESOUND_SECONDS`
+//! ahead of them, no more than `AMBIGUITY_DB` under the strongest, is heard at
+//! one place on `AGREEING` probes or as an earlier group. Such a path is a
+//! direct path too faint to measure, and the train is ambiguous: deciding it
+//! for the train rather than for each probe keeps each probe's own level from
+//! choosing which side of a threshold the train falls. With no candidate
+//! heard, the best-ranked is measured, to say why it fails.
 
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
@@ -31,7 +35,7 @@ use super::{ProbeFailure, Role};
 
 /// Claude: the train is heard when at least `AGREEING` probes peak this far
 /// above the background, and only a peak this far above it is an arrival or
-/// makes a probe ambiguous: noise peaks well under it.
+/// part of an earlier path: noise peaks well under it.
 const HEARD_DB: f64 = 20.0;
 /// Claude: the least background the detector assumes: what a probe recorded
 /// this far below full scale makes of the envelope. Any microphone's own noise
@@ -41,16 +45,27 @@ const HEARD_DB: f64 = 20.0;
 const FLOOR_DBFS: f64 = -120.0;
 /// Claude: an arrival stands at most this far under its probe's strongest peak.
 const ARRIVAL_DB: f64 = 15.0;
-/// Claude: a peak that stands under the arrival bound but no further than
-/// this under the strongest peak, and more than `RINGING_SECONDS` before the
-/// arrival, could be a direct path heard just too faintly, so the probe is
-/// ambiguous rather than measured on the later path.
-const AMBIGUITY_DB: f64 = 21.0;
-/// Claude: how far ahead of its arrival a speaker's own response may sound:
-/// measured, built-in speakers ring up to 2.8 ms ahead, 27 to 32 dB under,
-/// and an AirPlay soundbar sounds 19 dB under 2.6 ms ahead of its first
-/// arrival. Paths 4 ms apart differ by 1.4 m, more than inside one speaker.
-const RINGING_SECONDS: f64 = 0.004;
+/// Claude: peaks no further than this under their probes' strongest, heard
+/// at one place more than `PRESOUND_SECONDS` ahead of a train's arrival on
+/// `AGREEING` probes, are a direct path too faint to measure, and make the
+/// train ambiguous rather than measured on a later path. Live, a soundbar's
+/// direct path stood 18 to 20.5 dB under its strongest path on some probes
+/// and past 21 dB on others. That far ahead, the filter's sidelobes of four
+/// arrivals summed in phase stay under this.
+const AMBIGUITY_DB: f64 = 27.0;
+/// Claude: how far ahead of a train's arrival a speaker's own response may
+/// sound, so that only a path further ahead is an earlier path. In 102
+/// recordings of an AirPlay soundbar, peaks 15.6 to 24 dB under its strongest
+/// came up to 2.9 ms ahead of its arrival, in 19 of them at one place on every
+/// chirp, and built-in speakers ring up to 2.8 ms ahead, 27 to 32 dB under.
+/// The soundbar's direct path, measured late live, came 3.7 to 4.1 ms ahead of
+/// the train's arrival.
+const PRESOUND_SECONDS: f64 = 0.0033;
+/// Claude: how far before its strongest peak a probe's own cluster of
+/// near-equal arrivals may start, and how far after another probe's arrival
+/// that probe's cluster may run. Paths 4 ms apart differ by 1.4 m, more than
+/// inside one speaker.
+const CLUSTER_SECONDS: f64 = 0.004;
 /// Claude: a peak no more than this above what a later, stronger peak's
 /// sidelobes put there is one of them.
 const SIDELOBE_MARGIN_DB: f64 = 6.0;
@@ -107,24 +122,17 @@ fn median(values: &mut [f64]) -> f64 {
     values[values.len() / 2]
 }
 
-/// Claude: what finding one probe's arrival came to, as the debug log shows it.
+/// Claude: what finding one probe's arrival came to.
 struct Found {
     /// Claude: the earliest peak within `ARRIVAL_DB` of the strongest that no
-    /// sidelobes explain, or the strongest: the arrival unless a near miss
-    /// makes the probe ambiguous.
-    within: usize,
-    /// Claude: the peaks in the band down to `AMBIGUITY_DB` that came more
-    /// than `RINGING_SECONDS` before `within`.
-    near_misses: Vec<usize>,
+    /// sidelobes explain, or the strongest.
+    arrival: usize,
+    /// Claude: the peaks before `arrival` down to `AMBIGUITY_DB` that pass
+    /// its other tests, earliest first.
+    before: Vec<usize>,
     /// Claude: the peaks a later, stronger peak's sidelobes explain, kept
     /// only while the debug log is on.
     sidelobes: Vec<usize>,
-}
-
-impl Found {
-    fn arrival(&self) -> Option<usize> {
-        self.near_misses.is_empty().then_some(self.within)
-    }
 }
 
 /// Claude: where a train sounded, against where it was scheduled to.
@@ -325,25 +333,25 @@ impl Detector {
             .iter()
             .min_by(|a, b| a.at.total_cmp(&b.at))
             .expect("the loudest candidate forms a group");
-        let ringing = RINGING_SECONDS * self.rate;
-        let near_misses: Vec<&Group> = groups
+        let presound = PRESOUND_SECONDS * self.rate;
+        let earlier: Vec<&Group> = groups
             .iter()
-            .filter(|group| group.at + ringing < arrival.at && group.level < significant)
+            .filter(|group| group.at + presound < arrival.at && group.level < significant)
             .collect();
-        if !near_misses.is_empty() {
+        if !earlier.is_empty() {
             let ambiguous = arrival
                 .probes
                 .iter()
-                .filter(|k| near_misses.iter().any(|group| group.probes.contains(k)))
+                .filter(|k| earlier.iter().any(|group| group.probes.contains(k)))
                 .count();
             debug!(
                 arrival_ms = %format!("{:+.2}", late_ms(arrival.at)),
-                near_misses = near_misses
+                earlier = earlier
                     .iter()
                     .map(|group| format!("{:+.2} ms", late_ms(group.at)))
                     .collect::<Vec<_>>()
                     .join(", "),
-                "calibration train ambiguous"
+                "calibration train ambiguous: an earlier group too faint to measure"
             );
             return Err(ProbeFailure::Ambiguous {
                 ambiguous,
@@ -457,12 +465,12 @@ impl Detector {
     }
 
     /// Claude: the earliest peak within `ARRIVAL_DB` of `strongest`, no more
-    /// than `RINGING_SECONDS` before it, that no later peak's sidelobes
+    /// than `CLUSTER_SECONDS` before it, that no later peak's sidelobes
     /// explain: where a probe's own cluster of near-equal arrivals starts.
     fn cluster_arrival(&self, envelope: &[f64], strongest: usize) -> usize {
         let level = envelope[strongest];
         let from = strongest
-            .saturating_sub((RINGING_SECONDS * self.rate) as usize)
+            .saturating_sub((CLUSTER_SECONDS * self.rate) as usize)
             .max(1);
         (from..strongest)
             .find(|&i| {
@@ -476,7 +484,8 @@ impl Detector {
     /// Claude: the train candidate number `candidate` makes of the probes'
     /// strongest peaks `strongest`, each probe arriving at the earliest peak
     /// the arrival rule allows, none where one of `groups` places another of
-    /// its probes, measured where at least `AGREEING` agree.
+    /// its probes, measured where at least `AGREEING` agree and no earlier
+    /// path makes it ambiguous.
     fn measure_train(
         &self,
         span: &Span,
@@ -528,9 +537,9 @@ impl Detector {
         }
 
         let offset = |k: usize| (self.layout[k] * self.rate).round();
-        let mut arrivals: Vec<(usize, f64)> = heard
+        let found: Vec<(usize, Found)> = heard
             .iter()
-            .filter_map(|&(k, peak)| {
+            .map(|&(k, peak)| {
                 let others: Vec<f64> = groups
                     .iter()
                     .flat_map(|group| {
@@ -541,7 +550,14 @@ impl Detector {
                             .map(move |&j| group.at + offset(j))
                     })
                     .collect();
-                let found = self.arrival(envelope, peak, background, &others, detailed);
+                (
+                    k,
+                    self.arrival(envelope, peak, background, &others, detailed),
+                )
+            })
+            .collect();
+        if detailed {
+            for ((k, found), &(_, peak)) in found.iter().zip(&heard) {
                 let level = envelope[peak];
                 let peaks = |indices: &[usize]| {
                     indices
@@ -549,33 +565,26 @@ impl Detector {
                         .map(|&i| {
                             format!(
                                 "{:+.2} ms {:.1} dB under",
-                                late_ms(i, k),
+                                late_ms(i, *k),
                                 db(level / envelope[i])
                             )
                         })
                         .collect::<Vec<_>>()
                         .join(", ")
                 };
-                let separations = || {
-                    found
-                        .near_misses
-                        .iter()
-                        .map(|&i| format!("{:.2} ms", (found.within - i) as f64 / self.rate * 1e3))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
                 debug!(
                     probe = k,
-                    arrival_ms = %format!("{:+.2}", late_ms(found.within, k)),
-                    arrival_under_db = %format!("{:.1}", db(level / envelope[found.within])),
-                    ambiguous = !found.near_misses.is_empty(),
-                    near_misses = peaks(&found.near_misses),
-                    near_misses_before_arrival = separations(),
+                    arrival_ms = %format!("{:+.2}", late_ms(found.arrival, *k)),
+                    arrival_under_db = %format!("{:.1}", db(level / envelope[found.arrival])),
+                    before = peaks(&found.before),
                     sidelobes = peaks(&found.sidelobes),
                     "calibration probe arrival"
                 );
-                Some((k, found.arrival()? as f64 - offset(k)))
-            })
+            }
+        }
+        let mut arrivals: Vec<(usize, f64)> = found
+            .iter()
+            .map(|(k, found)| (*k, found.arrival as f64 - offset(*k)))
             .collect();
         arrivals.sort_by(|a, b| a.1.total_cmp(&b.1));
         let agreement = AGREEMENT_SECONDS * self.rate;
@@ -605,16 +614,47 @@ impl Detector {
             "calibration train agreement"
         );
         if agreeing.len() < AGREEING {
-            return Err(if arrivals.len() < AGREEING {
-                ProbeFailure::Ambiguous {
-                    ambiguous: heard.len() - arrivals.len(),
-                    measurable: arrivals.len(),
-                    required: AGREEING,
+            return Err(self.moved(&arrivals).unwrap_or(ProbeFailure::Disagree {
+                spread_ms: (arrivals[arrivals.len() - 1].1 - arrivals[0].1) / self.rate * 1e3,
+            }));
+        }
+        let ahead = agreeing[0].1 - PRESOUND_SECONDS * self.rate;
+        let mut earlier: Vec<(usize, f64)> = found
+            .iter()
+            .flat_map(|(k, found)| {
+                found
+                    .before
+                    .iter()
+                    .chain([&found.arrival])
+                    .map(|&i| (*k, i as f64 - offset(*k)))
+            })
+            .filter(|&(_, at)| at < ahead)
+            .collect();
+        earlier.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let earlier_path = (0..earlier.len())
+            .map(|first| {
+                let mut path: Vec<(usize, f64)> = Vec::new();
+                for &(k, at) in earlier[first..]
+                    .iter()
+                    .take_while(|(_, at)| at - earlier[first].1 <= agreement)
+                {
+                    if path.iter().all(|&(j, _)| j != k) {
+                        path.push((k, at));
+                    }
                 }
-            } else {
-                self.moved(&arrivals).unwrap_or(ProbeFailure::Disagree {
-                    spread_ms: (arrivals[arrivals.len() - 1].1 - arrivals[0].1) / self.rate * 1e3,
-                })
+                path
+            })
+            .max_by_key(Vec::len)
+            .unwrap_or_default();
+        if earlier_path.len() >= AGREEING {
+            debug!(
+                earlier_path = against_schedule(&earlier_path),
+                "calibration train ambiguous: an earlier path too faint to measure"
+            );
+            return Err(ProbeFailure::Ambiguous {
+                ambiguous: earlier_path.len(),
+                measurable: heard.len() - earlier_path.len(),
+                required: AGREEING,
             });
         }
 
@@ -751,9 +791,8 @@ impl Detector {
     /// Claude: the earliest peak within `ARRIVAL_DB` of `strongest`, at most
     /// `LOOKBACK_SECONDS` before it, that no later peak's sidelobes explain
     /// and that does not lie in the cluster of another probe arriving at one
-    /// of `others`; none when a peak in the band down to `AMBIGUITY_DB` comes
-    /// more than `RINGING_SECONDS` before that. `detailed` keeps the peaks
-    /// excluded as sidelobes.
+    /// of `others`, and the peaks before it down to `AMBIGUITY_DB` that pass
+    /// the same tests. `detailed` keeps the peaks excluded as sidelobes.
     fn arrival(
         &self,
         envelope: &[f64],
@@ -766,11 +805,11 @@ impl Detector {
         let from = strongest
             .saturating_sub((LOOKBACK_SECONDS * self.rate) as usize)
             .max(1);
-        let (agreement, ringing) = (AGREEMENT_SECONDS * self.rate, RINGING_SECONDS * self.rate);
+        let (agreement, cluster) = (AGREEMENT_SECONDS * self.rate, CLUSTER_SECONDS * self.rate);
         let another_probe = |i: usize| {
             others
                 .iter()
-                .any(|&at| (at - agreement..=at + ringing).contains(&(i as f64)))
+                .any(|&at| (at - agreement..=at + cluster).contains(&(i as f64)))
         };
         let mut sidelobes = Vec::new();
         let candidates: Vec<usize> = (from..strongest)
@@ -791,15 +830,13 @@ impl Detector {
             .copied()
             .find(|&i| envelope[i] >= level * ratio(-ARRIVAL_DB))
             .unwrap_or(strongest);
-        let ringing = (RINGING_SECONDS * self.rate) as usize;
-        let near_misses: Vec<usize> = candidates
-            .iter()
-            .copied()
-            .take_while(|&i| i + ringing < arrival)
+        let before = candidates
+            .into_iter()
+            .take_while(|&i| i < arrival)
             .collect();
         Found {
-            within: arrival,
-            near_misses,
+            arrival,
+            before,
             sidelobes,
         }
     }
@@ -1363,33 +1400,51 @@ mod tests {
         );
     }
 
-    /// Claude: probes heard more than once on all but three, so too few to
-    /// agree can be measured, are ambiguous, and say how many were.
+    /// Claude: a path 4.3 ms ahead of the arrival and 18 dB under it is an
+    /// earlier path only where it is heard on as many probes as make a
+    /// train: on two or three, the train is measured at its arrival; on four,
+    /// it is ambiguous, and says how many probes were.
     #[test]
-    fn too_few_measurable_probes_left_by_ambiguity_are_ambiguous_not_moved() {
-        let mut taps = paths(&[(0.032, 0.3)]);
-        taps.push(Path {
-            delay: 0.012,
-            gain: 0.3 * db(-18.0),
-            probes: Some(vec![0, 1]),
-        });
-        let (span, sound_at) = recorded(48_000.0, &taps, 1e-5);
-        let failure = Detector::new(48_000.0, ROLE)
-            .measure(&span, sound_at)
-            .unwrap_err();
-        assert_eq!(
-            failure,
-            ProbeFailure::Ambiguous {
-                ambiguous: 2,
-                measurable: 3,
-                required: 4,
+    fn an_earlier_path_makes_a_train_ambiguous_only_on_as_many_probes_as_a_train() {
+        for (on, ambiguous) in [
+            (vec![0, 1], None),
+            (vec![0, 2, 4], None),
+            (vec![0, 1, 2, 3], Some(4)),
+        ] {
+            let mut taps = paths(&[(0.032, 0.3)]);
+            taps.push(Path {
+                delay: 0.032 - 0.0043,
+                gain: 0.3 * db(-18.0),
+                probes: Some(on.clone()),
+            });
+            let (span, sound_at) = recorded(48_000.0, &taps, 1e-5);
+            let result = Detector::new(48_000.0, ROLE).measure(&span, sound_at);
+            match (result, ambiguous) {
+                (Ok(measured), None) => {
+                    assert!(
+                        (measured.residual - 0.032).abs() < 1e-5,
+                        "{on:?}: {measured:?}"
+                    )
+                }
+                (Err(failure), Some(ambiguous)) => {
+                    assert_eq!(
+                        failure,
+                        ProbeFailure::Ambiguous {
+                            ambiguous,
+                            measurable: 5 - ambiguous,
+                            required: 4,
+                        }
+                    );
+                    let said = failure.to_string();
+                    assert!(
+                        said.contains("4 of the probes were heard more than once")
+                            && said.contains("leaving 1 measurable where 4 must agree"),
+                        "{said}"
+                    );
+                }
+                (result, _) => panic!("{on:?}: {result:?}"),
             }
-        );
-        let said = failure.to_string();
-        assert!(
-            said.contains("leaving 3 measurable where 4 must agree"),
-            "{said}"
-        );
+        }
     }
 
     /// Claude: arrivals that lie within 1 ms of a line through their probes'
@@ -1552,7 +1607,7 @@ mod tests {
     }
 
     /// Claude: a direct path just inside the arrival bound under a later
-    /// echo is the arrival, one in the band below it is ambiguous, and one
+    /// echo is the arrival, one down to 27 dB under it is ambiguous, and one
     /// further under leaves the echo the arrival, however far apart they lie.
     #[test]
     fn a_direct_path_under_an_echo_is_found_ambiguous_or_lost_by_how_far_under() {
@@ -1567,7 +1622,9 @@ mod tests {
                 (15.5, None),
                 (18.0, None),
                 (20.5, None),
-                (21.5, Some(after)),
+                (21.5, None),
+                (26.5, None),
+                (27.5, Some(after)),
                 (30.0, Some(after)),
             ] {
                 let taps = [(0.012, 0.3 * db(-under_db)), (0.012 + after, 0.3)];
@@ -1728,6 +1785,139 @@ mod tests {
                 assert!(
                     (measured.residual - arrival).abs() < 5e-5 && measured.spread < 1e-4,
                     "{role}, {label}: {measured:?}"
+                );
+            }
+        }
+    }
+
+    /// Claude: a soundbar heard mostly by a later path, as in a live session
+    /// that measured it 4.5 ms late: its strongest path 1.8 ms after one 11.5
+    /// dB under it, and its direct path `ahead` of that, `under` the strongest
+    /// on each probe, with paths 19.5 and 76 ms after the second, 1.2 and 17.4
+    /// dB under, as that session's other groups were.
+    fn soundbar_heard_late(ahead: f64, under: [f64; PROBES]) -> Vec<Path> {
+        let (arrival, strongest) = (-0.0355, 0.3);
+        let mut soundbar = paths(&[
+            (arrival, strongest * db(-11.5)),
+            (arrival + 0.0018, strongest),
+            (arrival + 0.0195, strongest * db(-1.2)),
+            (arrival + 0.076, strongest * db(-17.4)),
+        ]);
+        soundbar.extend(under.into_iter().enumerate().map(|(k, under_db)| Path {
+            delay: arrival - ahead,
+            gain: strongest * db(-under_db),
+            probes: Some(vec![k]),
+        }));
+        soundbar
+    }
+
+    /// Claude: the soundbar heard mostly by a later path is ambiguous rather
+    /// than measured there, in either leg: with its direct path 4.3 ms ahead,
+    /// 18 to 21 dB under; as one train of that session logged it, 20.5 dB
+    /// under on one probe and past 21 dB on the rest; and as close as it was
+    /// logged, 3.7 ms ahead.
+    #[test]
+    fn a_soundbar_heard_mostly_by_a_later_path_is_ambiguous_not_measured_late() {
+        let described = [18.2, 19.4, 20.5, 19.0, 20.8];
+        for role in ROLES {
+            for (label, ahead, under) in [
+                ("described", 0.0043, described),
+                ("as logged", 0.0043, [21.4, 20.5, 21.8, 22.0, 21.6]),
+                ("closest logged", 0.0037, described),
+            ] {
+                let paths = soundbar_heard_late(ahead, under);
+                let (span, sound_at) = recorded_as(role, 48_000.0, &[(role, &paths)], 1e-5);
+                let result = Detector::new(48_000.0, role).measure(&span, sound_at);
+                assert_eq!(
+                    result,
+                    Err(ProbeFailure::Ambiguous {
+                        ambiguous: 5,
+                        measurable: 0,
+                        required: 4,
+                    }),
+                    "{role}, {label}"
+                );
+            }
+        }
+    }
+
+    /// Claude: the same soundbar as sessions that measured it right heard it:
+    /// its direct path 14 dB under its strongest, which comes 1.1 ms after it
+    /// on some probes and 2.4 ms after it on the others, the other 2 dB
+    /// under, and a reflection 18.2 ms after it 4 dB under. The direct path
+    /// is the arrival, in either leg.
+    #[test]
+    fn a_soundbar_heard_first_by_its_direct_path_is_measured_there() {
+        let direct = -0.040_35;
+        let mut paths = paths(&[(direct, 0.3 * db(-14.0)), (direct + 0.0182, 0.3 * db(-4.0))]);
+        for (probes, first, second) in [(vec![0, 2, 3], 0.0, -2.0), (vec![1, 4], -2.0, 0.0)] {
+            for (after, under_db) in [(0.0011, first), (0.0024, second)] {
+                paths.push(Path {
+                    delay: direct + after,
+                    gain: 0.3 * db(under_db),
+                    probes: Some(probes.clone()),
+                });
+            }
+        }
+        for role in ROLES {
+            let (span, sound_at) = recorded_as(role, 48_000.0, &[(role, &paths)], 1e-5);
+            let measured = Detector::new(48_000.0, role)
+                .measure(&span, sound_at)
+                .unwrap_or_else(|failure| panic!("{role}: {failure}"));
+            assert!(
+                (measured.residual - direct).abs() < 2e-5 && measured.spread < 5e-5,
+                "{role}: {measured:?}"
+            );
+        }
+    }
+
+    /// Claude: a path 18 dB under a later arrival and up to
+    /// `PRESOUND_SECONDS` ahead of it is a speaker's own sound, as a
+    /// soundbar's reaches 2.9 ms ahead, and the arrival is measured; 3.7 ms
+    /// ahead, as a soundbar's direct path came live, it is an earlier path,
+    /// and the train is ambiguous.
+    #[test]
+    fn a_path_ahead_of_the_arrival_is_an_earlier_path_only_beyond_a_speakers_own_presound() {
+        for role in ROLES {
+            for (ahead, ambiguous) in [(0.0029, false), (0.0037, true)] {
+                let taps = [(0.020 - ahead, 0.3 * db(-18.0)), (0.020, 0.3)];
+                let label = format!("{role}: {} ms ahead", ahead * 1e3);
+                match (measure_as(role, 48_000.0, &taps, 1e-5), ambiguous) {
+                    (Ok(measured), false) => assert!(
+                        (measured.residual - 0.020).abs() < 1e-5,
+                        "{label}: {measured:?}"
+                    ),
+                    (
+                        Err(ProbeFailure::Ambiguous {
+                            ambiguous: 5,
+                            measurable: 0,
+                            required: 4,
+                        }),
+                        true,
+                    ) => {}
+                    (result, _) => panic!("{label}: {result:?}"),
+                }
+            }
+        }
+    }
+
+    /// Claude: beyond `PRESOUND_SECONDS`, the filter's sidelobes stand so far
+    /// under its peak that those of four arrivals summed in phase stay under
+    /// `AMBIGUITY_DB`: a cluster's own sidelobes make no earlier path.
+    #[test]
+    fn the_filters_own_sidelobes_make_no_earlier_path() {
+        for rate in [16_000.0, 44_100.0, 48_000.0, 96_000.0] {
+            for role in ROLES {
+                let detector = Detector::new(rate, role);
+                let from = (PRESOUND_SECONDS * rate).ceil() as usize;
+                let highest = detector.sidelobes[from..]
+                    .iter()
+                    .copied()
+                    .fold(0.0, f64::max);
+                assert!(
+                    4.0 * highest < ratio(-AMBIGUITY_DB),
+                    "{role}, {rate} Hz: {} dB",
+                    super::db(highest)
                 );
             }
         }
