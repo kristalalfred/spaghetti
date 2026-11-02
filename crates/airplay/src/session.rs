@@ -42,6 +42,18 @@ pub(crate) enum Transport {
     },
 }
 
+/// Claude: how a receiver takes a packet it asked for again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Resend {
+    /// Claude: wrapped in a retransmission, over the control channel.
+    Wrapped,
+    /// Claude: as first sent, on the audio channel, as OwnTone resends to
+    /// AirPlay 2 receivers. A Harman soundbar on Apple's AirPlay SDK 2.0.4
+    /// asked once for each packet it lost and concealed it when the packet
+    /// came back wrapped over control, but played it when it came this way.
+    Original,
+}
+
 /// Claude: the request that keeps a session alive, and how often it goes.
 /// An AirPlay 2 receiver's answer to `/feedback` counts whatever its status,
 /// as OwnTone and pyatv take it.
@@ -57,6 +69,13 @@ impl Session {
         match self.transport {
             Transport::AirPlay1 => Protocol::AirPlay1,
             Transport::AirPlay2 { .. } => Protocol::AirPlay2,
+        }
+    }
+
+    pub(crate) fn resend(&self) -> Resend {
+        match self.transport {
+            Transport::AirPlay1 => Resend::Wrapped,
+            Transport::AirPlay2 { .. } => Resend::Original,
         }
     }
 

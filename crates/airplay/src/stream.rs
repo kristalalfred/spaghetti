@@ -17,7 +17,7 @@ use crate::clock::{self, Clock, PACKET_DURATION, Timeline};
 use crate::packet::{self, AudioHeader, MAX_AUDIO_PACKET_LEN, MAX_RETRANSMISSION_LEN, Sync};
 use crate::raop;
 use crate::rtsp::{Connection, OpenError, ReadError, Request};
-use crate::session::{Offer, Session};
+use crate::session::{Offer, Resend, Session};
 use crate::turns::Turn;
 use crate::{
     Browser, Counters, FRAMES_PER_PACKET, LATENCY, Protocol, Receiver, ReceiverId, Render, Status,
@@ -835,8 +835,14 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
                     debug!(seq, "retransmit request for a packet no longer held");
                     continue;
                 };
-                let len = packet::write_retransmission(original, &mut self.retransmission);
-                if let Ok(sent) = self.control.send_to(&self.retransmission[..len], from) {
+                let resent = match self.session.resend() {
+                    Resend::Wrapped => {
+                        let len = packet::write_retransmission(original, &mut self.retransmission);
+                        self.control.send_to(&self.retransmission[..len], from)
+                    }
+                    Resend::Original => self.audio.send_to(original, self.session.audio),
+                };
+                if let Ok(sent) = resent {
                     self.counters.packets_retransmitted += 1;
                     self.counters.bytes_sent += sent as u64;
                 }

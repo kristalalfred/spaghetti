@@ -262,7 +262,7 @@ fn airplay_2_sync_packets_map_each_packet_to_its_play_time() {
 }
 
 #[test]
-fn retransmissions_resend_the_sealed_packets_across_the_wrap() {
+fn retransmissions_resend_the_sealed_packets_on_the_audio_channel_across_the_wrap() {
     let fake = Fake::start(Behavior::default());
     let browser = browser(&fake, false);
     let settings = Settings {
@@ -276,27 +276,19 @@ fn retransmissions_resend_the_sealed_packets_across_the_wrap() {
         Renders::default().renderer(None),
     );
     assert!(wait_until(HANDSHAKE, || fake.audio().len() >= 20));
+    let originals = fake.audio_bytes()[1..5].to_vec();
     fake.request_retransmission(65_534, 4);
-    let resent = || -> Vec<Vec<u8>> {
-        fake.control()
-            .into_iter()
-            .filter(|b| b[1] == 0xD6)
-            .collect()
-    };
-    assert!(wait_until(Duration::from_secs(1), || resent().len() >= 4));
-    let originals = fake.audio_bytes();
-    let retransmissions = resent();
-    assert_eq!(retransmissions.len(), 4);
-    for (retransmission, original) in retransmissions.iter().zip(&originals[1..5]) {
-        assert_eq!(retransmission.len(), 4 + AIRPLAY2_PACKET_LEN);
-        assert_eq!(retransmission[2..4], original[2..4]);
-        assert_eq!(&retransmission[4..], original.as_slice());
-    }
-    let seqs: Vec<u16> = retransmissions
+    let copies = |original: &Vec<u8>| fake.audio_bytes().iter().filter(|b| *b == original).count();
+    assert!(wait_until(Duration::from_secs(1), || {
+        originals.iter().all(|original| copies(original) == 2)
+    }));
+    let seqs: Vec<u16> = originals
         .iter()
-        .map(|b| decode_audio(&fake.open(&b[4..])).seq)
+        .map(|b| decode_audio(&fake.open(b)).seq)
         .collect();
     assert_eq!(seqs, [65_534, 65_535, 0, 1]);
+    assert!(originals.iter().all(|b| b.len() == AIRPLAY2_PACKET_LEN));
+    assert!(fake.control().iter().all(|b| b[1] != 0xD6));
     let Status::Streaming(counters) = stream.status() else {
         panic!("not streaming")
     };

@@ -43,8 +43,7 @@ pub(crate) enum Framing {
     /// AirPlay 1 receivers in use have been heard to play.
     Counted,
     /// Claude: it leaves the count out, so the decoder takes the stream's
-    /// frames per packet, as Apple's encoder writes a full frame; four bytes
-    /// shorter, which an AirPlay 2 packet needs to fit the MTU.
+    /// frames per packet, as Apple's encoder writes a full frame.
     Full,
 }
 
@@ -306,9 +305,10 @@ mod tests {
     fn an_airplay_2_packet_seals_its_full_alac_frame_and_fits_ipv6() {
         assert_eq!(alac_frame_len(FRAMES_PER_PACKET, Framing::Full), 1412);
         assert_eq!(AIRPLAY2_PACKET_LEN, 1448);
+        assert_eq!(IPV6_HEADER_LEN + UDP_HEADER_LEN + AIRPLAY2_PACKET_LEN, 1496);
         assert_eq!(
-            IPV6_HEADER_LEN + UDP_HEADER_LEN + RETRANSMISSION_HEADER_LEN + AIRPLAY2_PACKET_LEN,
-            1500
+            IPV6_HEADER_LEN + UDP_HEADER_LEN + RETRANSMISSION_HEADER_LEN + AIRPLAY1_PACKET_LEN,
+            1480
         );
         let header = AudioHeader {
             seq: 0x1234,
@@ -412,10 +412,10 @@ mod tests {
             None
         );
 
-        let original: Vec<u8> = (0..AIRPLAY2_PACKET_LEN).map(|i| i as u8).collect();
+        let original: Vec<u8> = (0..AIRPLAY1_PACKET_LEN).map(|i| i as u8).collect();
         let mut out = [0; MAX_RETRANSMISSION_LEN];
         let len = write_retransmission(&original, &mut out);
-        assert_eq!(len, 4 + AIRPLAY2_PACKET_LEN);
+        assert_eq!(len, 4 + AIRPLAY1_PACKET_LEN);
         assert_eq!(out[..4], [0x80, 0xD6, original[2], original[3]]);
         assert_eq!(&out[4..len], original.as_slice());
     }

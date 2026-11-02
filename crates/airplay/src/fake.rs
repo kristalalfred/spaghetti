@@ -1449,10 +1449,17 @@ pub(crate) mod tests {
                 played_out.saturating_duration_since(returned_at)
             );
             assert!(returned_at.duration_since(finished_at) <= bound + PROMPT);
-            assert!(
-                fake.control()
+            let resent = match protocol {
+                Protocol::AirPlay1 => fake
+                    .control()
                     .iter()
                     .any(|b| b[1] == 0xD6 && b[4..] == bytes),
+                Protocol::AirPlay2 => {
+                    fake.audio_bytes().iter().filter(|b| **b == bytes).count() == 2
+                }
+            };
+            assert!(
+                resent,
                 "{protocol:?}, {delay:?}: the tail retransmission was not byte-identical"
             );
         }
