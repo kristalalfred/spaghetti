@@ -52,6 +52,14 @@ pub(super) const RECORDING_LAG: f64 = 2.0;
 /// constant). A slower one passes further off: 10 ms settling with a time
 /// constant of 600 s passes both gates about 9.7 ms from where it ends.
 pub(super) const STEADY_DRIFT: f64 = 0.000_02;
+/// Claude: how many standard errors of a train's drift the drift must stand
+/// beyond `STEADY_DRIFT` for the train to count as unsteady. A speaker whose
+/// arrival alternates between two peaks 0.3 ms apart from probe to probe, as a
+/// soundbar's did live, tilts each train's line by up to 0.1 ms a second
+/// while its trains stay put, and leaves the drift that uncertain. Three
+/// standard errors is significant at about 97% one-sided for five arrivals and
+/// 95% for four, by t with three and two degrees of freedom.
+pub(super) const UNSTEADY: f64 = 3.0;
 /// Claude: how far apart two successive output trains' lateness against the
 /// reference may lie, about 12.4 s apart, for the output to count as
 /// settled: under the same model, within about 1.3 ms of where it settles.
@@ -245,18 +253,23 @@ struct Train {
 }
 
 /// Claude: a measured train: where it arrived, or, when its leg's timing
-/// moved while it played, how fast.
-#[derive(Debug, Clone, Copy)]
+/// moved while it played, how fast, or, for an output train, why it measured
+/// nothing.
+#[derive(Debug, Clone)]
 enum Outcome {
     Steady(Measured),
-    Moving { ms_per_second: f64 },
+    Moving {
+        ms_per_second: f64,
+    },
+    /// Claude: an output train not heard, or refused: it measured nothing.
+    Missed(ProbeFailure),
 }
 
 impl Outcome {
     fn steady(&self) -> Option<&Measured> {
         match self {
             Outcome::Steady(measured) => Some(measured),
-            Outcome::Moving { .. } => None,
+            Outcome::Moving { .. } | Outcome::Missed(_) => None,
         }
     }
 }
@@ -625,6 +638,14 @@ impl Job {
             train.outcome = Some(match detector.measure(&span, train.sound_at) {
                 Ok(measured) => Outcome::Steady(measured),
                 Err(ProbeFailure::Moved { ms_per_second, .. }) => Outcome::Moving { ms_per_second },
+                Err(failure) if train.role == Role::Output => {
+                    tracing::info!(
+                        number,
+                        %failure,
+                        "calibration output train measured nothing; playing on"
+                    );
+                    Outcome::Missed(failure)
+                }
                 Err(failure) => {
                     return Err(CalibrationFailure::Probes {
                         role: train.role,
@@ -663,15 +684,38 @@ impl Job {
             }
             return Some(Ok(self.calibrated(window[2], window[3], window[4])));
         }
-        (measured.len() == MOST_TRAINS).then(|| Err(self.unsettled(&measured, output, now)))
+        (measured.len() == MOST_TRAINS).then(|| Err(self.unsettled(&measured, now)))
     }
 
     /// Claude: why the latest trains, around output train `output`, show the
     /// calibration not settled: the latest train whose leg moved while it
     /// played, or else how the window's trains drifted, or else how fast the
     /// output moved against the reference between its latest two trains.
-    fn unsettled(&self, measured: &[&Outcome], output: usize, now: u64) -> CalibrationFailure {
+    fn unsettled(&self, measured: &[&Outcome], now: u64) -> CalibrationFailure {
         let ticks = host_time::ticks_per_second();
+        let heard = (FEWEST_TRAINS - 1..measured.len())
+            .rev()
+            .step_by(2)
+            .find(|&last| {
+                measured[last + 1 - FEWEST_TRAINS..=last]
+                    .iter()
+                    .all(|outcome| !matches!(outcome, Outcome::Missed(_)))
+            });
+        let Some(last) = heard else {
+            let failure = measured
+                .iter()
+                .rev()
+                .find_map(|outcome| match outcome {
+                    Outcome::Missed(failure) => Some(failure.clone()),
+                    _ => None,
+                })
+                .expect("a window is missing only for a train that measured nothing");
+            return CalibrationFailure::Probes {
+                role: Role::Output,
+                failure,
+            };
+        };
+        let output = last - 1;
         let moving = (output - 3..=output + 1)
             .rev()
             .find_map(|train| match measured[train] {
@@ -681,7 +725,7 @@ impl Job {
                         ms_per_second: *ms_per_second,
                     },
                 )),
-                Outcome::Steady(_) => None,
+                Outcome::Steady(_) | Outcome::Missed(_) => None,
             });
         let (role, movement) = moving.unwrap_or_else(|| {
             let window: Vec<&Measured> = (output - 3..=output + 1)
@@ -826,10 +870,14 @@ fn index(role: Role) -> usize {
 /// reference trains against one another. A recording whose dates drift
 /// steadily drifts every train alike, which cancels.
 fn movement(window: &[&Measured]) -> Option<(Role, Movement)> {
+    let beyond = |drift: f64, error: f64| drift.abs() - STEADY_DRIFT > UNSTEADY * error;
     for output in [3, 1] {
-        let reference = (window[output - 1].drift + window[output + 1].drift) / 2.0;
-        let drift = window[output].drift - reference;
-        if drift.abs() > STEADY_DRIFT {
+        let (before, after) = (window[output - 1], window[output + 1]);
+        let drift = window[output].drift - (before.drift + after.drift) / 2.0;
+        let error = (window[output].drift_error.powi(2)
+            + (before.drift_error.powi(2) + after.drift_error.powi(2)) / 4.0)
+            .sqrt();
+        if beyond(drift, error) {
             return Some((
                 Role::Output,
                 Movement::AgainstReference {
@@ -838,13 +886,22 @@ fn movement(window: &[&Measured]) -> Option<(Role, Movement)> {
             ));
         }
     }
-    let references = [window[0].drift, window[2].drift, window[4].drift];
-    let lowest = references.iter().copied().fold(f64::INFINITY, f64::min);
-    let highest = references.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    (highest - lowest > STEADY_DRIFT).then_some((
+    let references = [window[0], window[2], window[4]];
+    let by_drift = |a: &&&Measured, b: &&&Measured| a.drift.total_cmp(&b.drift);
+    let lowest = references
+        .iter()
+        .min_by(by_drift)
+        .expect("three references");
+    let highest = references
+        .iter()
+        .max_by(by_drift)
+        .expect("three references");
+    let apart = highest.drift - lowest.drift;
+    let error = (highest.drift_error.powi(2) + lowest.drift_error.powi(2)).sqrt();
+    beyond(apart, error).then_some((
         Role::Reference,
         Movement::ReferenceDrifts {
-            apart_ms_per_second: (highest - lowest) * 1e3,
+            apart_ms_per_second: apart * 1e3,
         },
     ))
 }
@@ -867,6 +924,7 @@ mod tests {
             spread: 0.0,
             at,
             drift: drift_ms_per_second / 1e3,
+            drift_error: 0.0,
         }
     }
 

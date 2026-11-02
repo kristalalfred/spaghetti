@@ -76,6 +76,13 @@ const AGREEING: usize = 4;
 /// moved rather than its arrivals to have scattered: past the 99% two-sided
 /// t value for four arrivals, 9.9, and for five, 5.8.
 const TREND: f64 = 10.0;
+/// Claude: how long after a group's arrival a candidate whose probes do not
+/// agree may arrive, no louder than the group, and be that group's own later
+/// paths, as a speaker's reflections are: 100 ms, an extra path of 34 m,
+/// longer than any strong reflection in a home. A soundbar measured in a
+/// living room had reflection clusters 17.6, 45.8 and 75.4 ms after its
+/// direct path, the one at 22 ms wandering 3.3 ms from probe to probe.
+const REFLECTIONS_SECONDS: f64 = 0.1;
 
 fn ratio(db: f64) -> f64 {
     10f64.powf(db / 20.0)
@@ -134,6 +141,9 @@ pub struct Measured {
     /// Claude: how much later each second the agreeing probes arrived against
     /// their schedules, by the line through them, in seconds a second.
     pub drift: f64,
+    /// Claude: the standard error of `drift`, against the arrivals' scatter
+    /// about the line.
+    pub drift_error: f64,
 }
 
 /// Claude: what finds one role's trains: its probe as the template, its
@@ -241,7 +251,7 @@ impl Detector {
         };
         let significant = loudest * ratio(-ARRIVAL_DB);
         let mut groups: Vec<Group> = Vec::new();
-        let mut unexplained: Option<(usize, f64)> = None;
+        let mut scattered: Vec<(usize, f64)> = Vec::new();
         for (candidate, strongest) in candidates.iter().enumerate() {
             let Some(level) = levels[candidate] else {
                 continue;
@@ -257,15 +267,28 @@ impl Detector {
                         None => groups.push(group),
                     }
                 }
-                None if level >= significant
-                    && unexplained.is_none_or(|(_, louder)| level > louder) =>
-                {
-                    unexplained = Some((candidate, level));
-                }
+                None if level >= significant => scattered.push((candidate, level)),
                 None => {}
             }
         }
         groups.retain(|group| group.level >= loudest * ratio(-AMBIGUITY_DB));
+        let later_paths = |(candidate, level): (usize, f64)| {
+            let arrivals = self.cluster_arrivals(&envelope, background, &candidates[candidate]);
+            groups
+                .iter()
+                .filter(|group| group.level >= significant && group.level >= level)
+                .any(|group| {
+                    arrivals.iter().all(|(at, _, _)| {
+                        let after = at - group.at;
+                        after >= -AGREEMENT_SECONDS * self.rate
+                            && after <= REFLECTIONS_SECONDS * self.rate
+                    })
+                })
+        };
+        let unexplained = scattered
+            .into_iter()
+            .filter(|&scattered| !later_paths(scattered))
+            .max_by(|a, b| a.1.total_cmp(&b.1));
         let ticks_per_second = crate::host_time::ticks_per_second();
         let late_ms = |at: f64| (span.date(at) - sound_at[0]) / ticks_per_second * 1e3;
         debug!(
@@ -605,22 +628,25 @@ impl Detector {
                 )
             })
             .collect();
-        let (drift, _, _) = fit(&probes
+        let line: Vec<(f64, f64)> = probes
             .iter()
             .map(|&(late, at)| (at / ticks_per_second, late))
-            .collect::<Vec<_>>());
+            .collect();
+        let fitted = fit(&line);
         probes.sort_by(|a, b| a.0.total_cmp(&b.0));
         let n = probes.len() as f64;
         let measured = Measured {
             residual: probes.iter().map(|(late, _)| late).sum::<f64>() / n,
             spread: probes[probes.len() - 1].0 - probes[0].0,
             at: probes.iter().map(|(_, at)| at).sum::<f64>() / n,
-            drift,
+            drift: fitted.0,
+            drift_error: slope_error(&line, fitted),
         };
         debug!(
             residual_ms = %format!("{:+.3}", measured.residual * 1e3),
             spread_ms = %format!("{:.3}", measured.spread * 1e3),
             drift_ms_per_second = %format!("{:+.4}", measured.drift * 1e3),
+            drift_error_ms_per_second = %format!("{:.4}", measured.drift_error * 1e3),
             "calibration train measured"
         );
         Ok(measured)
@@ -640,18 +666,12 @@ impl Detector {
             .iter()
             .map(|&(k, at)| (self.layout[k], at / self.rate))
             .collect();
-        let (slope, mean_t, mean_at) = fit(&points);
-        let residuals: Vec<f64> = points
+        let fitted = fit(&points);
+        let (slope, mean_t, mean_at) = fitted;
+        let on_a_line = points
             .iter()
-            .map(|(t, at)| at - (mean_at + slope * (t - mean_t)))
-            .collect();
-        let on_a_line = residuals
-            .iter()
-            .all(|residual| residual.abs() <= AGREEMENT_SECONDS);
-        let scatter = residuals.iter().map(|r| r * r).sum::<f64>() / (points.len() - 2) as f64;
-        let spread_of_times: f64 = points.iter().map(|(t, _)| (t - mean_t).powi(2)).sum();
-        let standard_error = (scatter / spread_of_times).sqrt();
-        let trending = slope.abs() > TREND * standard_error;
+            .all(|(t, at)| (at - (mean_at + slope * (t - mean_t))).abs() <= AGREEMENT_SECONDS);
+        let trending = slope.abs() > TREND * slope_error(&points, fitted);
         let spread = arrivals[arrivals.len() - 1].1 - arrivals[0].1;
         (on_a_line && trending).then(|| ProbeFailure::Moved {
             spread_ms: spread / self.rate * 1e3,
@@ -810,6 +830,17 @@ fn fit(points: &[(f64, f64)]) -> (f64, f64, f64) {
         )
     });
     (sxy / sxx, mean_x, mean_y)
+}
+
+/// Claude: the standard error of the slope of the line `fitted` to `points`,
+/// against their scatter about it.
+fn slope_error(points: &[(f64, f64)], (slope, mean_x, mean_y): (f64, f64, f64)) -> f64 {
+    let scatter: f64 = points
+        .iter()
+        .map(|(x, y)| (y - (mean_y + slope * (x - mean_x))).powi(2))
+        .sum();
+    let spread: f64 = points.iter().map(|(x, _)| (x - mean_x).powi(2)).sum();
+    (scatter / (points.len() - 2) as f64 / spread).sqrt()
 }
 
 fn is_peak(envelope: &[f64], i: usize) -> bool {
@@ -1110,7 +1141,13 @@ mod tests {
     /// tenth low.
     #[test]
     fn a_quieter_still_train_does_not_hide_a_louder_one_that_moved() {
-        for (from, under_db) in [(0.8, 40.0), (0.824_38, 40.0), (0.8, 14.0), (0.824_38, 14.0)] {
+        for (from, under_db) in [
+            (0.8, 40.0),
+            (0.824_38, 40.0),
+            (0.8, 14.0),
+            (0.824_38, 14.0),
+            (0.06, 14.0),
+        ] {
             let mut paths: Vec<Path> = train()
                 .iter()
                 .enumerate()
@@ -1776,5 +1813,66 @@ mod tests {
             recorded_as(Role::Output, 48_000.0, &[(Role::Reference, &leak)], 1e-4);
         let result = Detector::new(48_000.0, Role::Output).measure(&span, sound_at);
         assert!(result.is_err(), "{result:?}");
+    }
+
+    /// Claude: `taps` at their delays and gains on every probe, and the
+    /// probes' paths `wandering`, one probe each, at `gain`.
+    fn wandering(taps: &[(f64, f64)], wandering: [f64; PROBES], gain: f64) -> Vec<Path> {
+        let mut all = paths(taps);
+        all.extend(wandering.into_iter().enumerate().map(|(k, delay)| Path {
+            delay,
+            gain,
+            probes: Some(vec![k]),
+        }));
+        all
+    }
+
+    /// Claude: a direct path at +12 ms and, 5.7 dB under it, a reflection
+    /// whose peak wanders between 18.5 and 21.5 ms later from probe to probe,
+    /// with a steadier one at 22 ms, as a soundbar's did live: the wandering
+    /// peaks are the speaker's own later paths, not a sound left unexplained,
+    /// and the train arrives with its direct path, in either leg.
+    #[test]
+    fn a_reflection_whose_peak_wanders_is_the_trains_own_later_path() {
+        let wander = [0.0185, 0.021, 0.019, 0.0215, 0.0185].map(|after| 0.012 + after);
+        for role in ROLES {
+            let paths = wandering(
+                &[(0.012, 0.3), (0.034, 0.3 * db(-12.0))],
+                wander,
+                0.3 * db(-5.7),
+            );
+            let (span, sound_at) = recorded_as(role, 48_000.0, &[(role, &paths)], 1e-4);
+            let measured = Detector::new(48_000.0, role)
+                .measure(&span, sound_at)
+                .unwrap_or_else(|failure| panic!("{role}: {failure}"));
+            assert!(
+                (measured.residual - 0.012).abs() < 1e-5,
+                "{role}: {measured:?}"
+            );
+        }
+    }
+
+    /// Claude: scattered peaks explain as a train's later paths only when no
+    /// louder than it and within 100 ms of it: louder ones 40 ms after it, or
+    /// weaker ones 150 ms after it, are a sound left unexplained.
+    #[test]
+    fn a_louder_or_a_late_scattered_sound_after_a_train_is_not_its_own() {
+        let scatter = [0.0, 0.0025, 0.001, 0.004, 0.0005];
+        for (after, under_db) in [(0.040, -6.0), (0.150, 6.0)] {
+            let paths = wandering(
+                &[(0.012, 0.3)],
+                scatter.map(|s| 0.012 + after + s),
+                0.3 * db(-under_db),
+            );
+            let (span, sound_at) = recorded(48_000.0, &paths, 1e-4);
+            let failure = Detector::new(48_000.0, ROLE)
+                .measure(&span, sound_at)
+                .map(|measured| panic!("{after} s, {under_db} dB under: {measured:?}"))
+                .unwrap_err();
+            let ProbeFailure::Disagree { spread_ms } = failure else {
+                panic!("{after} s: {failure:?}")
+            };
+            assert!((spread_ms - 4.0).abs() < 0.05, "{after} s: {spread_ms}");
+        }
     }
 }

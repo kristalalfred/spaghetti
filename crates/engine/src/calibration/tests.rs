@@ -59,6 +59,10 @@ struct Speaker {
     count: i32,
     /// Claude: bursts the microphone does not hear.
     muted: Vec<i32>,
+    /// Claude: how loud each burst comes along each path, by burst and path,
+    /// as a factor on the path's gain; every burst at the path's gain when
+    /// `None`.
+    gains: Option<fn(i32, usize) -> f64>,
     /// Claude: from this time on, renders are dated this much later.
     skip: Option<(f64, f64)>,
     moving: Option<Moving>,
@@ -120,9 +124,10 @@ impl Speaker {
             }
     }
 
-    /// Claude: the sound at `t` seconds, by band-limited interpolation of what
-    /// was rendered, as heard `lateness` after its heard time.
-    fn sound(&self, t: f64) -> f64 {
+    /// Claude: the sound at `t` seconds along path number `path`, by
+    /// band-limited interpolation of what was rendered, as heard `lateness`
+    /// after its heard time.
+    fn sound(&self, t: f64, path: usize) -> f64 {
         let position = (t - self.lateness_at(t)) * self.rate;
         let base = position.floor() as isize;
         let mut sum = 0.0;
@@ -130,9 +135,11 @@ impl Speaker {
             let Some(&sample) = usize::try_from(tap).ok().and_then(|i| self.rendered.get(i)) else {
                 continue;
             };
-            if sample == 0.0 || self.muted.contains(&self.bursts[tap as usize]) {
+            let burst = self.bursts[tap as usize];
+            if sample == 0.0 || self.muted.contains(&burst) {
                 continue;
             }
+            let gain = self.gains.map_or(1.0, |gains| gains(burst, path));
             let x = position - tap as f64;
             let window = 0.5 + 0.5 * (PI * x / TAPS as f64).cos();
             let sinc = if x.abs() < 1e-12 {
@@ -140,7 +147,7 @@ impl Speaker {
             } else {
                 (PI * x).sin() / (PI * x)
             };
-            sum += f64::from(sample) * sinc * window;
+            sum += gain * f64::from(sample) * sinc * window;
         }
         sum
     }
@@ -284,16 +291,17 @@ impl Room {
             let mut samples: Vec<f32> = (start..start + frames)
                 .map(|frame| {
                     let t = at(frame);
-                    let heard: f64 = self
-                        .speakers
-                        .iter()
-                        .flat_map(|(_, speaker)| {
-                            speaker
-                                .paths
-                                .iter()
-                                .map(move |(travel, gain)| gain * speaker.sound(t - travel))
-                        })
-                        .sum();
+                    let heard: f64 =
+                        self.speakers
+                            .iter()
+                            .flat_map(|(_, speaker)| {
+                                speaker.paths.iter().enumerate().map(
+                                    move |(path, (travel, gain))| {
+                                        gain * speaker.sound(t - travel, path)
+                                    },
+                                )
+                            })
+                            .sum();
                     (heard + mic.noise * mic.deviates.normal()) as f32
                 })
                 .collect();
@@ -339,6 +347,7 @@ struct Place {
     delay_ms: u32,
     latency_offset_ms: Option<i32>,
     muted: Vec<i32>,
+    gains: Option<fn(i32, usize) -> f64>,
     skip: Option<(f64, f64)>,
     moving: Option<Moving>,
 }
@@ -353,6 +362,7 @@ impl Place {
             delay_ms: 300,
             latency_offset_ms: None,
             muted: Vec::new(),
+            gains: None,
             skip: None,
             moving: None,
         }
@@ -441,6 +451,7 @@ fn run(setup: &Setup, hook: impl Fn(f64, &Job)) -> Run {
                 bursts: Vec::new(),
                 count: 0,
                 muted: place.muted.clone(),
+                gains: place.gains,
                 skip: place.skip,
                 moving: place.moving,
             },
@@ -1194,6 +1205,112 @@ fn a_calibration_counts_the_trains_it_plays() {
         (Calibrating::FEWEST_TRAINS, Calibrating::MOST_TRAINS),
         (5, 11)
     );
+}
+
+fn db(db: f64) -> f64 {
+    10f64.powf(db / 20.0)
+}
+
+/// Claude: the highest train a calibration reported playing.
+fn trains_played(run: &Run) -> usize {
+    run.states
+        .iter()
+        .filter_map(|state| match state {
+            CalibrationState::Probing { train, .. } => Some(*train),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Claude: an output heard along two paths 0.3 ms apart whose levels trade
+/// places from probe to probe, as a soundbar's did live: its third and fourth
+/// probes arrive by the first path, the rest by the second, the first path's
+/// peak there taken for a sidelobe of the second's. Each train's arrivals
+/// tilt 0.045 ms a second, but the tilt is scatter about the train's line,
+/// not drift, and its trains stay put: the calibration settles at once.
+#[test]
+fn an_output_whose_arrival_alternates_between_two_peaks_settles_at_once() {
+    let mut output = Place::at(23.0, 1.7);
+    output.paths = vec![(0.0017, 0.3), (0.0020, 0.3)];
+    output.gains = Some(|burst, path| match (burst.rem_euclid(5), path) {
+        (2 | 3, 0) => 1.0,
+        (2 | 3, _) => db(-2.0),
+        (_, 0) => db(-9.0),
+        _ => 1.0,
+    });
+    let setup = Setup::new(output, Place::at(2.2, 0.4));
+    let run = run(&setup, |_, _| {});
+    let calibrated = run
+        .result
+        .as_ref()
+        .unwrap_or_else(|failure| panic!("{failure}"));
+    assert_eq!(calibrated.latency_offset_ms, 22, "{calibrated:?}");
+    assert!(
+        (24.65..25.05).contains(&calibrated.output.late_ms),
+        "{calibrated:?}"
+    );
+    assert_eq!(trains_played(&run), Calibrating::FEWEST_TRAINS);
+}
+
+/// Claude: the output's first train not heard at all, or heard with its
+/// probes scattered by up to 5.5 ms off any line, as different paths of each
+/// probe, measures nothing, and the calibration plays on: it settles on the
+/// trains after it, two trains later.
+#[test]
+fn an_output_train_not_heard_or_refused_is_played_past() {
+    let mut silent = Place::at(31.5, 2.3);
+    silent.muted = (0..5).collect();
+    let mut scattered = Place::at(31.5, 2.3);
+    scattered.paths = [0.0, 1.1, 3.3, 2.2, 5.5, 4.4]
+        .map(|ms| (0.0023 + ms / 1000.0, 0.3))
+        .to_vec();
+    scattered.gains = Some(|burst, path| match burst {
+        0..5 => f64::from(path == 1 + burst as usize),
+        _ => f64::from(path == 0),
+    });
+    for output in [silent, scattered] {
+        let setup = Setup::new(output, Place::at(5.4, 1.1));
+        let run = run(&setup, |_, _| {});
+        let calibrated = run
+            .result
+            .as_ref()
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        assert_measures(&setup, calibrated);
+        assert_eq!(trains_played(&run), Calibrating::FEWEST_TRAINS + 2);
+    }
+}
+
+/// Claude: an output never heard plays every train the calibration may, then
+/// fails with what its trains last showed: not heard. A reference not heard
+/// ends the calibration at once: every output train is placed against the
+/// reference trains around it, and a reference not heard is a setup's fault
+/// that more trains do not mend.
+#[test]
+fn an_output_never_heard_plays_every_train_and_a_reference_not_heard_ends_at_once() {
+    let mut output = Place::at(31.5, 2.3);
+    output.muted = (0..30).collect();
+    let ran = run(&Setup::new(output, Place::at(5.4, 1.1)), |_, _| {});
+    let Err(CalibrationFailure::Probes {
+        role: Role::Output,
+        failure: ProbeFailure::NotFound { heard: 0, .. },
+    }) = ran.result
+    else {
+        panic!("{:?}", ran.result)
+    };
+    assert_eq!(trains_played(&ran), Calibrating::MOST_TRAINS);
+
+    let mut reference = Place::at(5.4, 1.1);
+    reference.muted = (0..5).collect();
+    let ran = run(&Setup::new(Place::at(31.5, 2.3), reference), |_, _| {});
+    let Err(CalibrationFailure::Probes {
+        role: Role::Reference,
+        failure: ProbeFailure::NotFound { heard: 0, .. },
+    }) = ran.result
+    else {
+        panic!("{:?}", ran.result)
+    };
+    assert_eq!(trains_played(&ran), 1);
 }
 
 #[test]
