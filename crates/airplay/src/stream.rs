@@ -14,9 +14,11 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
+use crate::airplay2::buffered::TimingPeer;
 use crate::airplay2::{self, Failure};
 use crate::browse;
 use crate::clock::Clock;
+use crate::ptp::{Endpoint, Ptp};
 use crate::raop;
 use crate::rtsp::{Connection, OpenError, ReadError, Request};
 use crate::session::{AudioLatency, Session};
@@ -24,6 +26,7 @@ use crate::turns::Turn;
 use crate::{
     Browser, Counters, FRAMES_PER_PACKET, LATENCY, Protocol, Receiver, ReceiverId, Render, Status,
 };
+use buffered::Buffered;
 use realtime::{Realtime, Sockets};
 
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
@@ -208,11 +211,13 @@ enum Command {
     Stop = 2,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct Settings {
     pub(crate) latency: Duration,
     pub(crate) lookup_window: Duration,
-    pub(crate) first_seq: u16,
+    /// Claude: the first packet's sequence number, of which a realtime
+    /// packet carries the low 16 bits and a buffered one the low 23.
+    pub(crate) first_seq: u32,
     pub(crate) first_rtp: u32,
     pub(crate) connect_timeout: Duration,
     pub(crate) wake_window: Duration,
@@ -223,8 +228,17 @@ pub(crate) struct Settings {
     /// Claude: the protocol the stream must speak, or `None` to speak the one
     /// `Receiver::protocol` picks.
     pub(crate) protocol: Option<Protocol>,
+    /// Claude: how long a buffered stream has from its session's SETUP answer
+    /// for its timing to settle and the receiver to accept an anchor, before
+    /// it starts over as realtime.
+    pub(crate) startup_budget: Duration,
     #[cfg(test)]
     pub(crate) failing_sends: Arc<AtomicBool>,
+    /// Claude: the clock a buffered stream times with and where the
+    /// receiver's clock is, or why there is no clock, in place of the
+    /// process's clock on PTP's ports and the receiver's on its address.
+    #[cfg(test)]
+    pub(crate) timing: Option<Result<(Arc<Ptp>, Endpoint), String>>,
 }
 
 impl Settings {
@@ -233,7 +247,7 @@ impl Settings {
         Ok(Settings {
             latency: LATENCY,
             lookup_window: Duration::from_secs(3),
-            first_seq: getrandom::u32().map_err(random)? as u16,
+            first_seq: getrandom::u32().map_err(random)?,
             first_rtp: getrandom::u32().map_err(random)?,
             connect_timeout: Duration::from_secs(2),
             wake_window: Duration::from_secs(15),
@@ -242,8 +256,11 @@ impl Settings {
             timing_silence: Duration::from_secs(15),
             send_failure_limit: Duration::from_secs(1),
             protocol: None,
+            startup_budget: Duration::from_secs(8),
             #[cfg(test)]
             failing_sends: Arc::default(),
+            #[cfg(test)]
+            timing: None,
         })
     }
 }
@@ -350,6 +367,7 @@ fn connect<'a, R>(
     };
     Ok(Streamer {
         shared,
+        next: delivery.first_packet(),
         keepalive: Keepalive {
             next_at: Instant::now() + session.keepalive().every,
             outstanding: None,
@@ -360,7 +378,6 @@ fn connect<'a, R>(
         delivery,
         left: Box::new([0.0; FRAMES_PER_PACKET]),
         right: Box::new([0.0; FRAMES_PER_PACKET]),
-        next: 0,
         sent: None,
         late_packets: 0,
     })
@@ -475,10 +492,78 @@ impl Connector<'_> {
     fn attempt(&self, found: &Receiver, mode: Mode) -> Result<(Session, Delivery), Failure> {
         match mode {
             Mode::AirPlay1 | Mode::Realtime => self.realtime(found, mode.protocol()),
-            Mode::Buffered => Err(Failure::Unbuffered(
-                "this build does not stream buffered audio yet".into(),
-            )),
+            Mode::Buffered => self.buffered(found),
         }
+    }
+
+    /// Claude: buffered AirPlay 2 timed by PTP. Timing with the receiver
+    /// starts once paired, right before the session's SETUP names this host's
+    /// clock, so that the clock's election runs while the receiver starts its
+    /// own PTP; the startup budget runs from that SETUP's answer. Whatever
+    /// fails releases the session, the timing and the connection.
+    fn buffered(&self, found: &Receiver) -> Result<(Session, Delivery), Failure> {
+        let (settings, abort) = (self.settings, self.abort);
+        let ptp = self.clock().map_err(|reason| {
+            Failure::Unbuffered(format!("this host has no PTP clock ({reason})"))
+        })?;
+        let service = found.service(Protocol::AirPlay2).map_err(Failure::Failed)?;
+        let connection = self
+            .open(Protocol::AirPlay2, service.addresses.clone())
+            .map_err(Failure::Failed)?;
+        let (local, receiver) = (connection.local_addr(), connection.peer_addr());
+        let timeout = settings.answer_timeout;
+        let paired = airplay2::pair(connection, timeout, abort)?;
+        let peer = ptp.add_peer(local, self.receiver_clock(receiver));
+        let timing_peer = TimingPeer {
+            clock: ptp.identity(),
+            address: local.ip(),
+        };
+        let mut handshake = airplay2::buffered::set_up(
+            paired,
+            &timing_peer,
+            timeout,
+            settings.teardown_timeout,
+            abort,
+        )?;
+        let deadline = handshake.answered_at() + settings.startup_budget;
+        let anchored = buffered::settle(&peer, deadline, abort).and_then(|()| {
+            let data = handshake.open_stream(timeout, abort)?;
+            let mut offer = || buffered::anchor_now(&peer, settings);
+            let (anchor, anchored_at) = handshake.anchor(deadline, timeout, abort, &mut offer)?;
+            Ok((data, anchor, anchored_at))
+        });
+        let (data, anchor, anchored_at) = match anchored {
+            Ok(anchored) => anchored,
+            Err(failure) => {
+                handshake.abandon(settings.teardown_timeout, abort);
+                return Err(failure);
+            }
+        };
+        let (mut session, audio) = handshake.start(data, anchor, anchored_at);
+        match Buffered::start(audio, peer, settings) {
+            Ok(buffered) => Ok((session, Delivery::Buffered(buffered))),
+            Err(reason) => {
+                session.teardown(settings.teardown_timeout);
+                Err(Failure::Failed(reason))
+            }
+        }
+    }
+
+    fn clock(&self) -> Result<Arc<Ptp>, String> {
+        #[cfg(test)]
+        if let Some(timing) = &self.settings.timing {
+            return timing.clone().map(|(clock, _)| clock);
+        }
+        Ptp::shared()
+    }
+
+    /// Claude: where the receiver at `address` keeps its PTP clock.
+    fn receiver_clock(&self, address: SocketAddr) -> Endpoint {
+        #[cfg(test)]
+        if let Some(Ok((_, endpoint))) = &self.settings.timing {
+            return *endpoint;
+        }
+        Endpoint::standard(address)
     }
 
     fn realtime(
@@ -587,18 +672,21 @@ pub(crate) fn pause_until(until: Instant, abort: &dyn Fn() -> bool) -> bool {
 /// Claude: how a stream's packets reach the receiver and when each plays.
 enum Delivery {
     Realtime(Realtime),
+    Buffered(Buffered),
 }
 
 impl Delivery {
     fn timing(&self) -> &'static str {
         match self {
             Delivery::Realtime(_) => "NTP",
+            Delivery::Buffered(_) => "PTP",
         }
     }
 
     fn audio(&self) -> &'static str {
         match self {
             Delivery::Realtime(_) => "realtime",
+            Delivery::Buffered(_) => "buffered",
         }
     }
 
@@ -607,29 +695,45 @@ impl Delivery {
     fn audio_latency(&self) -> Option<AudioLatency> {
         match self {
             Delivery::Realtime(realtime) => Some(realtime.audio_latency()),
+            Delivery::Buffered(_) => None,
         }
     }
 
     fn counters(&self) -> Counters {
         match self {
             Delivery::Realtime(realtime) => realtime.counters(),
+            Delivery::Buffered(buffered) => buffered.counters(),
         }
     }
 
-    fn play_at(&self, packet: u64) -> Instant {
+    /// Claude: the first packet to render; those before it are never
+    /// rendered or sent.
+    fn first_packet(&self) -> u64 {
         match self {
-            Delivery::Realtime(realtime) => realtime.play_at(packet),
+            Delivery::Realtime(_) => 0,
+            Delivery::Buffered(buffered) => buffered.first_packet(),
+        }
+    }
+
+    /// Claude: when the receiver plays `packet`, or why that can no longer be
+    /// said.
+    fn play_at(&self, packet: u64) -> Result<Instant, String> {
+        match self {
+            Delivery::Realtime(realtime) => Ok(realtime.play_at(packet)),
+            Delivery::Buffered(buffered) => buffered.play_at(packet),
         }
     }
 
     fn send(
         &mut self,
         packet: u64,
+        play_at: Instant,
         left: &[f32; FRAMES_PER_PACKET],
         right: &[f32; FRAMES_PER_PACKET],
     ) -> Result<(), String> {
         match self {
             Delivery::Realtime(realtime) => realtime.send(packet, left, right),
+            Delivery::Buffered(buffered) => buffered.send(packet, play_at, left, right),
         }
     }
 
@@ -637,12 +741,17 @@ impl Delivery {
     fn interest(&self) -> libc::pollfd {
         match self {
             Delivery::Realtime(realtime) => realtime.interest(),
+            Delivery::Buffered(buffered) => buffered.interest(),
         }
     }
 
-    fn on_ready(&mut self) {
+    fn on_ready(&mut self) -> Result<(), String> {
         match self {
-            Delivery::Realtime(realtime) => realtime.answer_control(),
+            Delivery::Realtime(realtime) => {
+                realtime.answer_control();
+                Ok(())
+            }
+            Delivery::Buffered(buffered) => buffered.flush(Instant::now()),
         }
     }
 
@@ -651,13 +760,16 @@ impl Delivery {
     fn upkeep(&mut self, now: Instant) -> Result<(), String> {
         match self {
             Delivery::Realtime(realtime) => realtime.upkeep(now),
+            Delivery::Buffered(buffered) => buffered.upkeep(now),
         }
     }
 
-    /// Claude: when `upkeep` next has something to do.
-    fn wake_at(&self) -> Instant {
+    /// Claude: when `upkeep` next has something to do, sooner than the loop
+    /// polls anyway.
+    fn wake_at(&self) -> Option<Instant> {
         match self {
-            Delivery::Realtime(realtime) => realtime.wake_at(),
+            Delivery::Realtime(realtime) => Some(realtime.wake_at()),
+            Delivery::Buffered(_) => None,
         }
     }
 }
@@ -702,8 +814,9 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
                     let end = match finish_at {
                         Some(end) => end,
                         None => match self.played_out() {
-                            Some(end) => *finish_at.insert(end),
-                            None => return End::Finished,
+                            Ok(Some(end)) => *finish_at.insert(end),
+                            Ok(None) => return End::Finished,
+                            Err(reason) => return End::Lost(reason),
                         },
                     };
                     if Instant::now() >= end {
@@ -711,8 +824,8 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
                     }
                     self.wait_until(end)
                 }
-                Command::Play => {
-                    let due = self.delivery.play_at(self.next) - self.settings.latency;
+                Command::Play => self.delivery.play_at(self.next).and_then(|play_at| {
+                    let due = play_at - self.settings.latency;
                     self.wait_until(due).and_then(|()| {
                         if self.shared.command() == Command::Play && Instant::now() >= due {
                             self.play_next()
@@ -720,7 +833,7 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
                             Ok(())
                         }
                     })
-                }
+                }),
             };
             if let Err(reason) = step {
                 return match self.shared.command() {
@@ -733,21 +846,24 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
 
     /// Claude: when the last packet sent has played, plus `playout_delay`, or
     /// `None` when none was sent.
-    fn played_out(&self) -> Option<Instant> {
-        let last = self.sent?;
-        Some(self.delivery.play_at(last + 1) + *self.shared.playout_delay.get().unwrap())
+    fn played_out(&self) -> Result<Option<Instant>, String> {
+        let Some(last) = self.sent else {
+            return Ok(None);
+        };
+        let ended = self.delivery.play_at(last + 1)?;
+        Ok(Some(ended + *self.shared.playout_delay.get().unwrap()))
     }
 
     fn play_next(&mut self) -> Result<(), String> {
         let cutoff = Instant::now() + MIN_LEAD;
         let mut late = 0;
-        while self.delivery.play_at(self.next) <= cutoff {
+        while self.delivery.play_at(self.next)? <= cutoff {
             self.next += 1;
             late += 1;
         }
         let packet = self.next;
         self.next += 1;
-        let play_at = self.delivery.play_at(packet);
+        let play_at = self.delivery.play_at(packet)?;
         self.left.fill(0.0);
         self.right.fill(0.0);
         let render = &mut self.render;
@@ -755,7 +871,7 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
         panic::catch_unwind(AssertUnwindSafe(|| render(Render { channels, play_at })))
             .map_err(|payload| format!("the renderer panicked: {}", panic_message(&*payload)))?;
         if Instant::now() + MIN_LEAD < play_at {
-            let sent = self.delivery.send(packet, &self.left, &self.right);
+            let sent = self.delivery.send(packet, play_at, &self.left, &self.right);
             self.sent = Some(packet);
             self.publish();
             sent?;
@@ -787,8 +903,10 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
     fn wait_until(&mut self, deadline: Instant) -> Result<(), String> {
         let command = self.shared.command();
         loop {
-            let timeout = deadline
-                .min(self.delivery.wake_at())
+            let timeout = self
+                .delivery
+                .wake_at()
+                .map_or(deadline, |wake| deadline.min(wake))
                 .saturating_duration_since(Instant::now())
                 .min(POLL_SLICE);
             let [delivery, rtsp] = poll(
@@ -799,8 +917,9 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
                 timeout,
             );
             if delivery {
-                self.delivery.on_ready();
+                let ready = self.delivery.on_ready();
                 self.publish();
+                ready?;
             }
             if rtsp {
                 self.read_rtsp()?;

@@ -219,6 +219,9 @@ pub(super) fn listen_for_data(state: Arc<State>, key: [u8; 32], reading: Reading
 }
 
 #[cfg(test)]
+mod streams;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::hap::Counted;

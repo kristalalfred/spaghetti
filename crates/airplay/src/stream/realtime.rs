@@ -59,7 +59,7 @@ impl Sockets {
         Offer {
             control_port: self.control_port,
             timing_port: self.timing_port,
-            first_seq: settings.first_seq,
+            first_seq: settings.first_seq as u16,
             first_rtp: settings.first_rtp,
         }
     }
@@ -114,7 +114,7 @@ impl Realtime {
             now = %clock.ntp(now),
             first_plays_at = %clock.ntp(now + settings.latency),
             first_rtp = settings.first_rtp,
-            first_seq = settings.first_seq,
+            first_seq = settings.first_seq as u16,
             latency_frames,
             audio_latency,
             "AirPlay timeline"
@@ -125,7 +125,7 @@ impl Realtime {
             clock,
             timeline: Timeline {
                 anchor: now + settings.latency,
-                first_seq: settings.first_seq,
+                first_seq: settings.first_seq as u16,
                 first_rtp: settings.first_rtp,
             },
             latency_frames,

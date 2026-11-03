@@ -53,7 +53,7 @@ impl Failure {
 
 /// Claude: a connection paired transiently and encrypted, with what the rest
 /// of either handshake derives from the pairing.
-struct Paired {
+pub(crate) struct Paired {
     connection: Connection,
     uri: String,
     session_id: u32,
@@ -63,7 +63,7 @@ struct Paired {
 
 /// Claude: asks for the receiver's `/info`, as OwnTone and pyatv do first,
 /// pairs transiently and encrypts the connection.
-fn pair(
+pub(crate) fn pair(
     mut connection: Connection,
     timeout: Duration,
     abort: &dyn Fn() -> bool,

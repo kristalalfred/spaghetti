@@ -12,6 +12,7 @@ use plist::{Dictionary, Value};
 
 use crate::browse::{Event, InstanceKey, Kind};
 use crate::clock::{Clock, Ntp};
+use crate::ptp::{Endpoint, Peer, Ptp, Timing};
 use crate::receiver::tests::txt;
 use crate::rtsp::{PLIST, Response, decode_response};
 use crate::tlv8::{self, Tlv};
@@ -41,8 +42,12 @@ pub(crate) enum Step {
     Announce,
     PairM1,
     PairM3,
+    /// Claude: a session's SETUP with NTP timing.
     SessionSetup,
+    /// Claude: a realtime stream's SETUP.
     StreamSetup,
+    PtpSessionSetup,
+    BufferedStreamSetup,
     Record,
     Flush,
     Feedback,
@@ -151,8 +156,11 @@ struct State {
     audio_key: Mutex<Option<[u8; 32]>>,
     events: Mutex<Events>,
     connections: Mutex<Vec<TcpStream>>,
+    open_at_accept: Mutex<Vec<Vec<usize>>>,
     anchors: Mutex<Vec<(Instant, Dictionary)>>,
     data: Mutex<Data>,
+    clock: Mutex<Option<(Arc<Ptp>, Endpoint)>>,
+    timing: Mutex<Option<Peer>>,
     stop: AtomicBool,
 }
 
@@ -240,11 +248,16 @@ impl Fake {
             while !state.stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        state
-                            .connections
-                            .lock()
-                            .unwrap()
-                            .push(stream.try_clone().unwrap());
+                        let mut connections = state.connections.lock().unwrap();
+                        let open = connections
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, earlier)| !at_end(earlier))
+                            .map(|(connection, _)| connection)
+                            .collect();
+                        state.open_at_accept.lock().unwrap().push(open);
+                        connections.push(stream.try_clone().unwrap());
+                        drop(connections);
                         let state = state.clone();
                         let connection = count;
                         count += 1;
@@ -484,9 +497,28 @@ impl Fake {
         self.state.events.lock().unwrap().answers.clone()
     }
 
+    /// Claude: the earlier connections the sender still held open when the
+    /// fake accepted `connection`.
+    pub(crate) fn open_when_accepted(&self, connection: usize) -> Vec<usize> {
+        self.state.open_at_accept.lock().unwrap()[connection].clone()
+    }
+
     /// Claude: how many TCP connections the fake has accepted.
     pub(crate) fn accepted(&self) -> usize {
         self.state.connections.lock().unwrap().len()
+    }
+
+    /// Claude: gives the fake a PTP clock, which times with the sender's
+    /// clock at `sender` from the PTP session SETUP on, as a receiver starts
+    /// timing once that SETUP names the sender.
+    pub(crate) fn time_with(&self, clock: Arc<Ptp>, sender: Endpoint) {
+        *self.state.clock.lock().unwrap() = Some((clock, sender));
+    }
+
+    /// Claude: where the fake's timing with the sender stands, once it has
+    /// begun.
+    pub(crate) fn timing(&self) -> Option<Timing> {
+        self.state.timing.lock().unwrap().as_ref().map(Peer::timing)
     }
 
     /// Claude: each SETRATEANCHORTIME's body, as it came, whatever the fake
@@ -526,6 +558,21 @@ impl Drop for Fake {
             let _ = stream.shutdown(Shutdown::Both);
         }
     }
+}
+
+/// Claude: whether the other end has closed `stream`, which a read would
+/// show, looking without taking anything or waiting.
+fn at_end(stream: &TcpStream) -> bool {
+    let mut byte = 0u8;
+    let peeked = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            (&raw mut byte).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    peeked == 0
 }
 
 /// Claude: a TCP socket bound to a localhost port but not listening on it.
@@ -854,6 +901,10 @@ impl Server {
             }
             if setup["timingProtocol"].as_string() == Some("PTP") {
                 assert!(setup.contains_key("timingPeerInfo"));
+                if let Some((clock, sender)) = &*self.state.clock.lock().unwrap() {
+                    let local = self.stream.local_addr().unwrap();
+                    *self.state.timing.lock().unwrap() = Some(clock.add_peer(local, *sender));
+                }
                 let mut peer = Dictionary::new();
                 peer.insert("Addresses".into(), vec![Value::from("127.0.0.1")].into());
                 peer.insert("ID".into(), "127.0.0.1".into());
@@ -970,8 +1021,21 @@ fn step_of(request: &FakeRequest) -> Option<Step> {
             _ => Some(Step::PairM3),
         },
         ("SETUP", _) if request.body.is_empty() => None,
-        ("SETUP", _) if request.plist().contains_key("streams") => Some(Step::StreamSetup),
-        ("SETUP", _) => Some(Step::SessionSetup),
+        ("SETUP", _) => {
+            let setup = request.plist();
+            let buffered = setup
+                .get("streams")
+                .and_then(Value::as_array)
+                .map(|streams| streams[0].as_dictionary().unwrap()["type"].as_unsigned_integer());
+            match buffered {
+                Some(Some(103)) => Some(Step::BufferedStreamSetup),
+                Some(_) => Some(Step::StreamSetup),
+                None if setup["timingProtocol"].as_string() == Some("PTP") => {
+                    Some(Step::PtpSessionSetup)
+                }
+                None => Some(Step::SessionSetup),
+            }
+        }
         ("RECORD", _) => Some(Step::Record),
         ("FLUSH", _) => Some(Step::Flush),
         ("POST", "/feedback") => Some(Step::Feedback),
@@ -1322,7 +1386,7 @@ pub(crate) mod tests {
         fake.advertise_airplay(&browser, REALTIME_AIRPLAY_2_RECORD);
         let renders = Renders::default();
         let settings = Settings {
-            first_seq,
+            first_seq: u32::from(first_seq),
             first_rtp,
             protocol: Some(protocol),
             ..settings()
@@ -1623,7 +1687,7 @@ pub(crate) mod tests {
         let failing = Arc::new(AtomicBool::new(false));
         let tail_from = 30;
         let settings = Settings {
-            first_seq: 0u16.wrapping_sub(tail_from as u16 + 3),
+            first_seq: u32::from(0u16.wrapping_sub(tail_from as u16 + 3)),
             failing_sends: failing.clone(),
             ..settings()
         };

@@ -7,7 +7,7 @@ use tracing::debug;
 
 use super::{
     ALAC_44100_16_2, COMPRESSION_ALAC, Failure, Paired, binary, device_id, dictionary, open_events,
-    pair, port, random_uuid, session_teardown, setup_turned_away_as, stream_teardown, teardown,
+    port, random_uuid, session_teardown, setup_turned_away_as, stream_teardown, teardown,
     with_port,
 };
 use crate::events::EventChannel;
@@ -95,15 +95,15 @@ pub(crate) struct Handshake {
     stream: Option<StreamRef>,
 }
 
-/// Claude: pairs, sets the session up with PTP timing naming this host's
-/// clock as its timing peer, opens the receiver's event connection, records,
+/// Claude: on a paired connection, sets the session up with PTP timing naming
+/// this host's clock as its timing peer, opens the receiver's event connection, records,
 /// and names this host and the receiver as the session's peers, in the order
 /// OwnTone and other buffered senders use, since Samsung, Sonos and TV
 /// receivers are reported to play buffered audio only when RECORD comes
 /// before the stream's SETUP. A handshake that fails after the session's
 /// SETUP tears the session down within `teardown_timeout`.
 pub(crate) fn set_up(
-    connection: Connection,
+    paired: Paired,
     peer: &TimingPeer,
     timeout: Duration,
     teardown_timeout: Duration,
@@ -115,7 +115,7 @@ pub(crate) fn set_up(
         session_id,
         events_keys,
         audio_key,
-    } = pair(connection, timeout, abort)?;
+    } = paired;
     let receiver = connection.peer_addr();
     let reply = setup_turned_away_as(
         &mut connection,
@@ -206,11 +206,13 @@ impl Handshake {
     }
 
     /// Claude: offers the receiver anchors, each made by `anchor` as it goes
-    /// out, until it accepts one: a 400 is offered again after `ANCHOR_RETRY`
-    /// while that is before `deadline`, and once it no longer is, buffered
-    /// audio does not start. Any other answer but 200 ends the handshake as
-    /// `turned_away` says; no answer within `timeout`, or a malformed one,
-    /// fails it. Returns the accepted anchor and when its answer came.
+    /// out, until it accepts one, offering none at or after `deadline`: a 400
+    /// is offered again after `ANCHOR_RETRY` while that is before `deadline`,
+    /// and once it no longer is, buffered audio does not start. Any other
+    /// answer but 200 ends the handshake as `turned_away` says; no answer
+    /// within `timeout`, or a malformed one, fails it. An offer made before
+    /// `deadline` is still taken if its 200 comes after. Returns the accepted
+    /// anchor and when its answer came.
     pub(crate) fn anchor(
         &mut self,
         deadline: Instant,
@@ -219,8 +221,20 @@ impl Handshake {
         anchor: &mut dyn FnMut() -> Result<Anchor, Failure>,
     ) -> Result<(Anchor, Instant), Failure> {
         let mut refusals = 0u32;
+        let ran_out = |refusals| {
+            Failure::Unbuffered(match refusals {
+                0 => "the startup budget ran out before it could be offered an anchor".into(),
+                n => format!(
+                    "it did not accept an anchor before the startup budget ran out \
+                     ({n} answered 400)"
+                ),
+            })
+        };
         loop {
             let offered = anchor()?;
+            if Instant::now() >= deadline {
+                return Err(ran_out(refusals));
+            }
             let body = anchor_body(&offered);
             let response =
                 self.exchange("SETRATEANCHORTIME", Some((PLIST, &body)), timeout, abort)?;
@@ -230,18 +244,15 @@ impl Handshake {
                     debug!(refusals, ?offered, "AirPlay 2 anchor accepted");
                     return Ok((offered, answered_at));
                 }
-                400 if answered_at + ANCHOR_RETRY < deadline => {
+                400 => {
                     refusals += 1;
+                    if answered_at + ANCHOR_RETRY >= deadline {
+                        return Err(ran_out(refusals));
+                    }
                     debug!(refusals, "AirPlay 2 receiver not ready for an anchor yet");
                     if !pause_until(answered_at + ANCHOR_RETRY, abort) {
                         return Err(Failure::Failed("stopped".into()));
                     }
-                }
-                400 => {
-                    return Err(Failure::Unbuffered(format!(
-                        "it did not accept an anchor before the startup budget ran out ({})",
-                        refusal("SETRATEANCHORTIME", &response)
-                    )));
                 }
                 _ => return Err(turned_away("SETRATEANCHORTIME", &response)),
             }
@@ -607,11 +618,12 @@ mod tests {
                 abort,
             )
             .unwrap_or_else(|e| panic!("{e}"));
+            let paired = crate::airplay2::pair(connection, TIMEOUT, abort)?;
             let peer = TimingPeer {
                 clock: ClockIdentity([1, 2, 3, 4, 5, 6, 7, 8]),
                 address: "127.0.0.1".parse().unwrap(),
             };
-            set_up(connection, &peer, TIMEOUT, TEARDOWN, abort)
+            set_up(paired, &peer, TIMEOUT, TEARDOWN, abort)
         }
 
         fn last(fake: &Fake, method: &str) -> FakeRequest {
@@ -761,6 +773,52 @@ mod tests {
         }
 
         #[test]
+        fn no_anchor_is_offered_once_the_budget_has_run_out() {
+            let fake = Fake::start(Behavior::default());
+            let mut handshake = set_up_with(&fake, &|| false).unwrap();
+            let _data = handshake.open_stream(TIMEOUT, &|| false).unwrap();
+            let mut made = 0;
+            let failure = handshake
+                .anchor(Instant::now(), TIMEOUT, &|| false, &mut anchors(&mut made))
+                .unwrap_err();
+            assert_eq!(
+                failure,
+                Failure::Unbuffered(
+                    "the startup budget ran out before it could be offered an anchor".into()
+                )
+            );
+            assert!(!fake.methods().contains(&"SETRATEANCHORTIME".to_owned()));
+        }
+
+        #[test]
+        fn an_anchor_made_past_the_budget_after_a_400_is_not_offered() {
+            let fake = Fake::start(Behavior {
+                anchor_refusals: 1,
+                ..Behavior::default()
+            });
+            let mut handshake = set_up_with(&fake, &|| false).unwrap();
+            let _data = handshake.open_stream(TIMEOUT, &|| false).unwrap();
+            let deadline = Instant::now() + 2 * ANCHOR_RETRY;
+            let mut made = 0;
+            let mut fresh = anchors(&mut made);
+            let mut oversleeping = || {
+                let offered = fresh();
+                if fake.anchors().len() == 1 {
+                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                }
+                offered
+            };
+            let failure = handshake
+                .anchor(deadline, TIMEOUT, &|| false, &mut oversleeping)
+                .unwrap_err();
+            assert!(
+                matches!(&failure, Failure::Unbuffered(reason) if reason.contains("1 answered 400")),
+                "{failure:?}"
+            );
+            assert_eq!(fake.anchors().len(), 1, "the late anchor was not offered");
+        }
+
+        #[test]
         fn anchor_answers_other_than_200_and_400_refuse_unbuffer_or_fail() {
             for (behavior, expected) in [
                 (Rtsp::RefuseAt(Step::Anchor, 501), "Unbuffered"),
@@ -838,12 +896,12 @@ mod tests {
         #[test]
         fn buffered_steps_answered_other_than_200_refuse_or_unbuffer_and_release_what_was_set_up() {
             for (step, status, expected) in [
-                (Step::SessionSetup, 501, "Unbuffered"),
-                (Step::SessionSetup, 500, "Unbuffered"),
-                (Step::SessionSetup, 453, "Refused"),
-                (Step::SessionSetup, 470, "Refused"),
-                (Step::StreamSetup, 501, "Unbuffered"),
-                (Step::StreamSetup, 403, "Refused"),
+                (Step::PtpSessionSetup, 501, "Unbuffered"),
+                (Step::PtpSessionSetup, 500, "Unbuffered"),
+                (Step::PtpSessionSetup, 453, "Refused"),
+                (Step::PtpSessionSetup, 470, "Refused"),
+                (Step::BufferedStreamSetup, 501, "Unbuffered"),
+                (Step::BufferedStreamSetup, 403, "Refused"),
                 (Step::Record, 501, "Unbuffered"),
                 (Step::Record, 453, "Refused"),
                 (Step::SetPeers, 501, "Unbuffered"),
@@ -871,7 +929,7 @@ mod tests {
                 };
                 assert_eq!(kind, expected, "{step:?} {status}: {failure:?}");
                 let bodies = teardown_bodies(&fake);
-                if step == Step::SessionSetup {
+                if step == Step::PtpSessionSetup {
                     assert!(bodies.is_empty(), "{step:?}: nothing to tear down");
                 } else {
                     assert_eq!(bodies.len(), 1, "{step:?}: the session only");

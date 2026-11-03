@@ -101,15 +101,10 @@ impl Timeline {
     }
 
     pub(crate) fn frame_at(&self, frame: i64) -> Instant {
-        let nanos = |frames: u64| {
-            Duration::from_nanos(
-                (u128::from(frames) * NANOS_PER_SECOND / u128::from(SAMPLE_RATE)) as u64,
-            )
-        };
         if frame >= 0 {
-            self.anchor + nanos(frame as u64)
+            self.anchor + span(frame as u64)
         } else {
-            self.anchor - nanos(frame.unsigned_abs())
+            self.anchor - span(frame.unsigned_abs())
         }
     }
 
@@ -136,6 +131,11 @@ impl Timeline {
     pub(crate) fn rtp(&self, frame: i64) -> u32 {
         self.first_rtp.wrapping_add(frame as u32)
     }
+}
+
+/// Claude: how long `frames` frames play, to the nanosecond below.
+pub(crate) fn span(frames: u64) -> Duration {
+    Duration::from_nanos((u128::from(frames) * NANOS_PER_SECOND / u128::from(SAMPLE_RATE)) as u64)
 }
 
 pub(crate) fn frames(duration: Duration) -> u32 {
