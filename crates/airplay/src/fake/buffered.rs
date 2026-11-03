@@ -1,5 +1,6 @@
-use std::io::{ErrorKind, Read};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener};
+use std::io::{self, ErrorKind, Read};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
@@ -9,7 +10,7 @@ use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, Tag};
 use socket2::{Domain, Socket, Type};
 
-use super::{POLL, State, decode_alac};
+use super::{Data, POLL, State, decode_alac};
 
 const LENGTH_LEN: usize = 2;
 const HEADER_LEN: usize = 12;
@@ -37,6 +38,8 @@ pub(crate) enum Reading {
     Never,
     /// Claude: closes the connection once `after` bytes have come.
     ClosingAfter(usize),
+    /// Claude: stops once `after` bytes have come, until the test releases it.
+    UntilReleased(usize),
 }
 
 /// Claude: one packet taken from a buffered stream's data connection, before
@@ -146,9 +149,25 @@ impl Framed {
     }
 }
 
+impl Data {
+    /// Claude: opens the packets the bytes read so far complete, each dated
+    /// when the bytes completing it came. The reading thread only keeps the
+    /// bytes, so that a debug build's decoding never holds the reading up.
+    pub(super) fn open_received(&mut self) {
+        let Some(key) = self.key else {
+            return;
+        };
+        for (at, bytes) in std::mem::take(&mut self.received) {
+            let framed = self.reader.feed(&bytes);
+            self.packets
+                .extend(framed.iter().map(|framed| (at, framed.open(&key))));
+        }
+    }
+}
+
 /// Claude: opens the port a buffered stream's data connection comes to and
-/// reads the one connection it takes as `reading` says, keeping each packet
-/// opened with `key` and when it came, and when the connection ended.
+/// reads the one connection it takes as `reading` says, keeping what came
+/// and when, to be opened with `key`, and when the connection ended.
 pub(super) fn listen_for_data(state: Arc<State>, key: [u8; 32], reading: Reading) -> u16 {
     let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
     socket.set_recv_buffer_size(RECEIVE_BUFFER).unwrap();
@@ -171,7 +190,7 @@ pub(super) fn listen_for_data(state: Arc<State>, key: [u8; 32], reading: Reading
         stream
             .set_read_timeout(Some(Duration::from_millis(20)))
             .unwrap();
-        let mut reader = DataReader::default();
+        state.data.lock().unwrap().key = Some(key);
         let mut taken = 0;
         let mut paused = false;
         let mut chunk = [0u8; 4096];
@@ -196,17 +215,26 @@ pub(super) fn listen_for_data(state: Arc<State>, key: [u8; 32], reading: Reading
                     break Some(Instant::now());
                 }
                 Reading::ClosingAfter(after) => (after - taken).min(chunk.len()),
+                Reading::UntilReleased(after)
+                    if taken >= after && !state.reading_released.load(Ordering::Acquire) =>
+                {
+                    thread::sleep(POLL);
+                    continue;
+                }
+                Reading::UntilReleased(after) if taken < after => (after - taken).min(chunk.len()),
                 _ => chunk.len(),
             };
-            match stream.read(&mut chunk[..limit]) {
+            let read = match reading {
+                Reading::ByteAtATime => read_bytewise(&mut stream, &mut chunk),
+                _ => stream.read(&mut chunk[..limit]),
+            };
+            match read {
                 Ok(0) => break Some(Instant::now()),
                 Ok(n) => {
                     let at = Instant::now();
                     taken += n;
-                    let framed = reader.feed(&chunk[..n]);
                     let mut data = state.data.lock().unwrap();
-                    data.packets
-                        .extend(framed.iter().map(|framed| (at, framed.open(&key))));
+                    data.received.push((at, chunk[..n].to_vec()));
                     data.bytes = taken;
                 }
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
@@ -216,6 +244,30 @@ pub(super) fn listen_for_data(state: Arc<State>, key: [u8; 32], reading: Reading
         state.data.lock().unwrap().ended = end;
     });
     port
+}
+
+/// Claude: reads one byte per call, as many as have come, into `chunk`, so
+/// that a debug build's decoding does not slow the reading down.
+fn read_bytewise(stream: &mut TcpStream, chunk: &mut [u8]) -> io::Result<usize> {
+    if stream.read(&mut chunk[..1])? == 0 {
+        return Ok(0);
+    }
+    let mut taken = 1;
+    while taken < chunk.len() {
+        let got = unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                chunk[taken..].as_mut_ptr().cast(),
+                1,
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if got <= 0 {
+            break;
+        }
+        taken += 1;
+    }
+    Ok(taken)
 }
 
 #[cfg(test)]

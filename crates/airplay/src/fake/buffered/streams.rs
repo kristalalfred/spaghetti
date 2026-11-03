@@ -26,6 +26,9 @@ const STARTING: Duration = Duration::from_secs(15);
 const SENDER: u8 = 250;
 const LEADING: u8 = 248;
 const FOLLOWING: u8 = 252;
+/// Claude: how late a render may come after it is due, the stream's thread
+/// waiting its turn on a machine busy with the other tests.
+const SCHEDULING: Duration = Duration::from_millis(25);
 /// Claude: how far a packet's play time as the stream gave it may lie from
 /// when the receiver plays it, both reading PTP over loopback.
 const TIMED_WITHIN: Duration = Duration::from_millis(2);
@@ -153,10 +156,28 @@ fn requests(fake: &Fake) -> Vec<FakeRequest> {
     fake.requests().into_iter().map(|(_, _, r)| r).collect()
 }
 
+/// Claude: when a packet must reach the fake, by how the fake reads.
+#[derive(Debug, Clone, Copy)]
+enum Receipt {
+    /// Claude: within this long of its render: the stream writes it at once
+    /// to a fake reading as it comes, so this is scheduling and loopback.
+    Within(Duration),
+    /// Claude: before the fake would play it, for a fake that pauses.
+    BeforePlay,
+    /// Claude: unchecked, for a fake reading one byte at a time, whose TCP
+    /// window opens a byte at a time, so that the sender's kernel holds back
+    /// what the stream wrote in time.
+    Unchecked,
+}
+
+const PROMPTLY: Receipt = Receipt::Within(Duration::from_millis(50));
+
 /// Claude: checks that the fake got the packets the renderer was asked for,
 /// in order and whole, each rendered `LATENCY` before the play time the
-/// stream gave it, and played by the fake at that time.
-fn check_played(fake: &Fake, calls: &Calls) {
+/// stream gave it and received as `receipt` says, and played by the fake, by
+/// its reading of the anchor and of its timing now, at the time the stream
+/// gave.
+fn check_played(fake: &Fake, calls: &Calls, receipt: Receipt) {
     let audio = fake.buffered_audio();
     let calls = calls.all();
     assert!(audio.len() >= 50, "{} packets", audio.len());
@@ -166,7 +187,7 @@ fn check_played(fake: &Fake, calls: &Calls) {
         .timestamp
         .wrapping_sub(integer(&anchor, "rtpTime") as u32);
     assert_eq!(skipped % FRAMES_PER_PACKET as u32, 0);
-    for (i, (_, packet)) in audio.iter().enumerate() {
+    for (i, (received, packet)) in audio.iter().enumerate() {
         assert_eq!(call_of(packet), i);
         assert_eq!(packet.ssrc, 0x1200_0000);
         assert_eq!(packet.seq, (first.seq + i as u32) % BUFFERED_SEQUENCES);
@@ -177,11 +198,23 @@ fn check_played(fake: &Fake, calls: &Calls) {
         let (called_at, play_at) = calls[i];
         let lead = play_at - called_at;
         assert!(
-            lead <= LATENCY && lead > LATENCY - Duration::from_millis(25),
+            lead <= LATENCY && lead > LATENCY - SCHEDULING,
             "call {i} rendered {lead:?} ahead"
         );
-        let error = off(plays_at(fake, packet), play_at);
+        let plays = plays_at(fake, packet);
+        let error = off(plays, play_at);
         assert!(error < TIMED_WITHIN, "packet {i} plays {error:?} off");
+        let promptly = match receipt {
+            Receipt::Within(within) => called_at + within,
+            Receipt::BeforePlay => plays,
+            Receipt::Unchecked => continue,
+        };
+        assert!(
+            *received <= promptly && *received < plays,
+            "packet {i} came {:?} after its render, {:?} before it plays",
+            received.saturating_duration_since(called_at),
+            plays.saturating_duration_since(*received)
+        );
     }
 }
 
@@ -263,7 +296,7 @@ fn a_stream_follows_a_leading_receivers_clock_and_each_packet_plays_when_it_said
         counters.bytes_sent,
         counters.packets_sent * BUFFERED_PACKET_LEN as u64
     );
-    check_played(&fake, &calls);
+    check_played(&fake, &calls, PROMPTLY);
 }
 
 #[test]
@@ -290,7 +323,7 @@ fn a_stream_leads_a_following_receiver_and_each_packet_plays_when_it_said() {
         sender.identity().as_u64(),
         "anchored on this host's clock"
     );
-    check_played(&fake, &calls);
+    check_played(&fake, &calls, PROMPTLY);
     stream.finish(Duration::ZERO).wait();
     assert_eq!(teardown_types(&fake), [Some(103), None]);
 }
@@ -329,7 +362,7 @@ fn check_start(delay: Duration, refusals: u32) {
         skipped >= delay && skipped < delay + Duration::from_millis(60),
         "{delay:?}: started {skipped:?} after the anchor"
     );
-    check_played(&fake, &calls);
+    check_played(&fake, &calls, PROMPTLY);
     stream.stop().wait();
 }
 
@@ -532,7 +565,7 @@ fn a_receiver_reading_one_byte_at_a_time_gets_every_packet_whole() {
         >= 60
         && matches!(setup.fake.timing(), Some(Timing::Settled(_)))));
     assert!(streaming(&stream), "{:?}", stream.status());
-    check_played(&setup.fake, &calls);
+    check_played(&setup.fake, &calls, Receipt::Unchecked);
 }
 
 #[test]
@@ -573,7 +606,7 @@ fn a_receiver_pausing_briefly_gets_everything_and_one_pausing_past_the_play_time
         >= 120
         && matches!(setup.fake.timing(), Some(Timing::Settled(_)))));
     assert!(streaming(&stream), "{:?}", stream.status());
-    check_played(&setup.fake, &calls);
+    check_played(&setup.fake, &calls, Receipt::BeforePlay);
 
     let long = Reading::Pausing {
         after: 50_000,
@@ -610,18 +643,6 @@ fn a_receiver_closing_its_data_connection_inside_a_packet_loses_the_stream() {
 }
 
 #[test]
-fn a_stream_to_a_receiver_that_stopped_reading_stops_within_its_bound() {
-    let (setup, stream, _) = reading(Reading::Never, LATENCY);
-    let stopped_at = Instant::now();
-    stream.stop().wait();
-    let took = stopped_at.elapsed();
-    assert!(
-        took < setup.settings.teardown_timeout + PROMPT,
-        "stopping took {took:?}"
-    );
-}
-
-#[test]
 fn finishing_sends_everything_rendered_and_ends_when_it_has_played_out() {
     let (setup, stream, calls) = reading(Reading::Steady, LATENCY);
     assert!(wait_until(STARTING, || setup.fake.buffered_audio().len() >= 40));
@@ -643,15 +664,76 @@ fn finishing_sends_everything_rendered_and_ends_when_it_has_played_out() {
         .len()
         == calls.len()));
     assert_eq!(teardown_types(&setup.fake), [Some(103), None]);
+}
 
-    let (setup, stream, _) = reading(Reading::Never, LATENCY);
-    let finished_at = Instant::now();
-    stream.finish(delay).wait();
+/// Claude: the latency of the tests under send pressure, long enough that the
+/// connection backs up well before any queued packet is due.
+const BACKED_UP: Duration = Duration::from_secs(5);
+
+#[test]
+fn a_stream_with_audio_queued_behind_a_receiver_that_stopped_reading_stops_within_its_bound() {
+    let led = Led::start(Reading::UntilReleased(20_000), BACKED_UP);
+    led.backed_up();
+    let stopped_at = Instant::now();
+    led.stream.stop().wait();
+    let took = stopped_at.elapsed();
     assert!(
-        finished_at.elapsed() <= LATENCY + delay + setup.settings.teardown_timeout + PROMPT,
-        "{:?}",
-        finished_at.elapsed()
+        took < led.setup.settings.teardown_timeout + PROMPT,
+        "stopping took {took:?}"
     );
+}
+
+#[test]
+fn finishing_with_audio_queued_delivers_it_once_the_receiver_reads_again() {
+    let led = Led::start(Reading::UntilReleased(20_000), BACKED_UP);
+    led.backed_up();
+    let Led {
+        setup,
+        stream,
+        calls,
+        ..
+    } = led;
+    let finishing = stream.finish(Duration::ZERO);
+    std::thread::sleep(Duration::from_millis(500));
+    setup.fake.release_reading();
+    assert!(wait_until(BACKED_UP + Duration::from_secs(2), || finishing
+        .is_finished()));
+    let status = finishing.status();
+    finishing.wait();
+    assert!(
+        matches!(status, Status::Streaming(_)),
+        "finishing ended {status:?}"
+    );
+    let rendered = calls.all().len();
+    assert!(wait_until(Duration::from_secs(2), || setup
+        .fake
+        .buffered_audio()
+        .len()
+        == rendered));
+    for (i, (_, packet)) in setup.fake.buffered_audio().iter().enumerate() {
+        assert_eq!(call_of(packet), i);
+    }
+}
+
+#[test]
+fn finishing_with_audio_queued_behind_a_receiver_that_never_reads_again_ends_lost_when_it_is_due() {
+    let led = Led::start(Reading::UntilReleased(20_000), BACKED_UP);
+    led.backed_up();
+    let Led { stream, .. } = led;
+    let finished_at = Instant::now();
+    let finishing = stream.finish(Duration::ZERO);
+    assert!(wait_until(BACKED_UP + Duration::from_secs(2), || finishing
+        .is_finished()));
+    let took = finished_at.elapsed();
+    let Status::Lost(reason) = finishing.status() else {
+        panic!("{:?}", finishing.status())
+    };
+    finishing.wait();
+    assert!(
+        reason.starts_with("the receiver had not taken a packet"),
+        "{reason}"
+    );
+    assert!(took <= BACKED_UP + SCHEDULING, "{took:?}");
 }
 
 /// Claude: the methods each connection the fake took carried, in order.
@@ -1001,4 +1083,396 @@ fn a_password_a_pin_or_a_busy_receiver_at_any_buffered_step_never_gets_realtime_
             }
         }
     }
+}
+
+#[test]
+fn a_receiver_taking_no_anchor_until_its_own_timing_settles_gets_the_stream_once_it_has() {
+    let Setup {
+        fake,
+        browser,
+        settings,
+        ..
+    } = setup(
+        Behavior {
+            anchor_until_timed: true,
+            ..Behavior::default()
+        },
+        FOLLOWING,
+    );
+    let calls = Calls::default();
+    let stream = Stream::start_with(&browser, fake.id(), Ok(settings), calls.renderer());
+    assert!(
+        wait_until(STARTING, || fake.buffered_audio().len() >= 60),
+        "{:?}",
+        stream.status()
+    );
+    assert!(
+        fake.anchors().len() >= 2,
+        "the stream settled leading before the fake had measured its clock"
+    );
+    check_played(&fake, &calls, PROMPTLY);
+}
+
+/// Claude: this host's clock as a test sets it: reading `network` at `host`
+/// on `timeline`.
+struct Own {
+    sender: Arc<Ptp>,
+    timeline: Timeline,
+    host: Instant,
+    network: PtpTime,
+}
+
+impl Own {
+    /// Claude: moves the clock on the same timeline so that every play time
+    /// comes `later` later, as a refined estimate would, at `rate`.
+    fn refine(&self, later: Duration, rate: f64) {
+        let network = PtpTime {
+            nanos: self.network.nanos - later.as_nanos() as u64,
+        };
+        let timebase = Timebase::new(self.timeline, self.host, network, rate).unwrap();
+        self.sender.set_test_timeline(timebase);
+    }
+
+    /// Claude: starts a new epoch of the clock.
+    fn step(&self) {
+        let timeline = Timeline {
+            epoch: self.timeline.epoch + 1,
+            ..self.timeline
+        };
+        let timebase = Timebase::new(timeline, self.host, self.network, 1.0).unwrap();
+        self.sender.set_test_timeline(timebase);
+    }
+}
+
+/// Claude: a stream leading the fake on a clock the test sets.
+struct Led {
+    setup: Setup,
+    stream: Stream,
+    calls: Calls,
+    own: Own,
+}
+
+impl Led {
+    fn start(reading: Reading, latency: Duration) -> Led {
+        let mut setup = setup(
+            Behavior {
+                reading,
+                ..Behavior::default()
+            },
+            FOLLOWING,
+        );
+        setup.settings.latency = latency;
+        let own = Own {
+            sender: setup.sender.clone(),
+            timeline: Timeline {
+                clock: setup.sender.identity(),
+                epoch: 0,
+            },
+            host: Instant::now(),
+            network: PtpTime { nanos: 1 << 40 },
+        };
+        own.refine(Duration::ZERO, 1.0);
+        let calls = Calls::default();
+        let stream = Stream::start_with(
+            &setup.browser,
+            setup.fake.id(),
+            Ok(setup.settings.clone()),
+            calls.renderer(),
+        );
+        assert!(
+            wait_until(STARTING, || streaming(&stream) && calls.all().len() >= 20),
+            "{:?}",
+            stream.status()
+        );
+        Led {
+            setup,
+            stream,
+            calls,
+            own,
+        }
+    }
+
+    /// Claude: waits until rendered packets queue unsent behind a receiver
+    /// that stopped reading, returning how many had been sent.
+    fn backed_up(&self) -> u64 {
+        let sent = || match self.stream.status() {
+            Status::Streaming(counters) => counters.packets_sent,
+            status => panic!("{status:?}"),
+        };
+        assert!(
+            wait_until(Duration::from_secs(15), || self.calls.all().len() as u64
+                > sent() + 5),
+            "no packet queued"
+        );
+        sent()
+    }
+}
+
+/// Claude: every render after the first `from` gave a play time one packet
+/// after the one before, so none was rendered against another mapping.
+fn check_steady(calls: &[(Instant, Instant)], from: usize) {
+    for pair in calls[from..].windows(2) {
+        let step = pair[1].1 - pair[0].1;
+        assert!(
+            step.abs_diff(PACKET_DURATION) < Duration::from_millis(1),
+            "a render {step:?} after the one before"
+        );
+    }
+}
+
+fn leads(calls: &[(Instant, Instant)]) -> impl Iterator<Item = (usize, Duration)> + '_ {
+    calls
+        .iter()
+        .enumerate()
+        .map(|(i, (called_at, play_at))| (i, *play_at - *called_at))
+}
+
+#[test]
+fn a_refined_mapping_delays_the_next_render_to_its_new_due_time() {
+    let led = Led::start(Reading::Steady, LATENCY);
+    let anchors = led.setup.fake.anchors().len();
+    for step in 1..=5 {
+        led.own.refine(Duration::from_millis(20) * step, 1.0);
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    for (i, lead) in leads(&led.calls.all()) {
+        assert!(
+            lead <= LATENCY && lead > LATENCY - SCHEDULING,
+            "call {i} rendered {lead:?} ahead"
+        );
+    }
+    assert_eq!(led.setup.fake.anchors().len(), anchors, "anchored again");
+    assert!(streaming(&led.stream));
+}
+
+#[test]
+fn a_mapping_refined_earlier_is_caught_up_at_once() {
+    let led = Led::start(Reading::Steady, LATENCY);
+    let earlier = Duration::from_millis(20);
+    led.own.refine(Duration::from_millis(100), 1.0);
+    std::thread::sleep(Duration::from_millis(200));
+    led.own.refine(Duration::from_millis(100) - earlier, 1.0);
+    std::thread::sleep(Duration::from_millis(200));
+    for (i, lead) in leads(&led.calls.all()) {
+        assert!(
+            lead <= LATENCY && lead > LATENCY - earlier - SCHEDULING,
+            "call {i} rendered {lead:?} ahead"
+        );
+    }
+}
+
+#[test]
+fn finishing_ends_when_it_first_said_however_the_mapping_is_refined_after() {
+    let Led {
+        setup,
+        stream,
+        calls,
+        own,
+    } = Led::start(Reading::Steady, LATENCY);
+    let delay = Duration::from_millis(100);
+    let finishing = stream.finish(delay);
+    let started = Instant::now();
+    for step in 1..=3 {
+        own.refine(Duration::from_millis(100) * step, 1.0);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    finishing.wait();
+    let returned = Instant::now();
+    let last = calls.all().last().unwrap().1;
+    let end = last + PACKET_DURATION + delay;
+    assert!(returned >= end, "{:?} early", end - returned);
+    assert!(
+        returned < end + setup.settings.teardown_timeout + Duration::from_millis(50),
+        "finishing ran {:?} past its end, {:?} after it started",
+        returned - end,
+        returned - started
+    );
+}
+
+/// Claude: a stream with rendered packets queued unsent behind a receiver
+/// that stopped reading, whose timing then leaves the anchored timeline,
+/// while playing or finishing, ends `Lost` without writing another byte of
+/// them once the receiver reads again, rendering nothing more, and anchoring
+/// nothing new.
+fn check_change_with_audio_queued(finishing: bool) {
+    let latency = Duration::from_secs(5);
+    let led = Led::start(Reading::UntilReleased(20_000), latency);
+    let sent = led.backed_up();
+    let anchors = led.setup.fake.anchors().len();
+    let Led {
+        setup,
+        stream,
+        calls,
+        own,
+    } = led;
+    let (stream, finishing) = if finishing {
+        (None, Some(stream.finish(Duration::from_secs(10))))
+    } else {
+        (Some(stream), None)
+    };
+    let rendered = calls.all().len();
+    own.step();
+    let bound = Duration::from_secs(2);
+    let status = match (&stream, &finishing) {
+        (Some(stream), _) => {
+            assert!(
+                wait_until(bound, || !streaming(stream)),
+                "{:?}",
+                stream.status()
+            );
+            stream.status()
+        }
+        (_, Some(finishing)) => {
+            assert!(wait_until(bound, || finishing.is_finished()));
+            finishing.status()
+        }
+        _ => unreachable!(),
+    };
+    let Status::Lost(reason) = status else {
+        panic!("{status:?}")
+    };
+    assert!(reason.contains("stepped (epoch 0 to 1)"), "{reason}");
+    setup.fake.release_reading();
+    std::thread::sleep(Duration::from_millis(300));
+    let audio = setup.fake.buffered_audio();
+    assert_eq!(audio.len() as u64, sent, "nothing more went out");
+    for (i, (_, packet)) in audio.iter().enumerate() {
+        assert_eq!(call_of(packet), i);
+    }
+    let after = setup.fake.data_bytes() - audio.len() * BUFFERED_PACKET_LEN;
+    assert!(
+        after < BUFFERED_PACKET_LEN,
+        "no packet spliced after a part"
+    );
+    let calls = calls.all();
+    assert!(calls.len() <= rendered + 1, "rendered on after the change");
+    check_steady(&calls, 0);
+    assert_eq!(setup.fake.anchors().len(), anchors);
+    drop((stream, finishing));
+}
+
+#[test]
+fn timing_changing_with_audio_queued_while_playing_ends_without_sending_it() {
+    check_change_with_audio_queued(false);
+}
+
+#[test]
+fn timing_changing_with_audio_queued_while_finishing_ends_without_sending_it() {
+    check_change_with_audio_queued(true);
+}
+
+/// Claude: a stream following a receiver whose clock then goes silent ends
+/// `Lost` once its timing's holdover runs out, while playing or finishing.
+fn check_silent_master(finishing: bool) {
+    let Setup {
+        fake,
+        browser,
+        settings,
+        ..
+    } = setup(Behavior::default(), LEADING);
+    let calls = Calls::default();
+    let stream = Stream::start_with(&browser, fake.id(), Ok(settings), calls.renderer());
+    assert!(
+        wait_until(STARTING, || fake.buffered_audio().len() >= 30),
+        "{:?}",
+        stream.status()
+    );
+    let holdover = Duration::from_secs(15);
+    let silent_at = Instant::now();
+    fake.stop_timing();
+    let bound = holdover + Duration::from_secs(3);
+    let status = if finishing {
+        let finishing = stream.finish(Duration::from_secs(30));
+        assert!(wait_until(bound, || finishing.is_finished()));
+        finishing.status()
+    } else {
+        assert!(wait_until(bound, || !streaming(&stream)));
+        stream.status()
+    };
+    let lost_after = silent_at.elapsed();
+    let Status::Lost(reason) = status else {
+        panic!("{status:?}")
+    };
+    assert!(
+        reason.starts_with("PTP timing with the receiver was lost"),
+        "{reason}"
+    );
+    assert!(
+        lost_after >= holdover - Duration::from_millis(500),
+        "lost {lost_after:?} after the silence, which holdover counts from the last exchange"
+    );
+}
+
+#[test]
+fn a_stream_whose_receivers_clock_falls_silent_is_lost_after_holdover_while_playing() {
+    check_silent_master(false);
+}
+
+#[test]
+fn a_stream_whose_receivers_clock_falls_silent_is_lost_after_holdover_while_finishing() {
+    check_silent_master(true);
+}
+
+#[test]
+fn a_malformed_or_closed_answer_at_a_buffered_step_fails_without_fallback_and_lets_go() {
+    for behavior in [
+        Rtsp::MalformedAt(Step::Anchor),
+        Rtsp::CloseAt(Step::BufferedStreamSetup),
+        Rtsp::CloseAt(Step::SetPeers),
+    ] {
+        let Setup {
+            fake,
+            browser,
+            sender,
+            settings,
+            ..
+        } = setup(
+            Behavior {
+                rtsp: behavior,
+                ..Behavior::default()
+            },
+            FOLLOWING,
+        );
+        let stream = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(settings),
+            Calls::default().renderer(),
+        );
+        assert!(
+            wait_until(STARTING, || matches!(
+                stream.status(),
+                Status::Unreachable(_)
+            )),
+            "{behavior:?}: {:?}",
+            stream.status()
+        );
+        assert!(
+            wait_until(Duration::from_secs(1), || fake.closed(0).is_some()),
+            "{behavior:?}: the connection was kept"
+        );
+        assert_eq!(fake.accepted(), 1, "{behavior:?}: fell back");
+        assert!(
+            wait_until(Duration::from_secs(1), || Arc::strong_count(&sender) == 1),
+            "{behavior:?}: the timing was kept"
+        );
+    }
+}
+
+#[test]
+fn a_play_time_the_timeline_cannot_say_after_streaming_starts_loses_the_stream() {
+    let led = Led::start(Reading::Steady, LATENCY);
+    let anchors = led.setup.fake.anchors().len();
+    led.own.refine(Duration::ZERO, f64::MIN_POSITIVE);
+    assert!(wait_until(Duration::from_secs(2), || !streaming(
+        &led.stream
+    )));
+    let Status::Lost(reason) = led.stream.status() else {
+        panic!("{:?}", led.stream.status())
+    };
+    assert!(
+        reason.contains("beyond what the receiver's timeline can say"),
+        "{reason}"
+    );
+    assert_eq!(led.setup.fake.anchors().len(), anchors);
 }

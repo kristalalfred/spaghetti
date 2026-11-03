@@ -127,6 +127,8 @@ impl Stream {
             .command
             .store(Command::Finish as u8, Ordering::Release);
         Finishing {
+            #[cfg(test)]
+            shared: self.shared.clone(),
             thread: self.thread.take(),
         }
     }
@@ -142,6 +144,8 @@ impl Stream {
             .command
             .store(Command::Stop as u8, Ordering::Release);
         Finishing {
+            #[cfg(test)]
+            shared: self.shared.clone(),
             thread: self.thread.take(),
         }
     }
@@ -165,12 +169,23 @@ impl Drop for Stream {
 /// Claude: a stream playing out its last packets, or tearing down. The
 /// receiver is still taken until it is finished.
 pub struct Finishing {
+    #[cfg(test)]
+    shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Finishing {
     pub fn is_finished(&self) -> bool {
         self.thread.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn status(&self) -> Status {
+        self.shared
+            .status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Codex: blocks until the session's thread has torn down and released
@@ -751,7 +766,7 @@ impl Delivery {
                 realtime.answer_control();
                 Ok(())
             }
-            Delivery::Buffered(buffered) => buffered.flush(Instant::now()),
+            Delivery::Buffered(buffered) => buffered.flush(),
         }
     }
 
@@ -760,7 +775,7 @@ impl Delivery {
     fn upkeep(&mut self, now: Instant) -> Result<(), String> {
         match self {
             Delivery::Realtime(realtime) => realtime.upkeep(now),
-            Delivery::Buffered(buffered) => buffered.upkeep(now),
+            Delivery::Buffered(buffered) => buffered.upkeep(),
         }
     }
 
@@ -805,43 +820,63 @@ enum End {
 }
 
 impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
+    /// Claude: steps until the stream ends. Each step brings the delivery up
+    /// to date first, then paces and renders, or waits out the finish, with
+    /// what that update left, so a packet is rendered by the same reading of
+    /// the receiver's timeline as the one that said when it was due.
     fn play(&mut self) -> End {
         let mut finish_at = None;
         loop {
-            let step = match self.shared.command() {
-                Command::Stop => return End::Stopped,
-                Command::Finish => {
-                    let end = match finish_at {
-                        Some(end) => end,
-                        None => match self.played_out() {
-                            Ok(Some(end)) => *finish_at.insert(end),
-                            Ok(None) => return End::Finished,
-                            Err(reason) => return End::Lost(reason),
-                        },
+            let command = self.shared.command();
+            if command == Command::Stop {
+                return End::Stopped;
+            }
+            let step = self
+                .delivery
+                .upkeep(Instant::now())
+                .and_then(|()| match command {
+                    Command::Play => self.play_when_due().map(|()| false),
+                    _ => self.finish_step(&mut finish_at),
+                });
+            match step {
+                Ok(true) => return End::Finished,
+                Ok(false) => {}
+                Err(reason) => {
+                    return match self.shared.command() {
+                        Command::Stop => End::Stopped,
+                        _ => End::Lost(reason),
                     };
-                    if Instant::now() >= end {
-                        return End::Finished;
-                    }
-                    self.wait_until(end)
                 }
-                Command::Play => self.delivery.play_at(self.next).and_then(|play_at| {
-                    let due = play_at - self.settings.latency;
-                    self.wait_until(due).and_then(|()| {
-                        if self.shared.command() == Command::Play && Instant::now() >= due {
-                            self.play_next()
-                        } else {
-                            Ok(())
-                        }
-                    })
-                }),
-            };
-            if let Err(reason) = step {
-                return match self.shared.command() {
-                    Command::Stop => End::Stopped,
-                    _ => End::Lost(reason),
-                };
             }
         }
+    }
+
+    /// Claude: renders the next packet once it is due, answering the receiver
+    /// at least once first.
+    fn play_when_due(&mut self) -> Result<(), String> {
+        let due = self.delivery.play_at(self.next)? - self.settings.latency;
+        self.pass(due)?;
+        if self.shared.command() == Command::Play && Instant::now() >= due {
+            self.play_next()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Claude: whether finishing is over: it ends when the last packet sent
+    /// has played and `playout_delay` after, fixed when finishing starts.
+    fn finish_step(&mut self, finish_at: &mut Option<Instant>) -> Result<bool, String> {
+        let end = match *finish_at {
+            Some(end) => end,
+            None => match self.played_out()? {
+                Some(end) => *finish_at.insert(end),
+                None => return Ok(true),
+            },
+        };
+        if Instant::now() >= end {
+            return Ok(true);
+        }
+        self.pass(end).map(|()| false)
     }
 
     /// Claude: when the last packet sent has played, plus `playout_delay`, or
@@ -897,39 +932,35 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
             .set_status(Status::Streaming(self.delivery.counters()));
     }
 
-    /// Claude: answers the receiver and keeps the delivery up until
-    /// `deadline`, or until the command changes, polling once even when the
-    /// deadline has passed.
-    fn wait_until(&mut self, deadline: Instant) -> Result<(), String> {
-        let command = self.shared.command();
-        loop {
-            let timeout = self
-                .delivery
-                .wake_at()
-                .map_or(deadline, |wake| deadline.min(wake))
-                .saturating_duration_since(Instant::now())
-                .min(POLL_SLICE);
-            let [delivery, rtsp] = poll(
-                [
-                    self.delivery.interest(),
-                    readable(self.session.connection.fd()),
-                ],
-                timeout,
-            );
-            if delivery {
-                let ready = self.delivery.on_ready();
-                self.publish();
-                ready?;
-            }
-            if rtsp {
-                self.read_rtsp()?;
-            }
-            self.keep_alive()?;
-            self.delivery.upkeep(Instant::now())?;
-            if Instant::now() >= deadline || self.shared.command() != command {
-                return Ok(());
-            }
+    /// Claude: answers the receiver once, waiting for something to answer
+    /// until `deadline`, the delivery's next wake or a poll slice, whichever
+    /// comes first; nothing once stopped.
+    fn pass(&mut self, deadline: Instant) -> Result<(), String> {
+        let timeout = self
+            .delivery
+            .wake_at()
+            .map_or(deadline, |wake| deadline.min(wake))
+            .saturating_duration_since(Instant::now())
+            .min(POLL_SLICE);
+        let [delivery, rtsp] = poll(
+            [
+                self.delivery.interest(),
+                readable(self.session.connection.fd()),
+            ],
+            timeout,
+        );
+        if self.shared.command() == Command::Stop {
+            return Ok(());
         }
+        if delivery {
+            let ready = self.delivery.on_ready();
+            self.publish();
+            ready?;
+        }
+        if rtsp {
+            self.read_rtsp()?;
+        }
+        self.keep_alive()
     }
 
     fn read_rtsp(&mut self) -> Result<(), String> {

@@ -66,6 +66,10 @@ pub(crate) enum Rtsp {
     /// Claude: answers this step only after this long.
     SlowAt(Step, Duration),
     RefuseAt(Step, u16),
+    /// Claude: answers this step with something that is not RTSP.
+    MalformedAt(Step),
+    /// Claude: closes the connection at this step instead of answering.
+    CloseAt(Step),
     SilentAfterRecord,
 }
 
@@ -96,6 +100,9 @@ pub(crate) struct Behavior {
     /// Claude: how many anchors the fake answers 400 before taking one, as a
     /// receiver that has not yet measured the sender's clock does.
     pub(crate) anchor_refusals: u32,
+    /// Claude: answers anchors 400 until its own timing with the sender has
+    /// settled.
+    pub(crate) anchor_until_timed: bool,
     pub(crate) reading: Reading,
 }
 
@@ -161,12 +168,16 @@ struct State {
     data: Mutex<Data>,
     clock: Mutex<Option<(Arc<Ptp>, Endpoint)>>,
     timing: Mutex<Option<Peer>>,
+    reading_released: AtomicBool,
     stop: AtomicBool,
 }
 
 /// Claude: what came over a buffered stream's data connection.
 #[derive(Default)]
 struct Data {
+    key: Option<[u8; 32]>,
+    received: Vec<(Instant, Vec<u8>)>,
+    reader: DataReader,
     packets: Vec<(Instant, BufferedPacket)>,
     bytes: usize,
     ended: Option<Instant>,
@@ -515,6 +526,17 @@ impl Fake {
         *self.state.clock.lock().unwrap() = Some((clock, sender));
     }
 
+    /// Claude: ends the fake's timing with the sender, so that its clock
+    /// goes silent to the sender.
+    pub(crate) fn stop_timing(&self) {
+        self.state.timing.lock().unwrap().take();
+    }
+
+    /// Claude: lets a data connection read `UntilReleased` read on.
+    pub(crate) fn release_reading(&self) {
+        self.state.reading_released.store(true, Ordering::Release);
+    }
+
     /// Claude: where the fake's timing with the sender stands, once it has
     /// begun.
     pub(crate) fn timing(&self) -> Option<Timing> {
@@ -530,7 +552,9 @@ impl Fake {
     /// Claude: each packet of the buffered stream's data connection as it
     /// came, opened with the key the stream's SETUP sent.
     pub(crate) fn buffered_audio(&self) -> Vec<(Instant, BufferedPacket)> {
-        self.state.data.lock().unwrap().packets.clone()
+        let mut data = self.state.data.lock().unwrap();
+        data.open_received();
+        data.packets.clone()
     }
 
     /// Claude: how many bytes the fake has read from the data connection.
@@ -713,6 +737,18 @@ impl Server {
                     continue;
                 }
                 (Rtsp::IgnoreAt(ignored), Some(step)) if ignored == step => continue,
+                (Rtsp::CloseAt(closing), Some(step)) if closing == step => {
+                    let _ = self.stream.shutdown(Shutdown::Both);
+                    continue;
+                }
+                (Rtsp::MalformedAt(malformed), Some(step)) if malformed == step => {
+                    let mut garbage = b"HTTP/1.1 nonsense\r\n\r\n".to_vec();
+                    if let Some(channel) = &mut self.channel {
+                        garbage = channel.seal(&garbage);
+                    }
+                    let _ = self.stream.write_all(&garbage);
+                    continue;
+                }
                 (Rtsp::SlowAt(slow, delay), Some(step)) if slow == step => thread::sleep(delay),
                 _ => {}
             }
@@ -926,9 +962,15 @@ impl Server {
     /// Claude: keeps each anchor and takes it once it has turned away
     /// `anchor_refusals` with 400.
     fn anchor(&self, request: &FakeRequest) -> Answer {
+        let timed = matches!(
+            self.state.timing.lock().unwrap().as_ref().map(Peer::timing),
+            Some(Timing::Settled(_))
+        );
         let mut anchors = self.state.anchors.lock().unwrap();
         anchors.push((Instant::now(), request.plist()));
-        if anchors.len() as u32 <= self.behavior.anchor_refusals {
+        if anchors.len() as u32 <= self.behavior.anchor_refusals
+            || (self.behavior.anchor_until_timed && !timed)
+        {
             Answer::status(status_line(400))
         } else {
             Answer::ok()

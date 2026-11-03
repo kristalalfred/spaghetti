@@ -94,6 +94,7 @@ impl Buffered {
         left: &[f32; FRAMES_PER_PACKET],
         right: &[f32; FRAMES_PER_PACKET],
     ) -> Result<(), String> {
+        self.still_timed()?;
         let seq = self.first_seq.wrapping_add(packet as u32);
         let rtp = self
             .anchor
@@ -103,22 +104,30 @@ impl Buffered {
         let write = |out: &mut [u8; BUFFERED_PACKET_LEN]| {
             write_buffered_packet(out, seq, rtp, FORMAT.ssrc(), left, right, key)
         };
-        self.outbox.push(write, play_at, Instant::now())
+        self.outbox.push(write, play_at)
     }
 
     pub(super) fn interest(&self) -> libc::pollfd {
         self.outbox.interest()
     }
 
-    pub(super) fn flush(&mut self, now: Instant) -> Result<(), String> {
-        self.outbox.flush(now)
+    pub(super) fn flush(&mut self) -> Result<(), String> {
+        self.still_timed()?;
+        self.outbox.flush()
     }
 
     /// Claude: takes the latest timebase, ending the stream once timing has
     /// left the anchored timeline, and sends what the connection takes.
-    pub(super) fn upkeep(&mut self, now: Instant) -> Result<(), String> {
+    pub(super) fn upkeep(&mut self) -> Result<(), String> {
         self.timebase = on_timeline(self.anchor.timeline, self.peer.timing())?;
-        self.outbox.flush(now)
+        self.outbox.flush()
+    }
+
+    /// Claude: ends the stream once timing has left the anchored timeline,
+    /// before anything more is written for it, keeping the timebase the step
+    /// paced by; only `upkeep` takes a newer one.
+    fn still_timed(&self) -> Result<(), String> {
+        on_timeline(self.anchor.timeline, self.peer.timing()).map(drop)
     }
 }
 
@@ -253,7 +262,6 @@ impl Outbox {
         &mut self,
         write: impl FnOnce(&mut [u8; BUFFERED_PACKET_LEN]) -> usize,
         deadline: Instant,
-        now: Instant,
     ) -> Result<(), String> {
         if self.queued == self.slots.len() {
             return Err(format!(
@@ -266,7 +274,7 @@ impl Outbox {
         slot.len = write(&mut slot.bytes);
         slot.deadline = deadline;
         self.queued += 1;
-        self.flush(now)
+        self.flush()
     }
 
     /// Claude: the socket, writable when packets wait.
@@ -282,10 +290,12 @@ impl Outbox {
         }
     }
 
-    /// Claude: writes what the connection takes without blocking.
-    pub(super) fn flush(&mut self, now: Instant) -> Result<(), String> {
+    /// Claude: writes what the connection takes without blocking, looking at
+    /// the clock again before each write.
+    pub(super) fn flush(&mut self) -> Result<(), String> {
         while self.queued > 0 {
             let slot = &self.slots[self.head];
+            let now = Instant::now();
             if now >= slot.deadline {
                 return Err(format!(
                     "the receiver had not taken a packet {:?} after it was due to play",
@@ -422,7 +432,7 @@ mod tests {
     fn keep_flushing(outbox: &mut Outbox, until: Instant) -> Result<(), String> {
         while Instant::now() < until {
             thread::sleep(Duration::from_millis(1));
-            outbox.flush(Instant::now())?;
+            outbox.flush()?;
         }
         Ok(())
     }
@@ -433,7 +443,7 @@ mod tests {
         let until = Instant::now() + within;
         while outbox.interest().fd >= 0 && Instant::now() < until {
             thread::sleep(Duration::from_millis(2));
-            outbox.flush(Instant::now())?;
+            outbox.flush()?;
         }
         Ok(())
     }
@@ -497,7 +507,7 @@ mod tests {
         let mut key = Counted::new(&KEY);
         for n in 0..count as u32 {
             let now = Instant::now();
-            outbox.push(packet(n, &mut key), now + FAR, now).unwrap();
+            outbox.push(packet(n, &mut key), now + FAR).unwrap();
         }
         drain(&mut outbox, Duration::from_secs(10)).unwrap();
         let (packets, held) = reading.join().unwrap();
@@ -534,7 +544,7 @@ mod tests {
                 };
                 sent = sent
                     .and_then(|()| keep_flushing(&mut outbox, at))
-                    .and_then(|()| outbox.push(copy, at + lead, Instant::now()));
+                    .and_then(|()| outbox.push(copy, at + lead));
             }
             let sent = sent.and_then(|()| drain(&mut outbox, Duration::from_secs(5)));
             if survives {
@@ -566,7 +576,7 @@ mod tests {
         let mut n = 0;
         let reason = loop {
             let now = Instant::now();
-            if let Err(reason) = outbox.push(packet(n, &mut key), now + lead, now) {
+            if let Err(reason) = outbox.push(packet(n, &mut key), now + lead) {
                 break reason;
             }
             if outbox.interest().fd >= 0 {
@@ -594,7 +604,7 @@ mod tests {
         let mut accepted = 0;
         let reason = loop {
             let now = Instant::now();
-            match outbox.push(packet(accepted, &mut key), now + FAR, now) {
+            match outbox.push(packet(accepted, &mut key), now + FAR) {
                 Ok(()) => accepted += 1,
                 Err(reason) => break reason,
             }
@@ -640,7 +650,7 @@ mod tests {
                 *out = *packet;
                 LEN
             };
-            outbox.push(copy, due, Instant::now()).unwrap();
+            outbox.push(copy, due).unwrap();
             if outbox.partly_written() > 0 {
                 return n + 1;
             }
@@ -659,7 +669,7 @@ mod tests {
             LEN
         };
         let now = Instant::now();
-        let reason = outbox.push(copy, now, now).unwrap_err();
+        let reason = outbox.push(copy, now).unwrap_err();
         assert!(
             reason.starts_with("the receiver had not taken a packet"),
             "{reason}"
@@ -680,7 +690,7 @@ mod tests {
         thread::sleep(due.saturating_duration_since(Instant::now()));
         let reading = read(receiver, 64 * 1024, None, usize::MAX);
         thread::sleep(Duration::from_millis(100));
-        let reason = outbox.flush(Instant::now()).unwrap_err();
+        let reason = outbox.flush().unwrap_err();
         assert!(
             reason.starts_with("the receiver had not taken a packet"),
             "{reason}"
@@ -713,6 +723,145 @@ mod tests {
     }
 
     #[test]
+    fn a_packet_due_while_it_is_being_made_is_not_written_or_counted() {
+        let (sender, receiver) = connection();
+        let reading = read(receiver, 4096, None, LEN);
+        let mut outbox = Outbox::new(sender, 4).unwrap();
+        let packets = run(1);
+        let due = Instant::now() + Duration::from_millis(50);
+        let slowly = |out: &mut [u8; LEN]| {
+            thread::sleep(Duration::from_millis(100));
+            *out = packets[0];
+            LEN
+        };
+        let reason = outbox.push(slowly, due).unwrap_err();
+        assert!(
+            reason.starts_with("the receiver had not taken a packet"),
+            "{reason}"
+        );
+        assert_eq!(outbox.counters(), Counters::default());
+        drop(outbox);
+        assert_eq!(reading.join().unwrap(), (vec![], 0), "nothing was written");
+    }
+
+    mod timed {
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        use super::*;
+        use crate::fake::wait_until;
+        use crate::ptp::{Config, Ptp, PtpTime};
+        use crate::stream::Settings;
+
+        const LONG: Duration = Duration::from_secs(5);
+
+        /// Claude: a peer this host's clock leads, once settled, toward a
+        /// receiver's clock that never answers, and that clock.
+        fn leading() -> (Arc<Ptp>, Arc<Ptp>, Peer) {
+            let config = |priority1| Config {
+                event_port: 0,
+                general_port: 0,
+                priority1,
+            };
+            let (clock, silent) = (
+                Ptp::bind(config(250)).unwrap(),
+                Ptp::bind(config(252)).unwrap(),
+            );
+            let local = SocketAddr::from(([127, 0, 0, 1], 0));
+            let peer = clock.add_peer(local, silent.endpoint(local));
+            assert!(wait_until(Duration::from_secs(5), || matches!(
+                peer.timing(),
+                Timing::Settled(_)
+            )));
+            (clock, silent, peer)
+        }
+
+        #[test]
+        fn a_flush_once_timing_has_left_the_anchored_timeline_writes_nothing_more() {
+            let (clock, _silent, peer) = leading();
+            let Timing::Settled(timebase) = peer.timing() else {
+                unreachable!()
+            };
+            let anchor = Anchor {
+                rtp: 0,
+                network: timebase.network(Instant::now() + LONG).unwrap(),
+                timeline: timebase.timeline(),
+            };
+            let (sender, receiver) = connection();
+            let settings = Settings {
+                latency: LONG,
+                first_seq: 0,
+                ..Settings::new().unwrap()
+            };
+            let audio = BufferedAudio {
+                data: sender,
+                key: Counted::new(&KEY),
+                anchor,
+                anchored_at: Instant::now(),
+            };
+            let mut buffered = Buffered::start(audio, peer, &settings).unwrap();
+            let silence = [0.0; FRAMES_PER_PACKET];
+            let mut packet = buffered.first_packet();
+            while buffered.interest().fd < 0 {
+                let play_at = buffered.play_at(packet).unwrap();
+                buffered.send(packet, play_at, &silence, &silence).unwrap();
+                packet += 1;
+            }
+            let sent = buffered.counters().packets_sent;
+            assert!(packet - buffered.first_packet() > sent, "nothing queued");
+
+            let stepped = Timeline {
+                epoch: 1,
+                ..timebase.timeline()
+            };
+            let reads = PtpTime { nanos: 1 << 40 };
+            clock.set_test_timeline(Timebase::new(stepped, Instant::now(), reads, 1.0).unwrap());
+            thread::sleep(Duration::from_millis(100));
+            let reading = read(receiver, 64 * 1024, None, usize::MAX);
+            thread::sleep(Duration::from_millis(100));
+            assert!(buffered.interest().fd >= 0);
+            let reason = buffered.flush().unwrap_err();
+            assert!(reason.contains("stepped (epoch 0 to 1)"), "{reason}");
+            let play_at = Instant::now() + LONG;
+            let reason = buffered
+                .send(packet, play_at, &silence, &silence)
+                .unwrap_err();
+            assert!(reason.contains("stepped (epoch 0 to 1)"), "{reason}");
+            assert_eq!(buffered.counters().packets_sent, sent);
+            drop(buffered);
+            let (packets, held) = reading.join().unwrap();
+            assert_eq!(packets.len() as u64, sent, "nothing more went out");
+            assert!(held < LEN);
+        }
+
+        #[test]
+        fn an_anchor_the_timeline_cannot_say_leaves_buffered_audio_unstarted() {
+            let (clock, _silent, peer) = leading();
+            let Timing::Settled(timebase) = peer.timing() else {
+                unreachable!()
+            };
+            let ending = PtpTime {
+                nanos: u64::MAX - 200_000_000,
+            };
+            let near_its_end =
+                Timebase::new(timebase.timeline(), Instant::now(), ending, 1.0).unwrap();
+            clock.set_test_timeline(near_its_end);
+            assert!(wait_until(Duration::from_millis(150), || peer.timing()
+                == Timing::Settled(near_its_end)));
+            let settings = Settings {
+                latency: Duration::from_millis(300),
+                ..Settings::new().unwrap()
+            };
+            assert_eq!(
+                anchor_now(&peer, &settings),
+                Err(Failure::Unbuffered(
+                    "its PTP timeline cannot say when to start".into()
+                ))
+            );
+        }
+    }
+
+    #[test]
     fn a_receiver_closing_mid_packet_fails_the_next_writes() {
         let (sender, receiver) = connection();
         let mut outbox = Outbox::new(sender, 50).unwrap();
@@ -721,12 +870,8 @@ mod tests {
         let reading = read(receiver.try_clone().unwrap(), 4096, None, taken);
         let mut key = Counted::new(&KEY);
         let far = Instant::now() + FAR;
-        outbox
-            .push(packet(0, &mut key), far, Instant::now())
-            .unwrap();
-        outbox
-            .push(packet(1, &mut key), far, Instant::now())
-            .unwrap();
+        outbox.push(packet(0, &mut key), far).unwrap();
+        outbox.push(packet(1, &mut key), far).unwrap();
         let (packets, held) = reading.join().unwrap();
         check_run(&packets, 1);
         assert_eq!(held, 600, "the receiver stopped inside the second packet");
@@ -736,7 +881,7 @@ mod tests {
         let started = Instant::now();
         let mut n = 2;
         let reason = loop {
-            if let Err(reason) = outbox.push(packet(n, &mut key), far, Instant::now()) {
+            if let Err(reason) = outbox.push(packet(n, &mut key), far) {
                 break reason;
             }
             assert!(
