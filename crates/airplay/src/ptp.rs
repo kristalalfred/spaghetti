@@ -1,5 +1,12 @@
+mod datagram;
+mod runtime;
+mod servo;
+mod wire;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::os::unix::net::UnixDatagram;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
@@ -16,11 +23,8 @@ impl ClockIdentity {
     }
 }
 
-/// Claude: which numbers a timebase's times are: the grandmaster's clock, and
-/// an epoch that changes whenever that clock's time stops continuing what it
-/// read before (a phase step under the same identity). A time from one
-/// timeline means nothing on another; an anchor given on an older one must be
-/// given again.
+/// Codex: identifies the grandmaster and its phase epoch. A stream ends if
+/// its anchored timeline changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Timeline {
     pub(crate) clock: ClockIdentity,
@@ -45,10 +49,12 @@ impl PtpTime {
         ((u128::from(self.nanos % NANOS_PER_SECOND) << 64) / u128::from(NANOS_PER_SECOND)) as u64
     }
 
-    pub(crate) fn after(self, duration: Duration) -> PtpTime {
-        PtpTime {
-            nanos: self.nanos + duration.as_nanos() as u64,
-        }
+    pub(crate) fn after(self, duration: Duration) -> Option<PtpTime> {
+        Some(PtpTime {
+            nanos: self
+                .nanos
+                .checked_add(u64::try_from(duration.as_nanos()).ok()?)?,
+        })
     }
 }
 
@@ -66,13 +72,21 @@ pub(crate) struct Timebase {
 impl Timebase {
     /// Claude: the timeline reads `network` at host instant `host` and
     /// advances `rate` seconds per host second.
-    pub(crate) fn new(timeline: Timeline, host: Instant, network: PtpTime, rate: f64) -> Self {
-        Timebase {
+    pub(crate) fn new(
+        timeline: Timeline,
+        host: Instant,
+        network: PtpTime,
+        rate: f64,
+    ) -> Option<Self> {
+        if !rate.is_finite() || rate <= 0.0 {
+            return None;
+        }
+        Some(Timebase {
             timeline,
             host,
             network,
             rate,
-        }
+        })
     }
 
     pub(crate) fn timeline(&self) -> Timeline {
@@ -80,25 +94,37 @@ impl Timebase {
     }
 
     /// Claude: the timeline's time at host instant `at`.
-    pub(crate) fn network(&self, at: Instant) -> PtpTime {
-        let host_nanos = signed_nanos(at, self.host);
-        let nanos = self.network.nanos as i128 + (host_nanos as f64 * self.rate).round() as i128;
-        PtpTime {
-            nanos: nanos.max(0) as u64,
-        }
+    pub(crate) fn network(&self, at: Instant) -> Option<PtpTime> {
+        let delta = (signed_nanos(at, self.host) as f64 * self.rate).round();
+        let delta = checked_nanos(delta)?;
+        let nanos = i128::from(self.network.nanos).checked_add(delta)?;
+        Some(PtpTime {
+            nanos: u64::try_from(nanos).ok()?,
+        })
     }
 
     /// Claude: the host instant at which the timeline reads `at`.
-    pub(crate) fn host(&self, at: PtpTime) -> Instant {
-        let network_nanos = at.nanos as i128 - self.network.nanos as i128;
-        let host_nanos = (network_nanos as f64 / self.rate).round() as i128;
-        let offset = Duration::from_nanos(host_nanos.unsigned_abs() as u64);
-        if host_nanos >= 0 {
-            self.host + offset
+    pub(crate) fn host(&self, at: PtpTime) -> Option<Instant> {
+        let delta = (i128::from(at.nanos) - i128::from(self.network.nanos)) as f64 / self.rate;
+        let nanos = checked_nanos(delta.round())?;
+        let magnitude = nanos.unsigned_abs();
+        let offset = Duration::new(
+            u64::try_from(magnitude / u128::from(NANOS_PER_SECOND)).ok()?,
+            (magnitude % u128::from(NANOS_PER_SECOND)) as u32,
+        );
+        if nanos >= 0 {
+            self.host.checked_add(offset)
         } else {
-            self.host - offset
+            self.host.checked_sub(offset)
         }
     }
+}
+
+fn checked_nanos(nanos: f64) -> Option<i128> {
+    if !nanos.is_finite() || !(i128::MIN as f64..i128::MAX as f64).contains(&nanos) {
+        return None;
+    }
+    Some(nanos as i128)
 }
 
 fn signed_nanos(at: Instant, from: Instant) -> i128 {
@@ -155,36 +181,148 @@ impl Config {
 
 /// Claude: this host's PTP clock. One per process holds UDP 319 and 320 for
 /// as long as any stream holds it.
-pub(crate) struct Ptp {}
+pub(crate) struct Ptp {
+    identity: ClockIdentity,
+    event_port: u16,
+    general_port: u16,
+    control: runtime::Control,
+    thread: Option<JoinHandle<()>>,
+    next_peer: AtomicU64,
+    shared_registry: Option<&'static Registry>,
+}
+
+struct Registry {
+    clock: Mutex<Option<Weak<Ptp>>>,
+    released: Condvar,
+}
+
+impl Registry {
+    const fn new() -> Self {
+        Self {
+            clock: Mutex::new(None),
+            released: Condvar::new(),
+        }
+    }
+
+    fn acquire(&'static self, config: Config) -> Result<Arc<Ptp>, String> {
+        let mut slot = self.clock.lock().unwrap();
+        loop {
+            match slot.as_ref() {
+                Some(weak) => {
+                    if let Some(clock) = weak.upgrade() {
+                        return Ok(clock);
+                    }
+                    slot = self.released.wait(slot).unwrap();
+                }
+                None => {
+                    let mut clock = Ptp::bind(config)?;
+                    Arc::get_mut(&mut clock).unwrap().shared_registry = Some(self);
+                    *slot = Some(Arc::downgrade(&clock));
+                    return Ok(clock);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Ptp {
+    fn drop(&mut self) {
+        self.control.send(runtime::Command::Stop);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(registry) = self.shared_registry {
+            *registry.clock.lock().unwrap() = None;
+            registry.released.notify_all();
+        }
+    }
+}
 
 impl Ptp {
     /// Claude: the process's clock on PTP's own ports, bound by the first
     /// caller and released when the last `Arc` drops, or why the ports could
     /// not be had.
     pub(crate) fn shared() -> Result<Arc<Ptp>, String> {
-        todo!()
+        static SHARED: Registry = Registry::new();
+        SHARED.acquire(Config::standard())
     }
 
     /// Claude: a clock of its own, outside the process's shared one, as tests
     /// and the fake receiver run.
     pub(crate) fn bind(config: Config) -> Result<Arc<Ptp>, String> {
-        todo!()
+        let mut bytes = [0; 8];
+        getrandom::fill(&mut bytes).map_err(|e| format!("could not create PTP identity: {e}"))?;
+        let identity = ClockIdentity(bytes);
+        let sockets = runtime::Sockets::bind(&config)?;
+        let event_port = sockets.event_port;
+        let general_port = sockets.general_port;
+        let (wake, reader) =
+            UnixDatagram::pair().map_err(|e| format!("could not open PTP wake socket: {e}"))?;
+        wake.set_nonblocking(true).map_err(|e| e.to_string())?;
+        reader.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let (sender, commands) = mpsc::channel();
+        let own = Timebase::new(
+            Timeline {
+                clock: identity,
+                epoch: 0,
+            },
+            Instant::now(),
+            PtpTime {
+                nanos: NANOS_PER_SECOND,
+            },
+            1.0,
+        )
+        .unwrap();
+        let thread = thread::Builder::new()
+            .name("airplay-ptp".into())
+            .spawn(move || runtime::run(sockets, reader, commands, own, config))
+            .map_err(|e| format!("could not start PTP thread: {e}"))?;
+        Ok(Arc::new(Self {
+            identity,
+            event_port,
+            general_port,
+            control: runtime::Control { sender, wake },
+            thread: Some(thread),
+            next_peer: AtomicU64::new(0),
+            shared_registry: None,
+        }))
     }
 
     /// Claude: where peers reach this clock at `local`'s IP and scope.
     pub(crate) fn endpoint(&self, local: SocketAddr) -> Endpoint {
-        todo!()
+        let mut event = local;
+        event.set_port(self.event_port);
+        let mut general = local;
+        general.set_port(self.general_port);
+        Endpoint { event, general }
     }
 
     pub(crate) fn identity(&self) -> ClockIdentity {
-        todo!()
+        self.identity
     }
 
     /// Claude: starts timing with the receiver at `peer`: following its clock
     /// when it wins the best master comparison against this clock, leading it
     /// otherwise. Dropping the `Peer` stops.
-    pub(crate) fn add_peer(self: &Arc<Self>, peer: Endpoint) -> Peer {
-        todo!()
+    pub(crate) fn add_peer(self: &Arc<Self>, local: SocketAddr, peer: Endpoint) -> Peer {
+        let id = self.next_peer.fetch_add(1, Ordering::Relaxed);
+        let timing = Arc::new(Mutex::new(Timing::Acquiring));
+        if !self
+            .control
+            .send(runtime::Command::Add(id, local, peer, timing.clone()))
+        {
+            *timing.lock().unwrap() = Timing::Lost("PTP thread has stopped".into());
+        }
+        Peer {
+            clock: self.clone(),
+            id,
+            timing,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_timeline(&self, timebase: Timebase) {
+        self.control.send(runtime::Command::Timeline(timebase));
     }
 }
 
@@ -197,17 +335,25 @@ pub(crate) enum Timing {
     /// Claude: the receiver's timeline, also while following through a short
     /// silence of its master (holdover).
     Settled(Timebase),
-    /// Claude: the followed master went silent for longer than holdover lasts.
-    /// Final for this peer.
     Lost(String),
 }
 
 /// Claude: one receiver this clock times with.
-pub(crate) struct Peer {}
+pub(crate) struct Peer {
+    clock: Arc<Ptp>,
+    id: u64,
+    timing: Arc<Mutex<Timing>>,
+}
+
+impl Drop for Peer {
+    fn drop(&mut self) {
+        self.clock.control.send(runtime::Command::Remove(self.id));
+    }
+}
 
 impl Peer {
     pub(crate) fn timing(&self) -> Timing {
-        todo!()
+        self.timing.lock().unwrap().clone()
     }
 }
 
@@ -230,7 +376,13 @@ mod tests {
         assert_eq!(nanos_back, 856_645_460);
         assert_eq!(PtpTime { nanos: 500_000_000 }.frac(), 1 << 63);
         assert_eq!(PtpTime { nanos: 250_000_000 }.frac(), 1 << 62);
-        assert_eq!(PtpTime { nanos: 7_000_000_000 }.frac(), 0);
+        assert_eq!(
+            PtpTime {
+                nanos: 7_000_000_000
+            }
+            .frac(),
+            0
+        );
     }
 
     #[test]
@@ -239,13 +391,19 @@ mod tests {
         let network = PtpTime {
             nanos: 231_017_000_000_000,
         };
-        let timebase = Timebase::new(TIMELINE, host, network, 1.0001);
+        let timebase = Timebase::new(TIMELINE, host, network, 1.0001).unwrap();
         let later = host + Duration::from_secs(10);
-        assert_eq!(timebase.network(later).nanos, network.nanos + 10_001_000_000);
+        assert_eq!(
+            timebase.network(later).unwrap().nanos,
+            network.nanos + 10_001_000_000
+        );
         let earlier = host - Duration::from_secs(10);
-        assert_eq!(timebase.network(earlier).nanos, network.nanos - 10_001_000_000);
+        assert_eq!(
+            timebase.network(earlier).unwrap().nanos,
+            network.nanos - 10_001_000_000
+        );
         for at in [later, earlier, host] {
-            let back = timebase.host(timebase.network(at));
+            let back = timebase.host(timebase.network(at).unwrap()).unwrap();
             assert!(signed_nanos(back, at).abs() <= 1);
         }
     }
@@ -254,7 +412,43 @@ mod tests {
     fn standard_endpoints_keep_the_address_and_its_scope() {
         let scoped: SocketAddr = "[fe80::d85c:c0f5:c1a0:d348%1]:7000".parse().unwrap();
         let endpoint = Endpoint::standard(scoped);
-        assert_eq!(endpoint.event.to_string(), "[fe80::d85c:c0f5:c1a0:d348%1]:319");
-        assert_eq!(endpoint.general.to_string(), "[fe80::d85c:c0f5:c1a0:d348%1]:320");
+        assert_eq!(
+            endpoint.event.to_string(),
+            "[fe80::d85c:c0f5:c1a0:d348%1]:319"
+        );
+        assert_eq!(
+            endpoint.general.to_string(),
+            "[fe80::d85c:c0f5:c1a0:d348%1]:320"
+        );
+    }
+    #[test]
+    fn time_conversions_reject_invalid_rates_and_out_of_range_values() {
+        let host = Instant::now();
+        for rate in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(Timebase::new(TIMELINE, host, PtpTime { nanos: 0 }, rate).is_none());
+        }
+        let zero = Timebase::new(TIMELINE, host, PtpTime { nanos: 0 }, 1.0).unwrap();
+        assert!(zero.network(host - Duration::from_nanos(1)).is_none());
+        let max = Timebase::new(TIMELINE, host, PtpTime { nanos: u64::MAX }, 1.0).unwrap();
+        assert_eq!(max.network(host), Some(PtpTime { nanos: u64::MAX }));
+        assert!(max.network(host + Duration::from_nanos(1)).is_none());
+        let slow = Timebase::new(TIMELINE, host, PtpTime { nanos: 0 }, f64::MIN_POSITIVE).unwrap();
+        assert!(slow.host(PtpTime { nanos: 1 }).is_none());
+        let fast = Timebase::new(TIMELINE, host, PtpTime { nanos: 0 }, f64::MAX).unwrap();
+        assert!(fast.network(host + Duration::from_secs(1)).is_none());
+        assert!(
+            PtpTime { nanos: u64::MAX }
+                .after(Duration::from_nanos(1))
+                .is_none()
+        );
+        assert!(
+            PtpTime { nanos: 0 }
+                .after(Duration::from_secs(u64::MAX))
+                .is_none()
+        );
+        assert_eq!(
+            PtpTime { nanos: 1 }.after(Duration::from_nanos(2)),
+            Some(PtpTime { nanos: 3 })
+        );
     }
 }
