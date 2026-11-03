@@ -183,7 +183,9 @@ impl Config {
 /// as long as any stream holds it.
 pub(crate) struct Ptp {
     identity: ClockIdentity,
+    #[cfg(test)]
     event_port: u16,
+    #[cfg(test)]
     general_port: u16,
     control: runtime::Control,
     thread: Option<JoinHandle<()>>,
@@ -254,7 +256,9 @@ impl Ptp {
         getrandom::fill(&mut bytes).map_err(|e| format!("could not create PTP identity: {e}"))?;
         let identity = ClockIdentity(bytes);
         let sockets = runtime::Sockets::bind(&config)?;
+        #[cfg(test)]
         let event_port = sockets.event_port;
+        #[cfg(test)]
         let general_port = sockets.general_port;
         let (wake, reader) =
             UnixDatagram::pair().map_err(|e| format!("could not open PTP wake socket: {e}"))?;
@@ -279,7 +283,9 @@ impl Ptp {
             .map_err(|e| format!("could not start PTP thread: {e}"))?;
         Ok(Arc::new(Self {
             identity,
+            #[cfg(test)]
             event_port,
+            #[cfg(test)]
             general_port,
             control: runtime::Control { sender, wake },
             thread: Some(thread),
@@ -289,6 +295,7 @@ impl Ptp {
     }
 
     /// Claude: where peers reach this clock at `local`'s IP and scope.
+    #[cfg(test)]
     pub(crate) fn endpoint(&self, local: SocketAddr) -> Endpoint {
         let mut event = local;
         event.set_port(self.event_port);

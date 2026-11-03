@@ -228,6 +228,90 @@ fn singleton_concurrent_acquisition_release_and_reacquisition() {
 }
 
 #[test]
+fn ephemeral_binding_retries_when_an_ipv6_port_is_already_held() {
+    for channel in 0..2 {
+        let reserved = Sockets::bind(&config(250)).unwrap();
+        let blocked_port = reserved.event_port;
+        let [reserved4, spare4, occupied6, spare6] = reserved.sockets;
+        drop(spare4);
+        drop(spare6);
+        let mut reserved4 = Some(reserved4);
+        let mut ipv4_binds = 0;
+        let sockets = Sockets::bind_with(&config(250), |ipv6, port| {
+            if !ipv6 {
+                ipv4_binds += 1;
+                if ipv4_binds == channel + 1 {
+                    assert_eq!(port, 0);
+                    return Ok(reserved4.take().unwrap());
+                }
+            }
+            bind_socket(ipv6, port)
+        })
+        .unwrap();
+        assert!(ipv4_binds >= 4);
+        assert_ne!(sockets.event_port, blocked_port);
+        assert_ne!(sockets.general_port, blocked_port);
+        assert_ne!(sockets.event_port, sockets.general_port);
+        for (index, socket) in sockets.sockets.iter().enumerate() {
+            assert_eq!(
+                socket.local_addr().unwrap().port(),
+                if index % 2 == 0 {
+                    sockets.event_port
+                } else {
+                    sockets.general_port
+                }
+            );
+        }
+        assert_eq!(occupied6.local_addr().unwrap().port(), blocked_port);
+    }
+}
+
+#[test]
+fn ephemeral_binding_retries_are_bounded_and_other_errors_are_not_retried() {
+    for (kind, expected) in [
+        (io::ErrorKind::AddrInUse, BIND_ATTEMPTS),
+        (io::ErrorKind::PermissionDenied, 1),
+    ] {
+        let mut ipv6_binds = 0;
+        let result = Sockets::bind_with(&config(250), |ipv6, port| {
+            if ipv6 {
+                ipv6_binds += 1;
+                Err(io::Error::new(kind, "injected IPv6 bind failure"))
+            } else {
+                bind_socket(ipv6, port)
+            }
+        });
+        assert!(matches!(result, Err(error) if error == "injected IPv6 bind failure"));
+        assert_eq!(ipv6_binds, expected);
+    }
+}
+
+#[test]
+fn a_fixed_ipv6_port_collision_is_not_retried() {
+    let reserved = Sockets::bind(&config(250)).unwrap();
+    let mut requested = config(250);
+    requested.event_port = reserved.event_port;
+    let [reserved4, spare4, occupied6, spare6] = reserved.sockets;
+    drop(spare4);
+    drop(spare6);
+    let mut reserved4 = Some(reserved4);
+    let mut ipv4_binds = 0;
+    let result = Sockets::bind_with(&requested, |ipv6, port| {
+        if !ipv6 {
+            ipv4_binds += 1;
+            if ipv4_binds == 1 {
+                assert_eq!(port, requested.event_port);
+                return Ok(reserved4.take().unwrap());
+            }
+        }
+        bind_socket(ipv6, port)
+    });
+    assert!(matches!(result, Err(error) if error.contains("could not bind PTP UDP [::]")));
+    assert_eq!(ipv4_binds, 2);
+    assert_eq!(occupied6.local_addr().unwrap().port(), requested.event_port);
+}
+
+#[test]
 fn a_failed_partial_bind_rolls_back_all_sockets() {
     let ports = config_ports(&Ptp::bind(config(250)).unwrap());
     let occupied = bind_socket(true, ports.general_port).unwrap();

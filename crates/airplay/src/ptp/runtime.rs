@@ -20,6 +20,7 @@ const ANNOUNCE_WITHOUT_TIMING: Duration = Duration::from_secs(3);
 const EXCHANGE_LIFETIME: Duration = Duration::from_secs(1);
 const ANNOUNCE_LOG: i8 = -2;
 const SYNC_LOG: i8 = -3;
+const BIND_ATTEMPTS: usize = 16;
 
 type Observer = Arc<Mutex<Timing>>;
 
@@ -48,23 +49,58 @@ impl Control {
 
 pub(super) struct Sockets {
     sockets: [UdpSocket; 4],
+    #[cfg(test)]
     pub event_port: u16,
+    #[cfg(test)]
     pub general_port: u16,
 }
 
 impl Sockets {
     pub fn bind(config: &Config) -> Result<Self, String> {
-        let event4 = bind_socket(false, config.event_port)?;
-        let general4 = bind_socket(false, config.general_port)?;
-        let event_port = event4.local_addr().map_err(|e| e.to_string())?.port();
-        let general_port = general4.local_addr().map_err(|e| e.to_string())?.port();
-        let event6 = bind_socket(true, event_port)?;
-        let general6 = bind_socket(true, general_port)?;
-        Ok(Self {
-            sockets: [event4, general4, event6, general6],
-            event_port,
-            general_port,
-        })
+        Self::bind_with(config, bind_socket)
+    }
+
+    fn bind_with(
+        config: &Config,
+        mut bind: impl FnMut(bool, u16) -> io::Result<UdpSocket>,
+    ) -> Result<Self, String> {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let event4 = bind(false, config.event_port).map_err(|e| e.to_string())?;
+            let general4 = bind(false, config.general_port).map_err(|e| e.to_string())?;
+            let event_port = event4.local_addr().map_err(|e| e.to_string())?.port();
+            let general_port = general4.local_addr().map_err(|e| e.to_string())?.port();
+            let event6 = match bind(true, event_port) {
+                Ok(socket) => socket,
+                Err(error)
+                    if config.event_port == 0
+                        && error.kind() == io::ErrorKind::AddrInUse
+                        && attempts < BIND_ATTEMPTS =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            let general6 = match bind(true, general_port) {
+                Ok(socket) => socket,
+                Err(error)
+                    if config.general_port == 0
+                        && error.kind() == io::ErrorKind::AddrInUse
+                        && attempts < BIND_ATTEMPTS =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            return Ok(Self {
+                sockets: [event4, general4, event6, general6],
+                #[cfg(test)]
+                event_port,
+                #[cfg(test)]
+                general_port,
+            });
+        }
     }
 
     fn send(&self, local: SocketAddr, endpoint: Endpoint, message: Message) -> io::Result<Instant> {
@@ -82,7 +118,7 @@ impl Sockets {
     }
 }
 
-fn bind_socket(ipv6: bool, port: u16) -> Result<UdpSocket, String> {
+fn bind_socket(ipv6: bool, port: u16) -> io::Result<UdpSocket> {
     let address = SocketAddr::new(
         if ipv6 {
             IpAddr::V6(Ipv6Addr::UNSPECIFIED)
@@ -104,7 +140,7 @@ fn bind_socket(ipv6: bool, port: u16) -> Result<UdpSocket, String> {
         socket.bind(&address.into())?;
         Ok(socket.into())
     };
-    make().map_err(|e| format!("could not bind PTP UDP {address}: {e}"))
+    make().map_err(|e| io::Error::new(e.kind(), format!("could not bind PTP UDP {address}: {e}")))
 }
 
 pub(super) fn run(
