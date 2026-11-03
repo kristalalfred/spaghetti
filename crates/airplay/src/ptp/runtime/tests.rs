@@ -70,13 +70,103 @@ fn loopback_lead_follow_ipv4_and_ipv6() {
 #[test]
 fn a_better_master_arriving_after_fifteen_hundred_milliseconds_is_followed() {
     let local = Ptp::bind(config(250)).unwrap();
-    let remote = Ptp::bind(config(100)).unwrap();
-    let local_peer = local.add_peer(address(false), remote.endpoint(address(false)));
-    thread::sleep(Duration::from_millis(1500));
-    assert_eq!(local_peer.timing(), Timing::Acquiring);
-    let remote_peer = remote.add_peer(address(false), local.endpoint(address(false)));
-    assert_eq!(settle(&remote_peer).timeline().clock, remote.identity());
-    assert_eq!(settle(&local_peer).timeline().clock, remote.identity());
+    let remote = Sockets::bind(&config(100)).unwrap();
+    let source = PortIdentity {
+        clock: ClockIdentity([2; 8]),
+        port: 32768,
+    };
+    let endpoint = Endpoint {
+        event: SocketAddr::new(address(false).ip(), remote.event_port),
+        general: SocketAddr::new(address(false).ip(), remote.general_port),
+    };
+    let local_peer = local.add_peer(address(false), endpoint);
+    let start = Instant::now();
+    let truth = Timebase::new(
+        Timeline {
+            clock: source.clock,
+            epoch: 0,
+        },
+        start,
+        PtpTime {
+            nanos: 100_000_000_000,
+        },
+        1.0,
+    )
+    .unwrap();
+    let send = |message| {
+        remote
+            .send(address(false), local.endpoint(address(false)), message)
+            .unwrap()
+    };
+    let mut next_sync = start + Duration::from_millis(1500);
+    let mut sequence = 0;
+    let mut bytes = [0; 2048];
+    loop {
+        match local_peer.timing() {
+            Timing::Acquiring => (),
+            Timing::Settled(timebase) => {
+                assert_eq!(timebase.timeline().clock, source.clock);
+                eprintln!(
+                    "late master settled after {} ms",
+                    start.elapsed().as_millis()
+                );
+                break;
+            }
+            Timing::Lost(reason) => panic!("late master lost: {reason}"),
+        }
+        let now = Instant::now();
+        assert!(now - start < Duration::from_secs(6));
+        if now >= next_sync {
+            send(Message::new(
+                source,
+                sequence,
+                -3,
+                Body::Announce {
+                    origin: Timestamp::ZERO,
+                    utc_offset: 37,
+                    reserved: 0,
+                    dataset: Dataset::local(source.clock, 100),
+                    time_source: 0xa0,
+                },
+            ));
+            let sent = send(Message::new(
+                source,
+                sequence,
+                -3,
+                Body::Sync(Timestamp::ZERO),
+            ));
+            let mut follow = Message::new(
+                source,
+                sequence,
+                -3,
+                Body::FollowUp(Timestamp::from_nanos(truth.network(sent).unwrap().nanos)),
+            );
+            follow.tlvs = vec![Tlv::Follow(FollowInfo {
+                rate_offset: 0,
+                timebase: 0,
+                phase_change: [0; 12],
+                frequency_change: 0,
+            })];
+            send(follow);
+            next_sync += Duration::from_millis(125);
+            sequence += 1;
+        }
+        while let Ok((length, _)) = remote.sockets[0].recv_from(&mut bytes) {
+            let received = Instant::now();
+            let request = Message::decode(&bytes[..length]).unwrap();
+            assert!(matches!(request.body, Body::DelayReq(_)));
+            send(Message::new(
+                source,
+                request.sequence,
+                -3,
+                Body::DelayResp {
+                    received: Timestamp::from_nanos(truth.network(received).unwrap().nanos),
+                    requester: request.source,
+                },
+            ));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]
