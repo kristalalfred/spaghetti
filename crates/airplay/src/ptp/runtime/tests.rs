@@ -575,6 +575,37 @@ impl Fixture {
 }
 
 #[test]
+fn received_corrections_do_not_change_whether_a_timestamp_exchange_is_usable() {
+    let residence = 50_000_000 * 65536_i64;
+    for (sync_correction, follow_correction, response_correction) in [
+        (residence, 0, 0),
+        (0, residence, 0),
+        (0, 0, residence),
+        (residence, residence, residence),
+        (i64::MIN, i64::MAX, i64::MAX),
+        (i64::MAX, i64::MIN, i64::MIN),
+    ] {
+        let mut f = Fixture::new();
+        let mut sync = Message::new(f.remote_port, 1, -3, Body::Sync(Timestamp::ZERO));
+        sync.correction = sync_correction;
+        let t2 = Instant::now();
+        f.receive(&sync, t2);
+        let (_, t3) = f.follower().pending[&1].request.unwrap();
+        let mut follow = f.follow(1, t2);
+        follow.correction = follow_correction;
+        let mut response = f.response(1);
+        response.correction = response_correction;
+        f.receive(&follow, Instant::now());
+        f.receive(&response, Instant::now());
+        assert_eq!(
+            f.follower().last_sample,
+            Some(t2 + t3.duration_since(t2) / 2)
+        );
+        assert!(f.follower().pending.is_empty());
+    }
+}
+
+#[test]
 fn associations_reject_wrong_ports_duplicates_stale_replies_and_wrap() {
     let mut f = Fixture::new();
     if let Role::Following(follower) = &mut f.relationship.role {

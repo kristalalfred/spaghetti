@@ -299,7 +299,7 @@ pub(super) fn run(
                         p.endpoint.general == from
                     }
                 }) {
-                    debug!(%from, kind = message.body.kind(), sequence = message.sequence, "PTP received");
+                    debug!(%from, kind = message.body.kind(), sequence = message.sequence, correction_scaled_ns = message.correction, correction_ns = message.correction as f64 / 65536.0, "PTP received");
                     peer.receive(&message, received, &sockets, own);
                 }
             }
@@ -731,10 +731,10 @@ fn set_interval(request: i8, default: i8, log: &mut i8, interval: &mut Option<Du
 
 struct Exchange {
     created: Instant,
-    sync: Option<(Instant, i64)>,
-    follow: Option<(u64, i64, Option<u16>)>,
+    sync: Option<Instant>,
+    follow: Option<(u64, Option<u16>)>,
     request: Option<(u16, Instant)>,
-    response: Option<(u64, i64)>,
+    response: Option<u64>,
     epoch: Option<u32>,
 }
 
@@ -804,7 +804,7 @@ impl Follower {
                 return Ok(());
             };
             if exchange.response.is_none() {
-                exchange.response = Some((time, message.correction));
+                exchange.response = Some(time);
             }
             self.complete(sync_sequence, received)?;
             return Ok(());
@@ -839,9 +839,9 @@ impl Follower {
                 {
                     self.latest_sync = Some(sequence);
                 }
-                exchange.sync = Some((received, message.correction));
+                exchange.sync = Some(received);
                 if message.flags & 0x0200 == 0 {
-                    exchange.follow = origin.nanos().map(|t| (t, 0, None));
+                    exchange.follow = origin.nanos().map(|t| (t, None));
                 }
                 self.delay_sequence = self.delay_sequence.wrapping_add(1);
                 let request = Message::new(
@@ -860,9 +860,7 @@ impl Follower {
                     Tlv::Follow(info) => Some(info.timebase),
                     _ => None,
                 });
-                exchange.follow = origin
-                    .nanos()
-                    .map(|time| (time, message.correction, indicator));
+                exchange.follow = origin.nanos().map(|time| (time, indicator));
             }
             _ => (),
         }
@@ -874,7 +872,7 @@ impl Follower {
             return Ok(());
         };
         if exchange.sync.is_some()
-            && let Some((_, _, indicator)) = exchange.follow
+            && let Some((_, indicator)) = exchange.follow
             && self
                 .latest_pair
                 .is_none_or(|latest| (sequence.wrapping_sub(latest) as i16) > 0)
@@ -886,18 +884,12 @@ impl Follower {
             }
             exchange.epoch = Some(self.servo.timeline().epoch);
         }
-        let (
-            Some((t2, sync_correction)),
-            Some((t1, follow_correction, _)),
-            Some((_, t3)),
-            Some((t4, reverse_correction)),
-        ) = (
+        let (Some(t2), Some((t1, _)), Some((_, t3)), Some(t4)) = (
             exchange.sync,
             exchange.follow,
             exchange.request,
             exchange.response,
-        )
-        else {
+        ) else {
             return Ok(());
         };
         let epoch = exchange.epoch;
@@ -909,15 +901,7 @@ impl Follower {
         if epoch != Some(self.servo.timeline().epoch) {
             return Ok(());
         }
-        let Some(sample) = Sample::exchange(
-            t1,
-            t2,
-            t3,
-            t4,
-            i128::from(sync_correction) + i128::from(follow_correction),
-            reverse_correction,
-            self.servo.rate(),
-        ) else {
+        let Some(sample) = Sample::exchange(t1, t2, t3, t4, self.servo.rate()) else {
             return Ok(());
         };
         if self.last_sample.is_some_and(|last| sample.host <= last) {

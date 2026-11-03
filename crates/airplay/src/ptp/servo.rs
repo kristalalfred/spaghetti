@@ -19,26 +19,16 @@ pub(super) struct Sample {
 }
 
 impl Sample {
-    pub fn exchange(
-        t1: u64,
-        t2: Instant,
-        t3: Instant,
-        t4: u64,
-        forward_correction: i128,
-        reverse_correction: i64,
-        rate: f64,
-    ) -> Option<Self> {
+    pub fn exchange(t1: u64, t2: Instant, t3: Instant, t4: u64, rate: f64) -> Option<Self> {
         let elapsed = signed_nanos(t3, t2);
         if !(0..=1_000_000_000).contains(&elapsed) {
             return None;
         }
-        let forward = i128::from(t1) * 65536 + forward_correction;
-        let reverse = i128::from(t4) * 65536 - i128::from(reverse_correction);
-        let round_trip = (reverse - forward) as f64 / 65536.0 - elapsed as f64 * rate;
+        let round_trip = (i128::from(t4) - i128::from(t1)) as f64 - elapsed as f64 * rate;
         if !(0.0..=200_000_000.0).contains(&round_trip) {
             return None;
         }
-        let network = (forward + reverse) / (2 * 65536);
+        let network = (u128::from(t1) + u128::from(t4)) / 2;
         Some(Self {
             host: t2 + Duration::from_nanos(elapsed as u64 / 2),
             network: u64::try_from(network).ok()?,
@@ -359,9 +349,7 @@ mod tests {
         let t4 = t3 + Duration::from_nanos(reverse);
         let network = |at| offset + (signed_nanos(at, host) as f64 * rate).round() as u64;
         servo
-            .observe(
-                Sample::exchange(network(t1), t2, t3, network(t4), 0, 0, servo.rate()).unwrap(),
-            )
+            .observe(Sample::exchange(network(t1), t2, t3, network(t4), servo.rate()).unwrap())
             .unwrap();
     }
 
@@ -424,21 +412,19 @@ mod tests {
     }
 
     #[test]
-    fn every_correction_and_fraction_is_in_the_e2e_equation() {
+    fn timestamps_determine_midpoint_and_rate_scaled_round_trip() {
         let host = Instant::now();
         let sample = Sample::exchange(
             1_000_000_000,
             host,
             host + Duration::from_micros(40),
             1_000_500_000,
-            100_000 * 65536 + 32768,
-            120_000 * 65536 + 32768,
-            1.0,
+            1.0001,
         )
         .unwrap();
         assert_eq!(sample.host, host + Duration::from_micros(20));
-        assert_eq!(sample.network, 1_000_240_000);
-        assert_eq!(sample.round_trip, 239_999.0);
+        assert_eq!(sample.network, 1_000_250_000);
+        assert_eq!(sample.round_trip, 459_996.0);
     }
 
     #[test]
@@ -591,15 +577,9 @@ mod captured_path {
                 let t2 = origin + Duration::from_nanos(values[2] as u64);
                 let t3 = origin + Duration::from_nanos(values[3] as u64);
                 first_packet.get_or_insert(t2);
-                if let Some(sample) = Sample::exchange(
-                    values[1] as u64,
-                    t2,
-                    t3,
-                    values[4] as u64,
-                    values[5] + values[6],
-                    values[7] as i64,
-                    servo.rate(),
-                ) {
+                if let Some(sample) =
+                    Sample::exchange(values[1] as u64, t2, t3, values[4] as u64, servo.rate())
+                {
                     servo.observe(sample).unwrap();
                     if let Some(timebase) = servo.timebase() {
                         if first_settled.is_none() {
@@ -629,3 +609,6 @@ mod captured_path {
         }
     }
 }
+
+#[cfg(test)]
+mod live_capture;
