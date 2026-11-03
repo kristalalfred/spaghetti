@@ -356,13 +356,16 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::new_at(Instant::now())
+    }
+
+    fn new_at(now: Instant) -> Self {
         let sockets = Sockets::bind(&config(250)).unwrap();
         let remote = Sockets::bind(&config(100)).unwrap();
         let endpoint = Endpoint {
             event: SocketAddr::new(address(false).ip(), remote.event_port),
             general: SocketAddr::new(address(false).ip(), remote.general_port),
         };
-        let now = Instant::now();
         let local = PortIdentity {
             clock: ClockIdentity([1; 8]),
             port: 32777,
@@ -420,6 +423,26 @@ impl Fixture {
             _ => panic!("not following"),
         }
     }
+
+    fn settle_follower(&mut self) {
+        let now = Instant::now();
+        let Role::Following(follower) = &mut self.relationship.role else {
+            panic!("not following")
+        };
+        for index in 0..9 {
+            let host = now - Duration::from_millis((8 - index) * 125);
+            follower
+                .servo
+                .observe(Sample {
+                    host,
+                    network: self.own.network(host).unwrap().nanos,
+                    round_trip: 100_000.0,
+                })
+                .unwrap();
+        }
+        let settled = follower.servo.timebase().unwrap();
+        self.relationship.publish(Timing::Settled(settled));
+    }
     fn receive(&mut self, message: &Message, at: Instant) {
         self.relationship
             .receive(message, at, &self.sockets, self.own);
@@ -450,7 +473,11 @@ impl Fixture {
     }
 
     fn response(&self, sync_sequence: u16) -> Message {
-        let (sequence, t3) = self.follower().pending[&sync_sequence].request.unwrap();
+        let follower = match &self.relationship.role {
+            Role::Following(follower) => follower,
+            _ => self.relationship.rejected_master.as_ref().unwrap(),
+        };
+        let (sequence, t3) = follower.pending[&sync_sequence].request.unwrap();
         Message::new(
             self.remote_port,
             sequence,
@@ -939,6 +966,126 @@ fn nqptp_wakeup_announces_elect_us_and_a_silent_claimant_is_not_followed_forever
         start + ANNOUNCE_WITHOUT_TIMING + Duration::from_secs(1),
     );
     assert!(matches!(f.relationship.role, Role::Leading));
+}
+
+#[test]
+fn indicator_change_loses_settled_timing_without_a_usable_delay_response() {
+    for unusable_response in [false, true] {
+        let mut f = Fixture::new();
+        let t2 = f.sync(u16::MAX);
+        f.receive(&f.follow(u16::MAX, t2), Instant::now());
+        f.settle_follower();
+        let epoch = f.relationship.epoch;
+        let t2 = f.sync(0);
+        if unusable_response {
+            let mut response = f.response(0);
+            if let Body::DelayResp { received, .. } = &mut response.body {
+                *received = Timestamp::from_nanos(received.nanos().unwrap() + 1_000_000_000);
+            }
+            f.receive(&response, Instant::now());
+        }
+        let mut changed = f.follow(0, t2);
+        if let Tlv::Follow(info) = &mut changed.tlvs[0] {
+            info.timebase = 3;
+        }
+        f.receive(&changed, Instant::now());
+        let lost = f.relationship.timing.clone();
+        assert!(matches!(lost, Timing::Lost(_)), "{lost:?}");
+        assert_eq!(f.relationship.epoch, epoch + 1);
+        let t2 = f.sync(u16::MAX - 1);
+        f.receive(&f.follow(u16::MAX - 1, t2), Instant::now());
+        assert_eq!(f.relationship.timing, lost);
+        assert_eq!(f.relationship.epoch, epoch + 1);
+    }
+}
+
+#[test]
+fn reordered_pairs_cannot_rewind_an_indicator_without_delay_responses() {
+    let mut f = Fixture::new();
+    let t2 = f.sync(10);
+    f.receive(&f.follow(10, t2), Instant::now());
+    let epoch = f.follower().servo.timeline().epoch;
+    let t2 = f.sync(11);
+    let mut changed = f.follow(11, t2);
+    if let Tlv::Follow(info) = &mut changed.tlvs[0] {
+        info.timebase = 3;
+    }
+    f.receive(&changed, Instant::now());
+    assert_eq!(f.follower().servo.timeline().epoch, epoch + 1);
+    let t2 = f.sync(9);
+    f.receive(&f.follow(9, t2), Instant::now());
+    assert_eq!(f.follower().servo.timeline().epoch, epoch + 1);
+    let response = f.response(10);
+    f.receive(&response, Instant::now());
+    assert_eq!(f.follower().servo.timeline().epoch, epoch + 1);
+    assert!(f.follower().last_sample.is_none());
+}
+
+#[test]
+fn a_rejected_better_master_requalifies_on_timing_and_invalidates_leadership() {
+    let now = Instant::now();
+    let mut f = Fixture::new_at(now - ANNOUNCE_WITHOUT_TIMING);
+    f.relationship.tick(now, &f.sockets, f.own);
+    assert_eq!(f.relationship.timing, Timing::Settled(f.own));
+    let repeated = Message::new(
+        f.remote_port,
+        1,
+        0,
+        Body::Announce {
+            origin: Timestamp::ZERO,
+            utc_offset: 37,
+            reserved: 0,
+            dataset: Dataset::local(f.remote_port.clock, 100),
+            time_source: 0xa0,
+        },
+    );
+    for _ in 0..3 {
+        f.receive(&repeated, Instant::now());
+        assert_eq!(f.relationship.timing, Timing::Settled(f.own));
+    }
+    let t2 = f.sync(10);
+    assert_eq!(f.relationship.timing, Timing::Settled(f.own));
+    let response = f.response(10);
+    f.receive(&response, Instant::now());
+    assert_eq!(f.relationship.timing, Timing::Settled(f.own));
+    f.receive(&f.follow(11, t2), Instant::now());
+    assert_eq!(f.relationship.timing, Timing::Settled(f.own));
+    f.receive(&f.follow(10, t2), Instant::now());
+    let lost = f.relationship.timing.clone();
+    assert!(matches!(lost, Timing::Lost(_)), "{lost:?}");
+    f.receive(&response, Instant::now());
+    f.receive(&repeated, Instant::now());
+    assert_eq!(f.relationship.timing, lost);
+}
+
+#[test]
+fn a_requalified_master_can_acquire_before_leadership_settles() {
+    let now = Instant::now();
+    let mut f = Fixture::new_at(now - ANNOUNCE_WITHOUT_TIMING);
+    f.relationship.election_until = now + Duration::from_secs(2);
+    f.relationship.tick(now, &f.sockets, f.own);
+    assert_eq!(f.relationship.timing, Timing::Acquiring);
+    assert!(f.relationship.rejected_master.is_some());
+    for sequence in 0..9 {
+        let t2 = f.sync(sequence);
+        f.receive(&f.response(sequence), Instant::now());
+        f.receive(&f.follow(sequence, t2), Instant::now());
+        assert!(matches!(f.relationship.role, Role::Following(_)));
+        assert!(f.relationship.rejected_master.is_none());
+        match f.relationship.timing {
+            Timing::Acquiring => (),
+            Timing::Settled(timebase) => assert_eq!(timebase.timeline().clock, f.remote_port.clock),
+            Timing::Lost(ref reason) => panic!("requalified master lost: {reason}"),
+        }
+        if sequence < 8 {
+            thread::sleep(Duration::from_millis(125));
+        }
+    }
+    let Timing::Settled(timebase) = f.relationship.timing else {
+        panic!("requalified master did not settle");
+    };
+    assert_eq!(timebase.timeline().clock, f.remote_port.clock);
+    assert!(Instant::now() - now < Duration::from_secs(5));
 }
 
 #[test]
