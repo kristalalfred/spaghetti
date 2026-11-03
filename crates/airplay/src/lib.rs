@@ -9,6 +9,7 @@ mod fake;
 mod hap;
 mod packet;
 mod pairing;
+mod ptp;
 mod raop;
 mod receiver;
 mod rtsp;
