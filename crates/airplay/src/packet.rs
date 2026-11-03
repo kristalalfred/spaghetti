@@ -18,6 +18,10 @@ pub(crate) const MAX_AUDIO_PACKET_LEN: usize = if AIRPLAY1_PACKET_LEN > AIRPLAY2
     AIRPLAY2_PACKET_LEN
 };
 pub(crate) const MAX_RETRANSMISSION_LEN: usize = RETRANSMISSION_HEADER_LEN + MAX_AUDIO_PACKET_LEN;
+const BUFFERED_LENGTH_LEN: usize = 2;
+pub(crate) const BUFFERED_PACKET_LEN: usize = BUFFERED_LENGTH_LEN + AIRPLAY2_PACKET_LEN;
+/// Claude: how many sequence numbers a buffered packet's header holds.
+pub(crate) const BUFFERED_SEQUENCES: u32 = 1 << 23;
 const IPV6_HEADER_LEN: usize = 40;
 const UDP_HEADER_LEN: usize = 8;
 const ETHERNET_MTU: usize = 1500;
@@ -87,16 +91,44 @@ pub(crate) fn write_audio_packet(
 /// receiver opens it, as pyatv sends it: ChaCha20-Poly1305 with the RTP
 /// timestamp and SSRC as associated data, then the tag, then the nonce's
 /// counter in little-endian. Returns the sealed packet's length.
-pub(crate) fn seal_audio(
-    key: &mut Counted,
-    out: &mut [u8; MAX_AUDIO_PACKET_LEN],
-    len: usize,
-) -> usize {
+pub(crate) fn seal_audio(key: &mut Counted, out: &mut [u8], len: usize) -> usize {
     let (header, payload) = out[..len].split_at_mut(RTP_HEADER_LEN);
     let (tag, counter) = key.seal(&header[4..12], payload);
     out[len..len + TAG_LEN].copy_from_slice(&tag);
     out[len + TAG_LEN..len + TAG_LEN + NONCE_LEN].copy_from_slice(&counter.to_le_bytes());
     len + TAG_LEN + NONCE_LEN
+}
+
+/// Claude: a packet of a buffered stream's data connection, as
+/// shairport-sync reads one and Apple's sender was captured writing one: its
+/// length in two big-endian bytes, counting themselves, then an RTP header
+/// whose first four bytes are version 2 and a 23-bit sequence number, with no
+/// payload type or marker, then the frames as one full ALAC frame sealed as a
+/// realtime AirPlay 2 packet is. The SSRC names the audio format. Returns the
+/// packet's length.
+pub(crate) fn write_buffered_packet(
+    out: &mut [u8; BUFFERED_PACKET_LEN],
+    seq: u32,
+    timestamp: u32,
+    ssrc: u32,
+    left: &[f32; FRAMES_PER_PACKET],
+    right: &[f32; FRAMES_PER_PACKET],
+    key: &mut Counted,
+) -> usize {
+    let (length, packet) = out.split_at_mut(BUFFERED_LENGTH_LEN);
+    let first_word = (u32::from(VERSION_2) << 24) | (seq % BUFFERED_SEQUENCES);
+    packet[..4].copy_from_slice(&first_word.to_be_bytes());
+    packet[4..8].copy_from_slice(&timestamp.to_be_bytes());
+    packet[8..12].copy_from_slice(&ssrc.to_be_bytes());
+    let frames = left
+        .iter()
+        .zip(right)
+        .map(|(&l, &r)| [to_i16(l), to_i16(r)]);
+    let plain = RTP_HEADER_LEN
+        + write_alac_uncompressed(&mut packet[RTP_HEADER_LEN..], frames, Framing::Full);
+    let len = BUFFERED_LENGTH_LEN + seal_audio(key, packet, plain);
+    length.copy_from_slice(&(len as u16).to_be_bytes());
+    len
 }
 
 pub(crate) fn to_i16(sample: f32) -> i16 {
@@ -341,6 +373,57 @@ mod tests {
         let mut again = plain;
         seal_audio(&mut counted, &mut again, plain_len);
         assert_eq!(again[len - 8..len], 2u64.to_le_bytes());
+    }
+
+    #[test]
+    fn a_buffered_packet_is_its_length_a_23_bit_sequence_and_a_sealed_full_frame() {
+        let left: [f32; FRAMES_PER_PACKET] = std::array::from_fn(|i| i as f32 / 1024.0);
+        let right: [f32; FRAMES_PER_PACKET] = std::array::from_fn(|i| -(i as f32) / 2048.0);
+        let key = std::array::from_fn(|i| i as u8);
+        let header = AudioHeader {
+            seq: 0,
+            timestamp: 0x89AB_CDEF,
+            ssrc: 0x0102_0304,
+            marker: false,
+        };
+        let mut realtime = [0; MAX_AUDIO_PACKET_LEN];
+        let plain = write_audio_packet(&mut realtime, &header, &left, &right, Framing::Full);
+        seal_audio(&mut Counted::new(&key), &mut realtime, plain);
+
+        let mut out = [0; BUFFERED_PACKET_LEN];
+        let mut counted = Counted::new(&key);
+        let len = write_buffered_packet(
+            &mut out,
+            0x0080_0000 + 0x19_8CEB,
+            0x89AB_CDEF,
+            0x0102_0304,
+            &left,
+            &right,
+            &mut counted,
+        );
+        assert_eq!(len, BUFFERED_PACKET_LEN);
+        assert_eq!(BUFFERED_PACKET_LEN, 1450);
+        assert_eq!(out[..2], [0x05, 0xAA]);
+        assert_eq!(
+            out[2..14],
+            [0x80, 0x19, 0x8C, 0xEB, 0x89, 0xAB, 0xCD, 0xEF, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            out[14..],
+            realtime[12..AIRPLAY2_PACKET_LEN],
+            "sealed as the realtime packet with the same timestamp, SSRC and counter"
+        );
+        let next = write_buffered_packet(
+            &mut out,
+            BUFFERED_SEQUENCES - 1,
+            0,
+            0,
+            &left,
+            &right,
+            &mut counted,
+        );
+        assert_eq!(out[2..6], [0x80, 0x7F, 0xFF, 0xFF]);
+        assert_eq!(out[next - 8..next], 1u64.to_le_bytes());
     }
 
     #[test]

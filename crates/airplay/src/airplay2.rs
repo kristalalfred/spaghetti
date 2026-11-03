@@ -10,9 +10,12 @@ use crate::hap::{self, Counted, KEY_LEN};
 use crate::pairing;
 use crate::rtsp::{Connection, PLIST, Request, Response};
 use crate::session::{
-    self, ASSUMED_AUDIO_LATENCY, Offer, Packets, RealtimeAudio, Session, Transport, refusal,
+    self, ASSUMED_AUDIO_LATENCY, Offer, Packets, RealtimeAudio, Session, StreamRef, Transport,
+    refusal,
 };
 use crate::{FRAMES_PER_PACKET, SAMPLE_RATE};
+
+pub(crate) mod buffered;
 
 /// Claude: how often iOS, and so pyatv, posts `/feedback` to keep a session.
 pub(crate) const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
@@ -22,16 +25,18 @@ pub(crate) const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
 pub(crate) const USER_AGENT: &str = "AirPlay/999.0.0";
 pub(crate) const REALTIME: u64 = 96;
 /// Claude: ALAC, 44.1 kHz, 16-bit stereo, in AirPlay 2's audio format bits.
-const ALAC_44100_16_2: u64 = 0x40000;
-const COMPRESSION_ALAC: u64 = 2;
+pub(crate) const ALAC_44100_16_2: u64 = 0x40000;
+pub(crate) const COMPRESSION_ALAC: u64 = 2;
 const LATENCY_MAX: u64 = 88_200;
 
-/// Claude: why an AirPlay 2 handshake did not end in a session. A receiver
-/// that refused a step may still take AirPlay 1; one that failed, by not
-/// answering, answering malformed or proving the wrong key, is not tried
-/// again.
+/// Claude: why an AirPlay 2 handshake did not end in a session. Buffered
+/// audio with PTP timing that could not start, here or at the receiver, may
+/// still start as realtime audio; a receiver that refused a step may still
+/// take AirPlay 1; one that failed, by not answering, answering malformed or
+/// proving the wrong key, is not tried again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Failure {
+    Unbuffered(String),
     Refused(String),
     Failed(String),
 }
@@ -39,24 +44,30 @@ pub(crate) enum Failure {
 impl Failure {
     pub(crate) fn reason(&self) -> &str {
         match self {
-            Failure::Refused(reason) | Failure::Failed(reason) => reason,
+            Failure::Unbuffered(reason) | Failure::Refused(reason) | Failure::Failed(reason) => {
+                reason
+            }
         }
     }
 }
 
+/// Claude: a connection paired transiently and encrypted, with what the rest
+/// of either handshake derives from the pairing.
+struct Paired {
+    connection: Connection,
+    uri: String,
+    session_id: u32,
+    events_keys: hap::Keys,
+    audio_key: [u8; KEY_LEN],
+}
+
 /// Claude: asks for the receiver's `/info`, as OwnTone and pyatv do first,
-/// pairs transiently, encrypts the connection, then sets up the session with
-/// NTP timing, opens the receiver's event connection, sets up one realtime
-/// ALAC stream with a fresh key, records, and flushes to the stream's first
-/// packet. A handshake that fails after the session's SETUP tears the session
-/// down within `teardown_timeout`.
-pub(crate) fn negotiate(
+/// pairs transiently and encrypts the connection.
+fn pair(
     mut connection: Connection,
-    offer: &Offer,
     timeout: Duration,
-    teardown_timeout: Duration,
     abort: &dyn Fn() -> bool,
-) -> Result<(Session, RealtimeAudio), Failure> {
+) -> Result<Paired, Failure> {
     let info = Request {
         method: "GET",
         uri: "/info",
@@ -86,24 +97,43 @@ pub(crate) fn negotiate(
     );
     let mut audio_key = [0; KEY_LEN];
     getrandom::fill(&mut audio_key).map_err(|e| Failure::Failed(e.to_string()))?;
+    Ok(Paired {
+        connection,
+        uri,
+        session_id,
+        events_keys,
+        audio_key,
+    })
+}
+
+/// Claude: pairs, then sets up the session with NTP timing, opens the
+/// receiver's event connection, sets up one realtime ALAC stream with a fresh
+/// key, records, and flushes to the stream's first packet. A handshake that
+/// fails after the session's SETUP tears the session down within
+/// `teardown_timeout`.
+pub(crate) fn negotiate(
+    connection: Connection,
+    offer: &Offer,
+    timeout: Duration,
+    teardown_timeout: Duration,
+    abort: &dyn Fn() -> bool,
+) -> Result<(Session, RealtimeAudio), Failure> {
+    let Paired {
+        mut connection,
+        uri,
+        session_id,
+        events_keys,
+        audio_key,
+    } = pair(connection, timeout, abort)?;
     let peer = connection.peer_addr();
     let reply = setup(&mut connection, &uri, session_setup(offer)?, timeout, abort)?;
     debug!(
         timing_port = offer.timing_port,
         "AirPlay 2 session SETUP answered"
     );
-    let opened = port(&reply, "eventPort").and_then(|event_port| {
+    let opened = open_events(peer, &reply, &events_keys, timeout, abort).and_then(|events| {
         let stream = stream_setup(offer, &audio_key, session_id);
-        let events_at = with_port(peer, event_port);
-        open_stream(
-            &mut connection,
-            &uri,
-            events_at,
-            &events_keys,
-            stream,
-            timeout,
-            abort,
-        )
+        open_stream(&mut connection, &uri, events, stream, timeout, abort)
     });
     let opened = opened
         .and_then(|stream| flush(&mut connection, &uri, offer, timeout, abort).map(|()| stream));
@@ -114,7 +144,10 @@ pub(crate) fn negotiate(
                 uri,
                 transport: Transport::AirPlay2 {
                     _events: stream.events,
-                    stream_id: stream.stream_id,
+                    stream: StreamRef {
+                        kind: REALTIME,
+                        id: stream.stream_id,
+                    },
                 },
             },
             RealtimeAudio {
@@ -137,6 +170,26 @@ pub(crate) fn negotiate(
     }
 }
 
+/// Claude: opens the event connection the session's SETUP answer names. One
+/// that fails is left out, and the stream goes on without it.
+fn open_events(
+    peer: SocketAddr,
+    reply: &Dictionary,
+    keys: &hap::Keys,
+    timeout: Duration,
+    abort: &dyn Fn() -> bool,
+) -> Result<Option<EventChannel>, Failure> {
+    let events_at = with_port(peer, port(reply, "eventPort")?);
+    match EventChannel::connect(events_at, keys, timeout, abort) {
+        Ok(events) => Ok(Some(events)),
+        Err(reason) if abort() => Err(Failure::Failed(reason)),
+        Err(reason) => {
+            warn!(%reason, "AirPlay 2 receiver's event connection failed; streaming without it");
+            Ok(None)
+        }
+    }
+}
+
 /// Claude: what a session's stream has once set up and recording.
 struct OpenStream {
     events: Option<EventChannel>,
@@ -146,25 +199,15 @@ struct OpenStream {
     record: Response,
 }
 
-/// Claude: opens the receiver's event connection, sets the stream up and
-/// records.
+/// Claude: sets the stream up and records.
 fn open_stream(
     connection: &mut Connection,
     uri: &str,
-    events_at: SocketAddr,
-    events_keys: &hap::Keys,
+    events: Option<EventChannel>,
     stream: Vec<u8>,
     timeout: Duration,
     abort: &dyn Fn() -> bool,
 ) -> Result<OpenStream, Failure> {
-    let events = match EventChannel::connect(events_at, events_keys, timeout, abort) {
-        Ok(events) => Some(events),
-        Err(reason) if abort() => return Err(Failure::Failed(reason)),
-        Err(reason) => {
-            warn!(%reason, "AirPlay 2 receiver's event connection failed; streaming without it");
-            None
-        }
-    };
     let reply = setup(connection, uri, stream, timeout, abort)?;
     let stream = reply
         .get("streams")
@@ -245,13 +288,31 @@ fn setup(
     timeout: Duration,
     abort: &dyn Fn() -> bool,
 ) -> Result<Dictionary, Failure> {
+    setup_turned_away_as(connection, uri, body, timeout, abort, refused)
+}
+
+/// Claude: a SETUP whose answer other than 200 means what `turned_away` makes
+/// of it.
+fn setup_turned_away_as(
+    connection: &mut Connection,
+    uri: &str,
+    body: Vec<u8>,
+    timeout: Duration,
+    abort: &dyn Fn() -> bool,
+    turned_away: fn(&str, &Response) -> Failure,
+) -> Result<Dictionary, Failure> {
     let request = Request {
         method: "SETUP",
         uri,
         headers: vec![],
         body: Some((PLIST, &body)),
     };
-    let response = exchange(connection, &request, timeout, abort)?;
+    let response = connection
+        .exchange(&request, timeout, abort)
+        .map_err(Failure::Failed)?;
+    if response.status != 200 {
+        return Err(turned_away(request.method, &response));
+    }
     Value::from_reader(Cursor::new(&response.body))
         .ok()
         .and_then(Value::into_dictionary)
@@ -268,9 +329,13 @@ fn exchange(
         .exchange(request, timeout, abort)
         .map_err(Failure::Failed)?;
     if response.status != 200 {
-        return Err(Failure::Refused(refusal(request.method, &response)));
+        return Err(refused(request.method, &response));
     }
     Ok(response)
+}
+
+fn refused(method: &str, response: &Response) -> Failure {
+    Failure::Refused(refusal(method, response))
 }
 
 fn port(dictionary: &Dictionary, key: &str) -> Result<u16, Failure> {
@@ -291,19 +356,9 @@ fn with_port(mut address: SocketAddr, port: u16) -> SocketAddr {
 /// which streamed to Sonos receivers advertising the HK Citation's feature
 /// bits and source version.
 fn session_setup(offer: &Offer) -> Result<Vec<u8>, Failure> {
-    let mut device = [0u8; 6];
-    let mut session = [0u8; 16];
-    getrandom::fill(&mut device)
-        .and_then(|()| getrandom::fill(&mut session))
-        .map_err(|e| Failure::Failed(e.to_string()))?;
-    let device_id = device
-        .iter()
-        .map(|b| format!("{b:02X}"))
-        .collect::<Vec<_>>()
-        .join(":");
     Ok(binary(dictionary([
-        ("deviceID", device_id.into()),
-        ("sessionUUID", uuid_v4(session).into()),
+        ("deviceID", device_id()?.into()),
+        ("sessionUUID", random_uuid()?.into()),
         ("timingPort", u64::from(offer.timing_port).into()),
         ("timingProtocol", "NTP".into()),
     ])))
@@ -333,10 +388,11 @@ fn stream_setup(offer: &Offer, audio_key: &[u8; KEY_LEN], session_id: u32) -> Ve
 
 /// Claude: a TEARDOWN naming the stream ends it and keeps the session, as iOS
 /// sends first; one with an empty plist ends the session.
-pub(crate) fn stream_teardown(stream_id: Option<u64>) -> Vec<u8> {
+pub(crate) fn stream_teardown(stream: StreamRef) -> Vec<u8> {
+    let StreamRef { kind, id } = stream;
     let mut stream = Dictionary::new();
-    stream.insert("type".into(), REALTIME.into());
-    if let Some(id) = stream_id {
+    stream.insert("type".into(), kind.into());
+    if let Some(id) = id {
         stream.insert("streamID".into(), id.into());
     }
     binary(dictionary([(
@@ -373,6 +429,23 @@ fn binary(value: Value) -> Vec<u8> {
         .to_writer_binary(&mut out)
         .expect("a plist of plain values writes to memory");
     out
+}
+
+/// Claude: a random device ID, as a MAC address reads.
+fn device_id() -> Result<String, Failure> {
+    let mut device = [0u8; 6];
+    getrandom::fill(&mut device).map_err(|e| Failure::Failed(e.to_string()))?;
+    Ok(device
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":"))
+}
+
+fn random_uuid() -> Result<String, Failure> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|e| Failure::Failed(e.to_string()))?;
+    Ok(uuid_v4(bytes))
 }
 
 fn uuid_v4(mut bytes: [u8; 16]) -> String {
@@ -444,7 +517,10 @@ mod tests {
 
     #[test]
     fn teardowns_name_the_stream_then_nothing() {
-        let stream = read(&stream_teardown(Some(5)));
+        let stream = read(&stream_teardown(StreamRef {
+            kind: REALTIME,
+            id: Some(5),
+        }));
         let entry = stream["streams"].as_array().unwrap()[0]
             .as_dictionary()
             .unwrap();

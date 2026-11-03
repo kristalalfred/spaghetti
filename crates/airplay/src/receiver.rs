@@ -99,6 +99,14 @@ impl Receiver {
                 .is_some_and(|raop| raop.txt.features("ft") & AIRPLAY_2 == AIRPLAY_2)
     }
 
+    /// Claude: whether its AirPlay 2 service takes buffered audio timed by
+    /// PTP, by its feature bits 40 and 41.
+    pub(crate) fn takes_buffered_audio(&self) -> bool {
+        self.airplay.as_ref().is_some_and(|airplay| {
+            airplay.txt.features("features") & BUFFERED_WITH_PTP == BUFFERED_WITH_PTP
+        })
+    }
+
     /// Claude: whether `protocol`'s service has only gone from browsing, as
     /// while a receiver announces itself again, with nothing it still
     /// advertises turning a stream away.
@@ -210,6 +218,9 @@ impl std::fmt::Display for Protocol {
 const AUDIO: u64 = 1 << 9;
 const CORE_UTILS_PAIRING_AND_ENCRYPTION: u64 = 1 << 48;
 const AIRPLAY_2: u64 = AUDIO | CORE_UTILS_PAIRING_AND_ENCRYPTION;
+const BUFFERED_AUDIO: u64 = 1 << 40;
+const PTP_CLOCK: u64 = 1 << 41;
+const BUFFERED_WITH_PTP: u64 = BUFFERED_AUDIO | PTP_CLOCK;
 const PIN_REQUIRED: u64 = 0x8;
 const PASSWORD_REQUIRED: u64 = 0x80;
 const PAIRING_REQUIRED: u64 = 0x200;
@@ -311,6 +322,28 @@ pub(crate) mod tests {
             raop: raop.map(service),
             airplay: airplay.map(service),
         }
+    }
+
+    #[test]
+    fn buffered_audio_needs_both_feature_bits_40_and_41_on_the_airplay_service() {
+        let with = |features: &str| {
+            receiver(
+                None,
+                Some(&format!(
+                    "deviceid=C4:30:18:6E:41:2D features={features} flags=0x4"
+                )),
+            )
+            .takes_buffered_audio()
+        };
+        assert!(receiver(None, Some(CITATION_AIRPLAY)).takes_buffered_audio());
+        assert!(with("0x445F8A00,0x300"));
+        assert!(!with("0x445F8A00,0x100"), "buffered audio without PTP");
+        assert!(!with("0x445F8A00,0x200"), "PTP without buffered audio");
+        assert!(!with("0x445F8A00,0x1C040"));
+        assert!(
+            !receiver(Some(MOVE_2_RAOP), None).takes_buffered_audio(),
+            "the RAOP record's bits do not count"
+        );
     }
 
     #[test]

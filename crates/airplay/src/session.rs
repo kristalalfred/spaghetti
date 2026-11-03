@@ -32,8 +32,16 @@ pub(crate) enum Transport {
     /// own when it could be opened, and the stream its TEARDOWN names.
     AirPlay2 {
         _events: Option<EventChannel>,
-        stream_id: Option<u64>,
+        stream: StreamRef,
     },
+}
+
+/// Claude: an AirPlay 2 stream as a TEARDOWN names it: its type, and its ID
+/// when the receiver gave one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamRef {
+    pub(crate) kind: u64,
+    pub(crate) id: Option<u64>,
 }
 
 /// Claude: where a receiver takes a realtime stream's audio and control
@@ -133,9 +141,9 @@ impl Session {
         let deadline = Instant::now() + timeout;
         let requests = match &self.transport {
             Transport::AirPlay1 => vec![(None, "TEARDOWN")],
-            Transport::AirPlay2 { stream_id, .. } => vec![
+            Transport::AirPlay2 { stream, .. } => vec![
                 (
-                    Some(airplay2::stream_teardown(*stream_id)),
+                    Some(airplay2::stream_teardown(*stream)),
                     "TEARDOWN of the stream",
                 ),
                 (

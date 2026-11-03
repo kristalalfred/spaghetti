@@ -1,3 +1,4 @@
+mod buffered;
 mod realtime;
 
 use std::any::Any;
@@ -332,18 +333,20 @@ fn connect<'a, R>(
         clock: shared.clock,
         abort: &abort,
     };
-    let (session, delivery) = match connector.attempt(&found, protocol) {
-        Ok(link) => link,
-        Err(failure) => {
-            let reason = format!("{name}: {}", failure.reason());
-            let Some(now) = fallback(&settings, protocol, &failure, browser, receiver) else {
-                return Err(reason);
-            };
-            warn!(%receiver, %reason, "AirPlay 2 refused; falling back to AirPlay 1");
-            connector
-                .attempt(&now, Protocol::AirPlay1)
-                .map_err(|failure| format!("{name}: {}", failure.reason()))?
-        }
+    let mode = Mode::of(protocol, &found);
+    let mut attempt = (found, mode);
+    let (session, delivery) = loop {
+        let (found, mode) = &attempt;
+        let failure = match connector.attempt(found, *mode) {
+            Ok(link) => break link,
+            Err(failure) => failure,
+        };
+        let reason = format!("{name}: {}", failure.reason());
+        let Some(next) = fallback(&settings, *mode, &failure, found, browser, receiver) else {
+            return Err(reason);
+        };
+        warn!(%receiver, %reason, "{mode} could not start; falling back to {}", next.1);
+        attempt = next;
     };
     Ok(Streamer {
         shared,
@@ -363,23 +366,69 @@ fn connect<'a, R>(
     })
 }
 
-/// Claude: the receiver to try AirPlay 1 with after a handshake failed: only
-/// when the stream picked AirPlay 2 itself, the receiver refused it rather
-/// than failed, and the receiver offers AirPlay 1 as browsing knows it now.
+/// Claude: how a handshake speaks to the receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    AirPlay1,
+    /// Claude: realtime audio over UDP, timed by NTP.
+    Realtime,
+    /// Claude: buffered audio over TCP, timed by PTP.
+    Buffered,
+}
+
+impl Mode {
+    /// Claude: AirPlay 2 is buffered with a receiver whose AirPlay 2 service
+    /// takes buffered audio timed by PTP, and realtime with any other.
+    fn of(protocol: Protocol, receiver: &Receiver) -> Mode {
+        match protocol {
+            Protocol::AirPlay1 => Mode::AirPlay1,
+            Protocol::AirPlay2 if receiver.takes_buffered_audio() => Mode::Buffered,
+            Protocol::AirPlay2 => Mode::Realtime,
+        }
+    }
+
+    fn protocol(self) -> Protocol {
+        match self {
+            Mode::AirPlay1 => Protocol::AirPlay1,
+            Mode::Realtime | Mode::Buffered => Protocol::AirPlay2,
+        }
+    }
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Mode::AirPlay1 => "AirPlay 1",
+            Mode::Realtime => "realtime AirPlay 2",
+            Mode::Buffered => "buffered AirPlay 2",
+        })
+    }
+}
+
+/// Claude: what to try after a handshake in `mode` to `found` failed, and
+/// with which receiver: realtime AirPlay 2 on a fresh connection to the same
+/// receiver when buffered audio could not start, even when AirPlay 2 was
+/// asked for; AirPlay 1 when the stream picked AirPlay 2 itself, the receiver
+/// refused it rather than failed, and it offers AirPlay 1 as browsing knows it
+/// now; nothing otherwise.
 fn fallback(
     settings: &Settings,
-    protocol: Protocol,
+    mode: Mode,
     failure: &Failure,
+    found: &Receiver,
     browser: &browse::Shared,
     receiver: &ReceiverId,
-) -> Option<Receiver> {
-    let refused = matches!(failure, Failure::Refused(_));
-    if settings.protocol.is_some() || protocol != Protocol::AirPlay2 || !refused {
-        return None;
+) -> Option<(Receiver, Mode)> {
+    match (mode, failure) {
+        (Mode::Buffered, Failure::Unbuffered(_)) => Some((found.clone(), Mode::Realtime)),
+        (Mode::Buffered | Mode::Realtime, Failure::Refused(_)) if settings.protocol.is_none() => {
+            browser
+                .receiver(receiver)
+                .filter(|now| now.service(Protocol::AirPlay1).is_ok())
+                .map(|now| (now, Mode::AirPlay1))
+        }
+        _ => None,
     }
-    browser
-        .receiver(receiver)
-        .filter(|now| now.service(Protocol::AirPlay1).is_ok())
 }
 
 /// Claude: how a stream names itself to the receiver, the same for each
@@ -422,9 +471,17 @@ struct Connector<'a> {
 }
 
 impl Connector<'_> {
-    /// Claude: one handshake speaking `protocol`, holding nothing once it
-    /// fails.
-    fn attempt(
+    /// Claude: one handshake in `mode`, holding nothing once it fails.
+    fn attempt(&self, found: &Receiver, mode: Mode) -> Result<(Session, Delivery), Failure> {
+        match mode {
+            Mode::AirPlay1 | Mode::Realtime => self.realtime(found, mode.protocol()),
+            Mode::Buffered => Err(Failure::Unbuffered(
+                "this build does not stream buffered audio yet".into(),
+            )),
+        }
+    }
+
+    fn realtime(
         &self,
         found: &Receiver,
         protocol: Protocol,
@@ -514,7 +571,7 @@ impl Connector<'_> {
 }
 
 /// Claude: false when `abort` turned true first.
-fn pause_until(until: Instant, abort: &dyn Fn() -> bool) -> bool {
+pub(crate) fn pause_until(until: Instant, abort: &dyn Fn() -> bool) -> bool {
     loop {
         if abort() {
             return false;
@@ -833,4 +890,87 @@ fn poll<const N: usize>(mut fds: [libc::pollfd; N], timeout: Duration) -> [bool;
         return [false; N];
     }
     fds.map(|p| p.revents & (p.events | libc::POLLHUP | libc::POLLERR) != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fake::{BUFFERED_AIRPLAY_2_RECORD, Behavior, Fake, REALTIME_AIRPLAY_2_RECORD};
+    use crate::receiver::tests::SHAIRPORT_SYNC_RAOP;
+
+    /// Claude: the fake as browsing finds it, advertising AirPlay 2 with
+    /// `airplay` and AirPlay 1 as well when `raop` says so.
+    fn found(fake: &Fake, airplay: &str, raop: bool) -> (Browser, Receiver) {
+        let browser = Browser::offline();
+        fake.advertise_airplay(&browser, airplay);
+        if raop {
+            fake.advertise(&browser, SHAIRPORT_SYNC_RAOP);
+        }
+        let found = browser.shared().receiver(&fake.id()).unwrap();
+        (browser, found)
+    }
+
+    #[test]
+    fn airplay_2_is_buffered_with_receivers_taking_buffered_audio_timed_by_ptp() {
+        let fake = Fake::start(Behavior::default());
+        let (_, buffered) = found(&fake, BUFFERED_AIRPLAY_2_RECORD, true);
+        let (_, realtime) = found(&fake, REALTIME_AIRPLAY_2_RECORD, true);
+        assert_eq!(Mode::of(Protocol::AirPlay2, &buffered), Mode::Buffered);
+        assert_eq!(Mode::of(Protocol::AirPlay2, &realtime), Mode::Realtime);
+        assert_eq!(Mode::of(Protocol::AirPlay1, &buffered), Mode::AirPlay1);
+        for mode in [Mode::Buffered, Mode::Realtime] {
+            assert_eq!(mode.protocol(), Protocol::AirPlay2);
+        }
+        assert_eq!(Mode::AirPlay1.protocol(), Protocol::AirPlay1);
+    }
+
+    #[test]
+    fn buffered_falls_back_to_realtime_and_a_refused_airplay_2_to_airplay_1() {
+        let fake = Fake::start(Behavior::default());
+        let automatic = Settings::new().unwrap();
+        let forced = Settings {
+            protocol: Some(Protocol::AirPlay2),
+            ..Settings::new().unwrap()
+        };
+        let unbuffered = Failure::Unbuffered("SETUP answered 501".into());
+        let refused = Failure::Refused("busy".into());
+        let failed = Failure::Failed("no answer".into());
+        let next = |settings: &Settings, mode, failure: &Failure, raop| {
+            let (browser, found) = found(&fake, BUFFERED_AIRPLAY_2_RECORD, raop);
+            fallback(
+                settings,
+                mode,
+                failure,
+                &found,
+                browser.shared(),
+                &fake.id(),
+            )
+            .map(|(receiver, mode)| (receiver == found, receiver.raop.is_some(), mode))
+        };
+
+        for settings in [&automatic, &forced] {
+            assert_eq!(
+                next(settings, Mode::Buffered, &unbuffered, false),
+                Some((true, false, Mode::Realtime)),
+                "to realtime on the same receiver, even with AirPlay 2 asked for"
+            );
+        }
+        for mode in [Mode::Buffered, Mode::Realtime] {
+            assert_eq!(
+                next(&automatic, mode, &refused, true),
+                Some((true, true, Mode::AirPlay1))
+            );
+            assert_eq!(next(&automatic, mode, &refused, false), None, "no RAOP");
+            assert_eq!(
+                next(&forced, mode, &refused, true),
+                None,
+                "AirPlay 2 asked for"
+            );
+            assert_eq!(next(&automatic, mode, &failed, true), None);
+        }
+        assert_eq!(next(&automatic, Mode::Realtime, &unbuffered, true), None);
+        for failure in [&unbuffered, &refused, &failed] {
+            assert_eq!(next(&automatic, Mode::AirPlay1, failure, true), None);
+        }
+    }
 }

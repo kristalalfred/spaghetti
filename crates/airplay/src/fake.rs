@@ -17,6 +17,10 @@ use crate::rtsp::{PLIST, Response, decode_response};
 use crate::tlv8::{self, Tlv};
 use crate::{Browser, FRAMES_PER_PACKET, ReceiverId, SAMPLE_RATE, hap, pairing, srp};
 
+mod buffered;
+
+pub(crate) use buffered::{BufferedPacket, DataReader, Reading};
+
 const ID: &str = "AA:BB:CC:DD:EE:FF";
 const INSTANCE: &str = "AABBCCDDEEFF@fake";
 const POLL: Duration = Duration::from_millis(5);
@@ -25,6 +29,10 @@ const POLL: Duration = Duration::from_millis(5);
 /// (buffered audio) and 41 (PTP).
 pub(crate) const REALTIME_AIRPLAY_2_RECORD: &str =
     "deviceid=AA:BB:CC:DD:EE:FF features=0x445F8A00,0x1C040 flags=0x4 model=Fake";
+/// Claude: what the fake's `_airplay._tcp` record says when it takes buffered
+/// AirPlay 2 timed by PTP: the HK Citation MultiBeam 1100's feature bits.
+pub(crate) const BUFFERED_AIRPLAY_2_RECORD: &str =
+    "deviceid=AA:BB:CC:DD:EE:FF features=0x445F8A00,0x1C340 flags=0x4 model=Fake";
 pub(crate) const STREAM_ID: u64 = 1;
 
 /// Claude: a step of a handshake, at which the fake can hang or refuse.
@@ -38,6 +46,8 @@ pub(crate) enum Step {
     Record,
     Flush,
     Feedback,
+    SetPeers,
+    Anchor,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -78,6 +88,10 @@ pub(crate) struct Behavior {
     pub(crate) rtsp: Rtsp,
     pub(crate) pairing: Pairing,
     pub(crate) event_port: EventPort,
+    /// Claude: how many anchors the fake answers 400 before taking one, as a
+    /// receiver that has not yet measured the sender's clock does.
+    pub(crate) anchor_refusals: u32,
+    pub(crate) reading: Reading,
 }
 
 #[derive(Debug, Clone)]
@@ -137,7 +151,17 @@ struct State {
     audio_key: Mutex<Option<[u8; 32]>>,
     events: Mutex<Events>,
     connections: Mutex<Vec<TcpStream>>,
+    anchors: Mutex<Vec<(Instant, Dictionary)>>,
+    data: Mutex<Data>,
     stop: AtomicBool,
+}
+
+/// Claude: what came over a buffered stream's data connection.
+#[derive(Default)]
+struct Data {
+    packets: Vec<(Instant, BufferedPacket)>,
+    bytes: usize,
+    ended: Option<Instant>,
 }
 
 /// Claude: the fake's side of a stream's event connection: it sends requests
@@ -246,6 +270,10 @@ impl Fake {
 
     pub(crate) fn wake(&self) {
         assert_eq!(unsafe { libc::listen(self.listener.as_raw_fd(), 16) }, 0);
+    }
+
+    pub(crate) fn address(&self) -> SocketAddr {
+        self.address
     }
 
     pub(crate) fn id(&self) -> ReceiverId {
@@ -461,6 +489,28 @@ impl Fake {
         self.state.connections.lock().unwrap().len()
     }
 
+    /// Claude: each SETRATEANCHORTIME's body, as it came, whatever the fake
+    /// answered.
+    pub(crate) fn anchors(&self) -> Vec<(Instant, Dictionary)> {
+        self.state.anchors.lock().unwrap().clone()
+    }
+
+    /// Claude: each packet of the buffered stream's data connection as it
+    /// came, opened with the key the stream's SETUP sent.
+    pub(crate) fn buffered_audio(&self) -> Vec<(Instant, BufferedPacket)> {
+        self.state.data.lock().unwrap().packets.clone()
+    }
+
+    /// Claude: how many bytes the fake has read from the data connection.
+    pub(crate) fn data_bytes(&self) -> usize {
+        self.state.data.lock().unwrap().bytes
+    }
+
+    /// Claude: when the data connection closed, as the fake read it.
+    pub(crate) fn data_ended(&self) -> Option<Instant> {
+        self.state.data.lock().unwrap().ended
+    }
+
     pub(crate) fn close_connections(&self) {
         for connection in self.state.connections.lock().unwrap().iter() {
             let _ = connection.shutdown(Shutdown::Both);
@@ -570,6 +620,7 @@ impl Server {
         let mut received = Vec::new();
         let mut auth_setup = false;
         let mut silent = false;
+        let mut recorded = false;
         loop {
             let request = loop {
                 if let Some((request, len)) = parse_request(&received) {
@@ -647,8 +698,10 @@ impl Server {
                         Answer::status("403 Forbidden")
                     }
                     "SETUP" if request.body.is_empty() => self.setup_raop(&request),
-                    "SETUP" => self.setup_airplay_2(&request),
+                    "SETUP" => self.setup_airplay_2(&request, recorded),
+                    "SETRATEANCHORTIME" => self.anchor(&request),
                     "RECORD" => {
+                        recorded = true;
                         let mut answer = Answer::ok();
                         if let Some(latency) = self.behavior.audio_latency {
                             answer
@@ -756,7 +809,11 @@ impl Server {
         answer
     }
 
-    fn setup_airplay_2(&self, request: &FakeRequest) -> Answer {
+    /// Claude: answers a session's SETUP with NTP or PTP timing, as
+    /// shairport-sync answers, and a stream's, realtime or buffered. A
+    /// buffered stream's SETUP before RECORD is refused, as receivers that
+    /// play buffered audio only once recording are reported to need.
+    fn setup_airplay_2(&self, request: &FakeRequest, recorded: bool) -> Answer {
         let setup = request.plist();
         let number = |dictionary: &Dictionary, key: &str| {
             dictionary[key]
@@ -767,24 +824,45 @@ impl Server {
             let stream = streams[0].as_dictionary().unwrap();
             let key = stream["shk"].as_data().unwrap().try_into().unwrap();
             *self.state.audio_key.lock().unwrap() = Some(key);
-            *self.state.control_port.lock().unwrap() = Some(number(stream, "controlPort") as u16);
+            let kind = number(stream, "type");
             let mut reply = Dictionary::new();
-            reply.insert("type".into(), number(stream, "type").into());
-            reply.insert("dataPort".into(), u64::from(self.ports.audio).into());
+            reply.insert("type".into(), kind.into());
+            if kind == 103 {
+                if !recorded {
+                    return Answer::status(status_line(455));
+                }
+                let port =
+                    buffered::listen_for_data(self.state.clone(), key, self.behavior.reading);
+                reply.insert("dataPort".into(), u64::from(port).into());
+                reply.insert("audioBufferSize".into(), 8_388_608u64.into());
+            } else {
+                *self.state.control_port.lock().unwrap() =
+                    Some(number(stream, "controlPort") as u16);
+                reply.insert("dataPort".into(), u64::from(self.ports.audio).into());
+            }
             reply.insert("controlPort".into(), u64::from(self.ports.control).into());
             reply.insert("streamID".into(), STREAM_ID.into());
             let mut streams = Dictionary::new();
             streams.insert("streams".into(), vec![Value::Dictionary(reply)].into());
             streams
         } else {
-            *self.state.timing_port.lock().unwrap() = Some(number(&setup, "timingPort") as u16);
             let secret = self.secret.expect("the stream paired first");
             let mut reply = Dictionary::new();
             if self.behavior.event_port != EventPort::Missing {
                 let port = self.listen_for_events(secret);
                 reply.insert("eventPort".into(), u64::from(port).into());
             }
-            reply.insert("timingPort".into(), u64::from(self.ports.timing).into());
+            if setup["timingProtocol"].as_string() == Some("PTP") {
+                assert!(setup.contains_key("timingPeerInfo"));
+                let mut peer = Dictionary::new();
+                peer.insert("Addresses".into(), vec![Value::from("127.0.0.1")].into());
+                peer.insert("ID".into(), "127.0.0.1".into());
+                reply.insert("timingPort".into(), 0u64.into());
+                reply.insert("timingPeerInfo".into(), Value::Dictionary(peer));
+            } else {
+                *self.state.timing_port.lock().unwrap() = Some(number(&setup, "timingPort") as u16);
+                reply.insert("timingPort".into(), u64::from(self.ports.timing).into());
+            }
             reply
         };
         let mut body = Vec::new();
@@ -792,6 +870,18 @@ impl Server {
             .to_writer_binary(&mut body)
             .unwrap();
         Answer::ok().with_body(PLIST, body)
+    }
+
+    /// Claude: keeps each anchor and takes it once it has turned away
+    /// `anchor_refusals` with 400.
+    fn anchor(&self, request: &FakeRequest) -> Answer {
+        let mut anchors = self.state.anchors.lock().unwrap();
+        anchors.push((Instant::now(), request.plist()));
+        if anchors.len() as u32 <= self.behavior.anchor_refusals {
+            Answer::status(status_line(400))
+        } else {
+            Answer::ok()
+        }
     }
 
     /// Claude: opens the port the stream's event connection comes to. Once it
@@ -885,6 +975,8 @@ fn step_of(request: &FakeRequest) -> Option<Step> {
         ("RECORD", _) => Some(Step::Record),
         ("FLUSH", _) => Some(Step::Flush),
         ("POST", "/feedback") => Some(Step::Feedback),
+        ("SETPEERS", _) => Some(Step::SetPeers),
+        ("SETRATEANCHORTIME", _) => Some(Step::Anchor),
         _ => None,
     }
 }
@@ -892,7 +984,10 @@ fn step_of(request: &FakeRequest) -> Option<Step> {
 fn status_line(status: u16) -> &'static str {
     match status {
         400 => "400 Bad Request",
+        401 => "401 Unauthorized",
         403 => "403 Forbidden",
+        453 => "453 Not Enough Bandwidth",
+        455 => "455 Method Not Valid in This State",
         470 => "470 Connection Authorization Required",
         500 => "500 Internal Server Error",
         501 => "501 Not Implemented",
@@ -944,8 +1039,21 @@ pub(crate) struct AudioPacket {
 pub(crate) fn decode_audio(bytes: &[u8]) -> AudioPacket {
     assert_eq!(bytes[0], 0x80);
     assert_eq!(bytes[1] & 0x7F, 0x60);
+    let (counted, frames) = decode_alac(&bytes[12..]);
+    AudioPacket {
+        seq: u16::from_be_bytes([bytes[2], bytes[3]]),
+        timestamp: u32::from_be_bytes(bytes[4..8].try_into().unwrap()),
+        marker: bytes[1] & 0x80 != 0,
+        counted,
+        frames,
+    }
+}
+
+/// Claude: reads an uncompressed ALAC frame, checking every field of its
+/// layout, and says whether it carries its count.
+fn decode_alac(payload: &[u8]) -> (bool, Vec<[i16; 2]>) {
     let mut bits = BitReader {
-        bytes: &bytes[12..],
+        bytes: payload,
         bit: 0,
     };
     assert_eq!(bits.take(3), 1, "channel pair element");
@@ -963,14 +1071,8 @@ pub(crate) fn decode_audio(bytes: &[u8]) -> AudioPacket {
         .map(|_| [bits.take(16) as u16 as i16, bits.take(16) as u16 as i16])
         .collect();
     assert_eq!(bits.take(3), 7, "end element");
-    assert_eq!(bits.bit.div_ceil(8), bytes.len() - 12, "no trailing bytes");
-    AudioPacket {
-        seq: u16::from_be_bytes([bytes[2], bytes[3]]),
-        timestamp: u32::from_be_bytes(bytes[4..8].try_into().unwrap()),
-        marker: bytes[1] & 0x80 != 0,
-        counted,
-        frames,
-    }
+    assert_eq!(bits.bit.div_ceil(8), payload.len(), "no trailing bytes");
+    (counted, frames)
 }
 
 struct BitReader<'a> {
