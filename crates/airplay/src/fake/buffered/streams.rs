@@ -1261,6 +1261,12 @@ fn a_mapping_refined_earlier_is_caught_up_at_once() {
     }
 }
 
+/// Claude: finishing ends when the last packet sent has played and its delay
+/// after, as the mapping read when finishing began says: refinements after
+/// that, here moving every play time 600 ms later, do not move the end. The
+/// stream fixes the end on its first step after `finish`, well within the
+/// wait before the first refinement, and the first TEARDOWN marks the end, so
+/// its answer's wait does not count.
 #[test]
 fn finishing_ends_when_it_first_said_however_the_mapping_is_refined_after() {
     let Led {
@@ -1271,21 +1277,26 @@ fn finishing_ends_when_it_first_said_however_the_mapping_is_refined_after() {
     } = Led::start(Reading::Steady, LATENCY);
     let delay = Duration::from_millis(100);
     let finishing = stream.finish(delay);
-    let started = Instant::now();
+    std::thread::sleep(Duration::from_millis(100));
+    let end = calls.all().last().unwrap().1 + PACKET_DURATION + delay;
     for step in 1..=3 {
-        own.refine(Duration::from_millis(100) * step, 1.0);
-        std::thread::sleep(Duration::from_millis(50));
+        own.refine(Duration::from_millis(200) * step, 1.0);
+        std::thread::sleep(Duration::from_millis(30));
     }
+    assert!(Instant::now() < end, "the refinements came after the end");
     finishing.wait();
-    let returned = Instant::now();
-    let last = calls.all().last().unwrap().1;
-    let end = last + PACKET_DURATION + delay;
-    assert!(returned >= end, "{:?} early", end - returned);
+    let torn_down = setup
+        .fake
+        .requests()
+        .into_iter()
+        .find(|(_, _, request)| request.method == "TEARDOWN")
+        .expect("a TEARDOWN")
+        .0;
+    assert!(torn_down >= end, "torn down {:?} early", end - torn_down);
     assert!(
-        returned < end + setup.settings.teardown_timeout + Duration::from_millis(50),
-        "finishing ran {:?} past its end, {:?} after it started",
-        returned - end,
-        returned - started
+        torn_down < end + Duration::from_millis(50),
+        "torn down {:?} after the end fixed when finishing began",
+        torn_down - end
     );
 }
 
