@@ -7,8 +7,8 @@ use tracing::debug;
 
 use super::{
     ALAC_44100_16_2, COMPRESSION_ALAC, Failure, Paired, binary, device_id, dictionary, open_events,
-    pair, port, random_uuid, refused, session_teardown, setup_turned_away_as, stream_teardown,
-    teardown, with_port,
+    pair, port, random_uuid, session_teardown, setup_turned_away_as, stream_teardown, teardown,
+    with_port,
 };
 use crate::events::EventChannel;
 use crate::hap::{Counted, KEY_LEN};
@@ -144,7 +144,7 @@ pub(crate) fn set_up(
         ] {
             let response = handshake.exchange(method, body, timeout, abort)?;
             if response.status != 200 {
-                return Err(refused(method, &response));
+                return Err(turned_away(method, &response));
             }
         }
         Ok(())
@@ -836,7 +836,7 @@ mod tests {
         }
 
         #[test]
-        fn setup_answers_other_than_200_refuse_or_unbuffer_and_release_what_was_set_up() {
+        fn buffered_steps_answered_other_than_200_refuse_or_unbuffer_and_release_what_was_set_up() {
             for (step, status, expected) in [
                 (Step::SessionSetup, 501, "Unbuffered"),
                 (Step::SessionSetup, 500, "Unbuffered"),
@@ -844,8 +844,10 @@ mod tests {
                 (Step::SessionSetup, 470, "Refused"),
                 (Step::StreamSetup, 501, "Unbuffered"),
                 (Step::StreamSetup, 403, "Refused"),
-                (Step::Record, 501, "Refused"),
-                (Step::SetPeers, 501, "Refused"),
+                (Step::Record, 501, "Unbuffered"),
+                (Step::Record, 453, "Refused"),
+                (Step::SetPeers, 501, "Unbuffered"),
+                (Step::SetPeers, 401, "Refused"),
             ] {
                 let fake = Fake::start(Behavior {
                     rtsp: Rtsp::RefuseAt(step, status),

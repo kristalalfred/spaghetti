@@ -34,7 +34,6 @@ impl Outbox {
         assert!(capacity > 0);
         socket.set_nonblocking(true)?;
         socket.set_nodelay(true)?;
-        no_sigpipe(&socket)?;
         Ok(Outbox {
             socket,
             slots: (0..capacity)
@@ -120,27 +119,6 @@ impl Outbox {
                 now - self.slots[self.head].deadline
             )),
         }
-    }
-}
-
-/// Claude: a write to a connection the receiver closed fails instead of
-/// raising SIGPIPE, which would end a host program that leaves it at its
-/// default.
-fn no_sigpipe(socket: &TcpStream) -> io::Result<()> {
-    let on: libc::c_int = 1;
-    let set = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_NOSIGPIPE,
-            (&raw const on).cast(),
-            size_of_val(&on) as libc::socklen_t,
-        )
-    };
-    if set == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
     }
 }
 
@@ -399,21 +377,9 @@ mod tests {
     }
 
     #[test]
-    fn a_receiver_closing_mid_packet_fails_the_next_writes_without_a_signal() {
+    fn a_receiver_closing_mid_packet_fails_the_next_writes() {
         let (sender, receiver) = connection();
         let mut outbox = Outbox::new(sender, 50).unwrap();
-        let mut nosigpipe: libc::c_int = 0;
-        let mut len = size_of_val(&nosigpipe) as libc::socklen_t;
-        let got = unsafe {
-            libc::getsockopt(
-                outbox.socket.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_NOSIGPIPE,
-                (&raw mut nosigpipe).cast(),
-                &mut len,
-            )
-        };
-        assert_eq!((got, nosigpipe), (0, 1));
 
         let taken = BUFFERED_PACKET_LEN + 600;
         let reading = read(receiver.try_clone().unwrap(), 4096, None, taken);

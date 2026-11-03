@@ -574,9 +574,63 @@ fn redacted(value: &plist::Value, out: &mut String) {
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
     use std::thread;
 
     use super::*;
+
+    /// Claude: whether writing to `socket` once its peer has gone fails
+    /// rather than raising SIGPIPE.
+    fn raises_no_sigpipe(socket: &impl AsRawFd) -> bool {
+        let mut set: libc::c_int = 0;
+        let mut len = size_of_val(&set) as libc::socklen_t;
+        let got = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                (&raw mut set).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(got, 0, "{}", io::Error::last_os_error());
+        set != 0
+    }
+
+    /// Claude: socket2 sets SO_NOSIGPIPE on every socket `Socket::new` makes
+    /// on Apple platforms, so the RTSP, event and data connections, all made
+    /// by `connect`, never end a host program that leaves SIGPIPE at its
+    /// default, as an app embedding the crate may. A socket made raw has no
+    /// such guard.
+    #[test]
+    fn connections_to_receivers_fail_writes_after_a_close_without_a_signal() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let raw = Socket::new_raw(Domain::IPV4, Type::STREAM, None).unwrap();
+        assert!(!raises_no_sigpipe(&raw));
+        let mut stream = connect(address, Duration::from_secs(1), &|| false).unwrap();
+        assert!(raises_no_sigpipe(&stream));
+        let (accepted, _) = listener.accept().unwrap();
+        drop(accepted);
+        let started = Instant::now();
+        let failed = loop {
+            if let Err(e) = stream.write_all(&[0; 1024]) {
+                break e;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "writes kept succeeding"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(
+            matches!(
+                failed.kind(),
+                ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+            ),
+            "{failed}"
+        );
+    }
 
     #[test]
     fn requests_put_cseq_first_then_common_headers_then_the_body() {
@@ -676,7 +730,6 @@ mod tests {
     #[test]
     fn an_encrypted_connection_seals_requests_and_opens_split_and_coalesced_responses() {
         use crate::hap::tests::{reversed, test_keys};
-        use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
