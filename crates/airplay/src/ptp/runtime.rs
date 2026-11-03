@@ -322,7 +322,7 @@ struct Relationship {
     sync_sequence: u16,
     signaling_sequence: u16,
     epoch: u32,
-    rejected_master: Option<(PortIdentity, Dataset)>,
+    rejected_master: Option<Box<Follower>>,
 }
 
 impl Relationship {
@@ -428,7 +428,12 @@ impl Relationship {
         }
         if let Role::Following(f) = &mut self.role {
             if !f.has_sync_pair && now.duration_since(f.started) >= ANNOUNCE_WITHOUT_TIMING {
-                self.rejected_master = Some((f.source, f.dataset.clone()));
+                self.rejected_master = Some(Box::new(Follower::new(
+                    f.source,
+                    f.dataset.clone(),
+                    self.epoch.wrapping_add(1),
+                    now,
+                )));
                 self.lead(now, own);
                 return;
             }
@@ -536,21 +541,43 @@ impl Relationship {
         if matches!(self.role, Role::Lost) || message.source.clock == self.source.clock {
             return;
         }
+        if matches!(
+            message.body,
+            Body::Sync(_) | Body::FollowUp(_) | Body::DelayResp { .. }
+        ) && let Some(candidate) = &mut self.rejected_master
+            && message.source == candidate.source
+        {
+            if let Err(reason) = candidate.receive(
+                message,
+                received,
+                sockets,
+                self.address,
+                self.endpoint,
+                self.source,
+            ) {
+                self.lose(reason.into());
+                return;
+            }
+            if candidate.has_sync_pair {
+                self.epoch = candidate.servo.timeline().epoch;
+                info!(peer = ?self.endpoint, clock = candidate.dataset.grandmaster.as_u64(), epoch = self.epoch, "PTP rejected master resumed timing; acquiring follower");
+                self.role = Role::Following(self.rejected_master.take().unwrap());
+                self.publish(Timing::Acquiring);
+            }
+            return;
+        }
         match &message.body {
             Body::Announce { dataset, .. } => {
                 if dataset.grandmaster == self.local.grandmaster || dataset.steps >= 255 {
                     return;
                 }
                 if dataset < &self.local {
-                    if self
-                        .rejected_master
-                        .as_ref()
-                        .is_some_and(|(source, rejected)| {
-                            *source == message.source && rejected == dataset
-                        })
-                    {
+                    if self.rejected_master.as_ref().is_some_and(|candidate| {
+                        candidate.source == message.source && &candidate.dataset == dataset
+                    }) {
                         return;
                     }
+                    self.rejected_master = None;
                     let changed = !matches!(&self.role, Role::Following(f) if f.source == message.source && f.servo.timeline().clock == dataset.grandmaster);
                     if changed {
                         self.epoch = self.epoch.wrapping_add(1);
@@ -672,6 +699,7 @@ struct Exchange {
     follow: Option<(u64, i64, Option<u16>)>,
     request: Option<(u16, Instant)>,
     response: Option<(u64, i64)>,
+    epoch: Option<u32>,
 }
 
 struct Follower {
@@ -683,6 +711,7 @@ struct Follower {
     pending: HashMap<u16, Exchange>,
     recent: VecDeque<u16>,
     latest_sync: Option<u16>,
+    latest_pair: Option<u16>,
     delay_sequence: u16,
     last_valid: Instant,
     last_sample: Option<Instant>,
@@ -700,6 +729,7 @@ impl Follower {
             pending: HashMap::new(),
             recent: VecDeque::new(),
             latest_sync: None,
+            latest_pair: None,
             delay_sequence: 0,
             last_valid: now,
             last_sample: None,
@@ -763,6 +793,7 @@ impl Follower {
             follow: None,
             request: None,
             response: None,
+            epoch: None,
         });
         match &message.body {
             Body::Sync(origin) if exchange.sync.is_none() => {
@@ -803,15 +834,25 @@ impl Follower {
     }
 
     fn complete(&mut self, sequence: u16, received: Instant) -> Result<(), &'static str> {
-        let Some(exchange) = self.pending.get(&sequence) else {
+        let Some(exchange) = self.pending.get_mut(&sequence) else {
             return Ok(());
         };
-        if exchange.sync.is_some() && exchange.follow.is_some() {
+        if exchange.sync.is_some()
+            && let Some((_, _, indicator)) = exchange.follow
+            && self
+                .latest_pair
+                .is_none_or(|latest| (sequence.wrapping_sub(latest) as i16) > 0)
+        {
             self.has_sync_pair = true;
+            self.latest_pair = Some(sequence);
+            if let Some(indicator) = indicator {
+                self.servo.indicator(indicator);
+            }
+            exchange.epoch = Some(self.servo.timeline().epoch);
         }
         let (
             Some((t2, sync_correction)),
-            Some((t1, follow_correction, indicator)),
+            Some((t1, follow_correction, _)),
             Some((_, t3)),
             Some((t4, reverse_correction)),
         ) = (
@@ -823,10 +864,14 @@ impl Follower {
         else {
             return Ok(());
         };
+        let epoch = exchange.epoch;
         self.pending.remove(&sequence);
         self.recent.push_back(sequence);
         while self.recent.len() > 64 {
             self.recent.pop_front();
+        }
+        if epoch != Some(self.servo.timeline().epoch) {
+            return Ok(());
         }
         let Some(sample) = Sample::exchange(
             t1,
@@ -843,9 +888,6 @@ impl Follower {
             return Ok(());
         }
         self.last_sample = Some(sample.host);
-        if let Some(indicator) = indicator {
-            self.servo.indicator(indicator);
-        }
         let previous = self.servo.last_good;
         self.servo.observe(sample)?;
         if self.servo.last_good != previous && self.servo.last_good.is_some()
