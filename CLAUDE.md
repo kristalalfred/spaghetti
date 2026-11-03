@@ -99,8 +99,10 @@ PTP clock: one per process (`Ptp::shared`) on UDP 319 and 320, held while a buff
   clock announces as a Mac does (priority1 250), follows a receiver that announces better
   (sending a Delay_Req after each Sync), and leads one that has not done so 2 s after the
   peer is added. Exchanges are timed from the messages' timestamps alone: incoming
-  correction fields are ignored, since an HK Citation puts its own processing delays in them
-  (40-50 ms on its first Sync). A followed timeline settles once its statistical offset
+  correction fields are ignored. Sender and receiver exchange PTP directly, with no
+  transparent clock between them to add residence time, and with the fields applied an
+  HK Citation's exchanges gave negative round trips (its first exchange's Follow_Up and
+  Delay_Resp carried 40-50 ms; aPTP, its PTP stack, writes its own delays there). A followed timeline settles once its statistical offset
   uncertainty is within 5 ms, using a +/-100 ppm rate prior until a fitted rate is better,
   holds over a silent master for 15 s, and is then lost
 

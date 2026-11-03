@@ -25,10 +25,11 @@ const ANCHOR_RETRY: Duration = Duration::from_millis(250);
 const PEER_LIST: &str = "/peer-list-changed";
 
 /// Claude: the audio format of buffered streams, as their stream SETUP names
-/// it and each packet's SSRC carries it. ALAC at 44.1 kHz, 16-bit and the
-/// renderer's 352 frames is an experiment: no receiver has yet been heard
-/// playing it, and its SSRC is inferred (`Format::ssrc`). Apple's sender sent
-/// the soundbar AAC-LC at 44.1 kHz.
+/// it and each packet's SSRC carries it: ALAC at 44.1 kHz, 16-bit, in the
+/// renderer's 352 frames. An HK Citation MultiBeam 1100 played a 440 Hz tone
+/// sent this way at 440 Hz; its SSRC is inferred from the codes of other
+/// formats (`Format::ssrc`), and Apple's sender sent that soundbar AAC-LC at
+/// 44.1 kHz instead.
 pub(crate) const FORMAT: Format = Format {
     audio_format: ALAC_44100_16_2,
     compression: COMPRESSION_ALAC,
