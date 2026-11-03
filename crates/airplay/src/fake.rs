@@ -20,10 +20,11 @@ use crate::{Browser, FRAMES_PER_PACKET, ReceiverId, SAMPLE_RATE, hap, pairing, s
 const ID: &str = "AA:BB:CC:DD:EE:FF";
 const INSTANCE: &str = "AABBCCDDEEFF@fake";
 const POLL: Duration = Duration::from_millis(5);
-/// Claude: what the fake's `_airplay._tcp` record says when it takes AirPlay 2:
-/// the HK Citation MultiBeam 1100's feature bits.
-pub(crate) const AIRPLAY_2_RECORD: &str =
-    "deviceid=AA:BB:CC:DD:EE:FF features=0x445F8A00,0x1C340 flags=0x4 model=Fake";
+/// Claude: what the fake's `_airplay._tcp` record says when it takes AirPlay 2
+/// in realtime only: the HK Citation MultiBeam 1100's feature bits without 40
+/// (buffered audio) and 41 (PTP).
+pub(crate) const REALTIME_AIRPLAY_2_RECORD: &str =
+    "deviceid=AA:BB:CC:DD:EE:FF features=0x445F8A00,0x1C040 flags=0x4 model=Fake";
 pub(crate) const STREAM_ID: u64 = 1;
 
 /// Claude: a step of a handshake, at which the fake can hang or refuse.
@@ -1216,7 +1217,7 @@ pub(crate) mod tests {
             ..Behavior::default()
         });
         let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
-        fake.advertise_airplay(&browser, AIRPLAY_2_RECORD);
+        fake.advertise_airplay(&browser, REALTIME_AIRPLAY_2_RECORD);
         let renders = Renders::default();
         let settings = Settings {
             first_seq,
@@ -1395,7 +1396,7 @@ pub(crate) mod tests {
         for delay in [Duration::ZERO, Duration::from_millis(200)] {
             let fake = Fake::start(Behavior::default());
             let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
-            fake.advertise_airplay(&browser, AIRPLAY_2_RECORD);
+            fake.advertise_airplay(&browser, REALTIME_AIRPLAY_2_RECORD);
             let renders = Renders::default();
             let settings = Settings {
                 protocol: Some(protocol),
@@ -2396,7 +2397,7 @@ pub(crate) mod tests {
 
         let fake = Fake::start(Behavior::default());
         let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
-        fake.advertise_airplay(&browser, AIRPLAY_2_RECORD);
+        fake.advertise_airplay(&browser, REALTIME_AIRPLAY_2_RECORD);
         let airplay_1 = || Settings {
             protocol: Some(Protocol::AirPlay1),
             ..settings()

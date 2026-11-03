@@ -32,7 +32,7 @@ fn airplay_2() -> Settings {
 /// 1 as well when `raop` says so, as the Citation does.
 fn browser(fake: &Fake, raop: bool) -> Browser {
     let browser = Browser::offline();
-    fake.advertise_airplay(&browser, AIRPLAY_2_RECORD);
+    fake.advertise_airplay(&browser, REALTIME_AIRPLAY_2_RECORD);
     if raop {
         fake.advertise(&browser, SHAIRPORT_SYNC_RAOP);
     }
@@ -750,7 +750,7 @@ fn an_automatic_stream_takes_airplay_2_whichever_service_resolves_first() {
             if raop_next {
                 raop.advertise(&browser, MOVE_2_RAOP);
             } else {
-                airplay.advertise_airplay(&browser, AIRPLAY_2_RECORD);
+                airplay.advertise_airplay(&browser, REALTIME_AIRPLAY_2_RECORD);
             }
         };
         advertise(raop_first);
@@ -831,7 +831,7 @@ fn an_airplay_service_resolved_while_a_stream_waits_its_turn_is_taken() {
     );
     thread::sleep(automatic().lookup_window + Duration::from_millis(200));
     assert_eq!(next.status(), Status::Connecting);
-    airplay.advertise_airplay(&browser, AIRPLAY_2_RECORD);
+    airplay.advertise_airplay(&browser, REALTIME_AIRPLAY_2_RECORD);
     first.finish(Duration::ZERO).wait();
     assert!(
         wait_until(HANDSHAKE, || streaming(&next)),

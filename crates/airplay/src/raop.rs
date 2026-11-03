@@ -5,7 +5,7 @@ use tracing::{debug, info};
 
 use crate::receiver::Txt;
 use crate::rtsp::{Connection, Request, Response};
-use crate::session::{self, Offer, Session, Transport, refusal};
+use crate::session::{self, Offer, Packets, RealtimeAudio, Session, Transport, refusal};
 use crate::{FRAMES_PER_PACKET, SAMPLE_RATE};
 
 enum Failure {
@@ -22,7 +22,7 @@ pub(crate) fn negotiate(
     offer: &Offer,
     timeout: Duration,
     abort: &dyn Fn() -> bool,
-) -> Result<Session, String> {
+) -> Result<(Session, RealtimeAudio), String> {
     let peer = connection.peer_addr();
     let common = connection.common_headers().to_vec();
     match attempt(connection, offer, timeout, abort, false) {
@@ -57,7 +57,7 @@ fn attempt(
     timeout: Duration,
     abort: &dyn Fn() -> bool,
     auth_setup: bool,
-) -> Result<Session, Failure> {
+) -> Result<(Session, RealtimeAudio), Failure> {
     let local = connection.local_addr().ip();
     let peer = connection.peer_addr();
     let session_id = getrandom::u32().map_err(|e| Failure::Other(e.to_string()))?;
@@ -162,14 +162,19 @@ fn attempt(
         .map_err(Failure::Other)?;
     let response = expect_ok("RECORD", response)?;
     debug!("AirPlay 1 RECORD answered");
-    Ok(Session {
-        connection,
-        uri,
-        audio,
-        control,
-        audio_latency: session::audio_latency(&response),
-        transport: Transport::AirPlay1,
-    })
+    Ok((
+        Session {
+            connection,
+            uri,
+            transport: Transport::AirPlay1,
+        },
+        RealtimeAudio {
+            audio,
+            control,
+            latency: session::audio_latency(&response),
+            packets: Packets::AirPlay1,
+        },
+    ))
 }
 
 const AUTH_SETUP_UNENCRYPTED: u8 = 0x01;

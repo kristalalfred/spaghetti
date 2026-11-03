@@ -10,7 +10,7 @@ use crate::packet::{self, AudioHeader, Framing, MAX_AUDIO_PACKET_LEN};
 use crate::rtsp::{Connection, Request, Response};
 use crate::{FRAMES_PER_PACKET, Protocol};
 
-/// Claude: what a stream offers the receiver in its handshake.
+/// Claude: what a realtime stream offers the receiver in its handshake.
 pub(crate) struct Offer {
     pub(crate) control_port: u16,
     pub(crate) timing_port: u16,
@@ -18,28 +18,38 @@ pub(crate) struct Offer {
     pub(crate) first_rtp: u32,
 }
 
-/// Claude: a receiver that accepted a stream: where to send audio and control
-/// packets, the latency it adds to what sync packets say, and what the
-/// protocol keeps for the rest of the session.
+/// Claude: a receiver that accepted a stream: its RTSP connection and what
+/// the protocol keeps for the rest of the session.
 pub(crate) struct Session {
     pub(crate) connection: Connection,
     pub(crate) uri: String,
-    pub(crate) audio: SocketAddr,
-    pub(crate) control: SocketAddr,
-    pub(crate) audio_latency: AudioLatency,
     pub(crate) transport: Transport,
 }
 
 pub(crate) enum Transport {
     AirPlay1,
-    /// Claude: audio sealed with the key the stream's SETUP gave the
-    /// receiver, and the receiver's event connection, answered on a thread of
-    /// its own when it could be opened.
+    /// Claude: the receiver's event connection, answered on a thread of its
+    /// own when it could be opened, and the stream its TEARDOWN names.
     AirPlay2 {
-        audio_key: Counted,
         _events: Option<EventChannel>,
         stream_id: Option<u64>,
     },
+}
+
+/// Claude: where a receiver takes a realtime stream's audio and control
+/// packets, how it takes them, and the latency it adds to what sync packets
+/// say.
+pub(crate) struct RealtimeAudio {
+    pub(crate) audio: SocketAddr,
+    pub(crate) control: SocketAddr,
+    pub(crate) latency: AudioLatency,
+    pub(crate) packets: Packets,
+}
+
+pub(crate) enum Packets {
+    AirPlay1,
+    /// Claude: sealed with the key the stream's SETUP gave the receiver.
+    AirPlay2(Counted),
 }
 
 /// Claude: how a receiver takes a packet it asked for again.
@@ -64,38 +74,40 @@ pub(crate) struct KeepAlive {
     pub(crate) needs_ok: bool,
 }
 
-impl Session {
-    pub(crate) fn protocol(&self) -> Protocol {
-        match self.transport {
-            Transport::AirPlay1 => Protocol::AirPlay1,
-            Transport::AirPlay2 { .. } => Protocol::AirPlay2,
-        }
-    }
-
+impl Packets {
     pub(crate) fn resend(&self) -> Resend {
-        match self.transport {
-            Transport::AirPlay1 => Resend::Wrapped,
-            Transport::AirPlay2 { .. } => Resend::Original,
+        match self {
+            Packets::AirPlay1 => Resend::Wrapped,
+            Packets::AirPlay2(_) => Resend::Original,
         }
     }
 
     /// Claude: writes the packet the receiver gets for these frames into
     /// `out` and returns its length.
-    pub(crate) fn write_audio(
+    pub(crate) fn write(
         &mut self,
         header: &AudioHeader,
         left: &[f32; FRAMES_PER_PACKET],
         right: &[f32; FRAMES_PER_PACKET],
         out: &mut [u8; MAX_AUDIO_PACKET_LEN],
     ) -> usize {
-        match &mut self.transport {
-            Transport::AirPlay1 => {
+        match self {
+            Packets::AirPlay1 => {
                 packet::write_audio_packet(out, header, left, right, Framing::Counted)
             }
-            Transport::AirPlay2 { audio_key, .. } => {
+            Packets::AirPlay2(audio_key) => {
                 let len = packet::write_audio_packet(out, header, left, right, Framing::Full);
                 packet::seal_audio(audio_key, out, len)
             }
+        }
+    }
+}
+
+impl Session {
+    pub(crate) fn protocol(&self) -> Protocol {
+        match self.transport {
+            Transport::AirPlay1 => Protocol::AirPlay1,
+            Transport::AirPlay2 { .. } => Protocol::AirPlay2,
         }
     }
 

@@ -9,7 +9,9 @@ use crate::events::EventChannel;
 use crate::hap::{self, Counted, KEY_LEN};
 use crate::pairing;
 use crate::rtsp::{Connection, PLIST, Request, Response};
-use crate::session::{self, ASSUMED_AUDIO_LATENCY, Offer, Session, Transport, refusal};
+use crate::session::{
+    self, ASSUMED_AUDIO_LATENCY, Offer, Packets, RealtimeAudio, Session, Transport, refusal,
+};
 use crate::{FRAMES_PER_PACKET, SAMPLE_RATE};
 
 /// Claude: how often iOS, and so pyatv, posts `/feedback` to keep a session.
@@ -54,7 +56,7 @@ pub(crate) fn negotiate(
     timeout: Duration,
     teardown_timeout: Duration,
     abort: &dyn Fn() -> bool,
-) -> Result<Session, Failure> {
+) -> Result<(Session, RealtimeAudio), Failure> {
     let info = Request {
         method: "GET",
         uri: "/info",
@@ -106,18 +108,22 @@ pub(crate) fn negotiate(
     let opened = opened
         .and_then(|stream| flush(&mut connection, &uri, offer, timeout, abort).map(|()| stream));
     match opened {
-        Ok(stream) => Ok(Session {
-            connection,
-            uri,
-            audio: with_port(peer, stream.audio_port),
-            control: with_port(peer, stream.control_port),
-            audio_latency: session::audio_latency(&stream.record),
-            transport: Transport::AirPlay2 {
-                audio_key: Counted::new(&audio_key),
-                _events: stream.events,
-                stream_id: stream.stream_id,
+        Ok(stream) => Ok((
+            Session {
+                connection,
+                uri,
+                transport: Transport::AirPlay2 {
+                    _events: stream.events,
+                    stream_id: stream.stream_id,
+                },
             },
-        }),
+            RealtimeAudio {
+                audio: with_port(peer, stream.audio_port),
+                control: with_port(peer, stream.control_port),
+                latency: session::audio_latency(&stream.record),
+                packets: Packets::AirPlay2(Counted::new(&audio_key)),
+            },
+        )),
         Err(failure) => {
             if !abort() {
                 let body = session_teardown();
