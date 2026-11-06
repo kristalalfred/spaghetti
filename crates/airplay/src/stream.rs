@@ -127,14 +127,18 @@ impl Stream {
     /// level that is not finite is ignored.
     pub fn set_volume(&self, level: f32) {
         if level.is_finite() {
-            self.shared.volumes().wanted = Some(level.clamp(0.0, 1.0));
+            let level = Some(level.clamp(0.0, 1.0));
+            let mut volumes = self.shared.volumes();
+            volumes.wanted = level;
+            volumes.reported = level;
         }
     }
 
-    /// Claude: the receiver's volume, from 0 to 1, as it last reported it or
-    /// last accepted it from `set_volume`; `None` until it has done either.
-    /// The stream reads it every 2 s while the receiver answers, so a change
-    /// made at the receiver shows here.
+    /// Claude: the receiver's volume, from 0 to 1, as last asked with
+    /// `set_volume` or as the receiver last reported it, whichever came later;
+    /// `None` until either. The stream reads it 2 s after its last volume
+    /// request and every 2 s after that while the receiver answers, so a change
+    /// made at the receiver shows here, and so does a change it refused.
     pub fn receiver_volume(&self) -> Option<f32> {
         self.shared.volumes().reported
     }

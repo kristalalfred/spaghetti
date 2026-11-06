@@ -1081,6 +1081,11 @@ fn a_refused_volume_change_keeps_the_stream_and_is_not_sent_again() {
         Renders::default().renderer(None),
     );
     stream.set_volume(0.5);
+    assert_eq!(
+        stream.receiver_volume(),
+        Some(0.5),
+        "as asked until it reports"
+    );
     assert!(wait_until(HANDSHAKE, || near(
         stream.receiver_volume(),
         1.0

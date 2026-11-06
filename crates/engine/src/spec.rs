@@ -95,7 +95,7 @@ pub struct RouteInfo {
     /// has no output of its own to play it.
     pub playback: Option<Playback>,
     /// Claude: for a route to an AirPlay receiver, the receiver's own volume
-    /// from 0 to 1, as it last reported or accepted it.
+    /// from 0 to 1, as last asked or as the receiver last reported it.
     pub receiver_volume: Option<f32>,
     /// Claude: a WebRTC peer's offer or answer, once it has one.
     pub local_description: Option<String>,

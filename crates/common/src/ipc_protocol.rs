@@ -252,7 +252,7 @@ pub struct RouteInfo {
     pub volume: f32,
     pub status: FlowStatus,
     /// For a route to an AirPlay receiver, the receiver's own volume from 0.0
-    /// to 1.0, as it last reported or accepted it.
+    /// to 1.0, as last asked or as the receiver last reported it.
     #[serde(default)]
     pub receiver_volume: Option<f32>,
     /// A WebRTC peer's offer or answer, once it has one.

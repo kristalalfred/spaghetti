@@ -61,7 +61,7 @@ spaghetti route 1 BuiltInSpeakerDevice --delay 2500
 
 `airplay` lists the receivers on the local network and whether spaghetti can play to each. Spaghetti sends uncompressed ALAC over AirPlay 2 to receivers that pair without a PIN, and over AirPlay 1 (RAOP) to the rest. A receiver that requires a password or a PIN is listed with the reason it is unsupported. `airplay://` takes a receiver's name or its ID. A receiver that reports no latency of its own is assumed to add 250 ms, the AirPlay default; one that adds a different amount plays early or late by the difference, which `--latency-offset` corrects. A receiver takes one route at a time. SRT sources cannot play to AirPlay receivers.
 
-A route's volume scales its audio, so it cannot make a receiver louder than the receiver's own volume. `receiver-volume` sets that volume, from 0 (muted) to 1, as an AirPlay sender's volume control does; a route never given one leaves the receiver's volume as it is. `routes` shows the receiver's volume under RECEIVER once the receiver reports or accepts it, so a change made at the receiver shows there too:
+A route's volume scales its audio, so it cannot make a receiver louder than the receiver's own volume. `receiver-volume` sets that volume, from 0 (muted) to 1, as an AirPlay sender's volume control does; a route never given one leaves the receiver's volume as it is. `routes` shows the receiver's volume under RECEIVER as last set or as the receiver last reported it, so a change made at the receiver shows there too:
 
 ```sh
 spaghetti receiver-volume 2 0.4
