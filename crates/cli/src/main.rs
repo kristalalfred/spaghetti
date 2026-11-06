@@ -95,6 +95,13 @@ enum Command {
         /// Volume level (0.0-2.0)
         level: f32,
     },
+    /// Set the own volume of the AirPlay receiver a route plays to
+    ReceiverVolume {
+        /// Route ID
+        route_id: u32,
+        /// Receiver volume (0.0 muted - 1.0)
+        level: f32,
+    },
     /// Manage virtual devices
     Devices {
         #[command(subcommand)]
@@ -445,6 +452,23 @@ fn run_command(cmd: Command, out: Output) -> Result<(), Box<dyn Error>> {
                 return Err(UNEXPECTED.into());
             };
             out.note(format_args!("Volume for route {route_id} set to {level:.2}."));
+        }
+
+        Command::ReceiverVolume { route_id, level } => {
+            if !(0.0..=1.0).contains(&level) {
+                return Err("receiver volume must be between 0.0 and 1.0".into());
+            }
+            let Response::Ok = client::request(
+                &mut stream,
+                &Request::SetReceiverVolume {
+                    route_id,
+                    volume: level,
+                },
+            )?
+            else {
+                return Err(UNEXPECTED.into());
+            };
+            out.note(format_args!("Receiver volume for route {route_id} set to {level:.2}."));
         }
 
         Command::Devices { action } => match action {

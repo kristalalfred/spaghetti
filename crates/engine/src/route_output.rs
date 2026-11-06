@@ -131,6 +131,13 @@ impl Output {
         }
     }
 
+    pub(crate) fn airplay(&self) -> Option<&AirPlayOutput> {
+        match self {
+            Self::AirPlay(airplay) => Some(airplay),
+            _ => None,
+        }
+    }
+
     pub(crate) fn playing_cycles(&self) -> Option<&Cycles> {
         match self {
             Self::Device(device) => Some(device.cycles()).filter(|cycles| cycles.running(IDLE)),

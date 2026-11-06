@@ -167,6 +167,13 @@ impl Path {
         }
     }
 
+    fn airplay(&self) -> Option<&AirPlayOutput> {
+        match self {
+            Self::Ring { output, .. } => output.airplay(),
+            Self::Bus { .. } => None,
+        }
+    }
+
     fn playing_cycles(&self) -> Option<&Cycles> {
         match self {
             Self::Ring { output, .. } => output.playing_cycles(),
@@ -496,6 +503,29 @@ impl Router {
         Ok(())
     }
 
+    /// Claude: asks the AirPlay receiver a route plays to for `level`, from 0,
+    /// muted, to 1: the receiver's own volume, which the route's `volume`
+    /// cannot raise. It reaches the receiver once the route's stream starts,
+    /// and again whenever it changes.
+    pub fn set_receiver_volume(&mut self, route_id: u32, level: f32) -> Result<(), String> {
+        if !level.is_finite() {
+            return Err(format!(
+                "a receiver volume is a number from 0 to 1, not {level}"
+            ));
+        }
+        let output = self
+            .routes
+            .get(&route_id)
+            .ok_or_else(|| format!("route {route_id} not found"))?
+            .path
+            .airplay()
+            .ok_or_else(|| format!("route {route_id} does not play to an AirPlay receiver"))?;
+        let level = level.clamp(0.0, 1.0);
+        output.set_receiver_volume(level);
+        tracing::debug!(route_id, level, "asked the receiver for a volume");
+        Ok(())
+    }
+
     pub fn fade_volume(&mut self, route_id: u32, volume: f32) -> Result<(), String> {
         self.set_volume(route_id, volume)?;
         let cycles = self
@@ -518,6 +548,7 @@ impl Router {
                 volume: f32::from_bits(r.volume.load(Ordering::Relaxed)),
                 status: r.path.status(),
                 playback: r.path.playback(),
+                receiver_volume: r.path.airplay().and_then(AirPlayOutput::receiver_volume),
                 local_description: r.path.peer().and_then(PeerLink::local_description),
             })
             .collect()
@@ -1116,6 +1147,44 @@ mod tests {
         assert_eq!(state(&router), FlowState::Connected);
         router.route_ring(route).end();
         assert_eq!(state(&router), FlowState::Lost);
+    }
+
+    #[test]
+    fn only_a_route_to_an_airplay_receiver_takes_a_receiver_volume() {
+        let mut router = Router::new();
+        let _input = router.add_program_input("capture", 48000.0).unwrap();
+        let _output = router
+            .add_program_output("playback", 48000.0, Duration::ZERO)
+            .unwrap();
+        let source = router
+            .create_source(
+                SourceSpec::Program {
+                    input: "capture".into(),
+                },
+                None,
+            )
+            .unwrap();
+        let route = router
+            .create_route(
+                source,
+                Destination::Program {
+                    output: "playback".into(),
+                    delay_ms: None,
+                    latency_offset_ms: None,
+                },
+                1.0,
+            )
+            .unwrap();
+        let error = router.set_receiver_volume(route, 0.5).unwrap_err();
+        assert!(
+            error.contains("does not play to an AirPlay receiver"),
+            "{error}"
+        );
+        let error = router.set_receiver_volume(route + 1, 0.5).unwrap_err();
+        assert!(error.contains("not found"), "{error}");
+        let error = router.set_receiver_volume(route, f32::NAN).unwrap_err();
+        assert!(error.contains("from 0 to 1"), "{error}");
+        assert_eq!(router.list_routes()[0].receiver_volume, None);
     }
 
     #[test]

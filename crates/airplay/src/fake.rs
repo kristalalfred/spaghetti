@@ -53,6 +53,8 @@ pub(crate) enum Step {
     Feedback,
     SetPeers,
     Anchor,
+    SetParameter,
+    GetParameter,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -169,6 +171,9 @@ struct State {
     clock: Mutex<Option<(Arc<Ptp>, Endpoint)>>,
     timing: Mutex<Option<Peer>>,
     reading_released: AtomicBool,
+    /// Claude: the fake's volume in decibels, which SET_PARAMETER changes and
+    /// GET_PARAMETER reports.
+    volume: Mutex<f32>,
     stop: AtomicBool,
 }
 
@@ -378,6 +383,25 @@ impl Fake {
                 } => Some((at, connection, request)),
                 _ => None,
             })
+            .collect()
+    }
+
+    /// Claude: the fake's volume in decibels.
+    pub(crate) fn volume(&self) -> f32 {
+        *self.state.volume.lock().unwrap()
+    }
+
+    /// Claude: changes the fake's volume as a control on the receiver does.
+    pub(crate) fn set_volume(&self, db: f32) {
+        *self.state.volume.lock().unwrap() = db;
+    }
+
+    /// Claude: the bodies of the requests made with `method`, in order.
+    pub(crate) fn bodies(&self, method: &str) -> Vec<String> {
+        self.requests()
+            .into_iter()
+            .filter(|(_, _, r)| r.method == method)
+            .map(|(_, _, r)| String::from_utf8_lossy(&r.body).into_owned())
             .collect()
     }
 
@@ -783,6 +807,19 @@ impl Server {
                     "SETUP" if request.body.is_empty() => self.setup_raop(&request),
                     "SETUP" => self.setup_airplay_2(&request, recorded),
                     "SETRATEANCHORTIME" => self.anchor(&request),
+                    "SET_PARAMETER" => {
+                        if let Some(db) = parameter(&request.body, "volume") {
+                            *self.state.volume.lock().unwrap() = db;
+                        }
+                        Answer::ok()
+                    }
+                    "GET_PARAMETER" => {
+                        let db = *self.state.volume.lock().unwrap();
+                        Answer::ok().with_body(
+                            "text/parameters",
+                            format!("volume: {db:.6}\r\n").into_bytes(),
+                        )
+                    }
                     "RECORD" => {
                         recorded = true;
                         let mut answer = Answer::ok();
@@ -1083,8 +1120,18 @@ fn step_of(request: &FakeRequest) -> Option<Step> {
         ("POST", "/feedback") => Some(Step::Feedback),
         ("SETPEERS", _) => Some(Step::SetPeers),
         ("SETRATEANCHORTIME", _) => Some(Step::Anchor),
+        ("SET_PARAMETER", _) => Some(Step::SetParameter),
+        ("GET_PARAMETER", _) => Some(Step::GetParameter),
         _ => None,
     }
+}
+
+/// Claude: the number a `text/parameters` body gives `name`.
+fn parameter(body: &[u8], name: &str) -> Option<f32> {
+    std::str::from_utf8(body).ok()?.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == name).then(|| value.trim().parse().ok())?
+    })
 }
 
 fn status_line(status: u16) -> &'static str {
@@ -1340,6 +1387,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_airplay_1_stream_sets_and_reads_the_receiver_volume() {
+        let fake = Fake::start(Behavior::default());
+        fake.set_volume(-15.0);
+        let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
+        let stream = Stream::start_with(
+            &browser,
+            fake.id(),
+            Ok(settings()),
+            Renders::default().renderer(None),
+        );
+        assert!(wait_until(Duration::from_secs(2), || stream
+            .receiver_volume()
+            == Some(0.5)));
+        stream.set_volume(1.0);
+        assert!(wait_until(Duration::from_secs(1), || fake.volume() == 0.0));
+        assert_eq!(fake.bodies("SET_PARAMETER"), ["volume: 0.000000\r\n"]);
+        assert!(streaming(&stream));
+    }
+
+    #[test]
     fn the_handshake_runs_in_order_and_record_names_the_first_packet() {
         let fake = Fake::start(Behavior::default());
         let browser = fake.browser(SHAIRPORT_SYNC_RAOP);
@@ -1352,7 +1419,14 @@ pub(crate) mod tests {
 
         assert_eq!(
             fake.methods(),
-            ["OPTIONS", "ANNOUNCE", "SETUP", "RECORD", "TEARDOWN"]
+            [
+                "OPTIONS",
+                "ANNOUNCE",
+                "SETUP",
+                "RECORD",
+                "GET_PARAMETER",
+                "TEARDOWN"
+            ]
         );
         let requests = fake.requests();
         let announce = &requests[1].2;
@@ -2367,6 +2441,7 @@ pub(crate) mod tests {
         let requests: Vec<(usize, String)> = fake
             .requests()
             .into_iter()
+            .filter(|(_, _, r)| r.method != "GET_PARAMETER")
             .map(|(_, c, r)| (c, r.method))
             .collect();
         let expected = [
@@ -2419,7 +2494,12 @@ pub(crate) mod tests {
             Renders::default().renderer(None),
         );
         assert!(wait_until(Duration::from_secs(2), || streaming(&stream)));
-        assert_eq!(fake.methods(), ["OPTIONS", "ANNOUNCE", "SETUP", "RECORD"]);
+        let handshake: Vec<String> = fake
+            .methods()
+            .into_iter()
+            .filter(|method| method != "GET_PARAMETER")
+            .collect();
+        assert_eq!(handshake, ["OPTIONS", "ANNOUNCE", "SETUP", "RECORD"]);
     }
 
     #[test]

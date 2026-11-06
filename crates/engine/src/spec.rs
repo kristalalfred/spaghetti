@@ -94,6 +94,9 @@ pub struct RouteInfo {
     /// Claude: for a route to a device or a program output; a network route
     /// has no output of its own to play it.
     pub playback: Option<Playback>,
+    /// Claude: for a route to an AirPlay receiver, the receiver's own volume
+    /// from 0 to 1, as it last reported or accepted it.
+    pub receiver_volume: Option<f32>,
     /// Claude: a WebRTC peer's offer or answer, once it has one.
     pub local_description: Option<String>,
 }
@@ -221,6 +224,7 @@ impl TryFrom<RouteInfo> for wire::RouteInfo {
             destination: info.destination.try_into()?,
             volume: info.volume,
             status: info.status,
+            receiver_volume: info.receiver_volume,
             local_description: info.local_description,
         })
     }
@@ -320,6 +324,7 @@ mod tests {
                 packets_retransmitted: 0,
             },
             playback: Some(Playback::Stopped),
+            receiver_volume: None,
             local_description: None,
         };
         let refused = wire::RouteInfo::try_from(route).unwrap_err();

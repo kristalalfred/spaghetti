@@ -122,6 +122,16 @@ impl AirPlayOutput {
         &self.cycles
     }
 
+    /// Claude: asks the receiver for `level`, from 0, muted, to 1, as
+    /// `airplay::Stream::set_volume` does.
+    pub fn set_receiver_volume(&self, level: f32) {
+        self.stream.set_volume(level);
+    }
+
+    pub fn receiver_volume(&self) -> Option<f32> {
+        self.stream.receiver_volume()
+    }
+
     pub fn is_playing(&self) -> bool {
         matches!(self.stream.status(), airplay::Status::Streaming(_))
     }

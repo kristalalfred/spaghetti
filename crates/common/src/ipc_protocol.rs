@@ -38,6 +38,9 @@ pub enum Request {
     DestroyRoute { route_id: u32 },
     ListRoutes,
     SetVolume { route_id: u32, volume: f32 },
+    /// Ask the AirPlay receiver a route plays to for its own volume, from 0.0
+    /// (muted) to 1.0.
+    SetReceiverVolume { route_id: u32, volume: f32 },
     /// Hand a WebRTC peer the answer to its offer, or the offer it answers.
     SetRemoteDescription { peer: PeerRef, generation: u32, sdp: String },
     CreateDevice { name: String, channels: Option<u32> },
@@ -248,6 +251,10 @@ pub struct RouteInfo {
     pub destination: Destination,
     pub volume: f32,
     pub status: FlowStatus,
+    /// For a route to an AirPlay receiver, the receiver's own volume from 0.0
+    /// to 1.0, as it last reported or accepted it.
+    #[serde(default)]
+    pub receiver_volume: Option<f32>,
     /// A WebRTC peer's offer or answer, once it has one.
     pub local_description: Option<String>,
 }
@@ -552,10 +559,11 @@ mod tests {
                     packets_lost: 3,
                     packets_retransmitted: 0,
                 },
+                receiver_volume: None,
                 local_description: None,
             },
             &format!(
-                r#"{{"route_id":9,"source_id":4,"destination":{{"WebRtc":{OFFERING}}},"volume":0.5,"status":{{"state":"Flowing","bytes":1200,"peer":"203.0.113.1:3478","relayed":true,"packets_lost":3,"packets_retransmitted":0}},"local_description":null}}"#
+                r#"{{"route_id":9,"source_id":4,"destination":{{"WebRtc":{OFFERING}}},"volume":0.5,"status":{{"state":"Flowing","bytes":1200,"peer":"203.0.113.1:3478","relayed":true,"packets_lost":3,"packets_retransmitted":0}},"receiver_volume":null,"local_description":null}}"#
             ),
         );
     }

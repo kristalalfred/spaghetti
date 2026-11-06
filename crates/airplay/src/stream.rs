@@ -1,5 +1,6 @@
 mod buffered;
 mod realtime;
+mod volume;
 
 use std::any::Any;
 use std::net::SocketAddr;
@@ -28,6 +29,7 @@ use crate::{
 };
 use buffered::Buffered;
 use realtime::{Realtime, Sockets};
+use volume::{Ask, VolumeSync, Volumes};
 
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const POLL_SLICE: Duration = Duration::from_millis(20);
@@ -92,6 +94,7 @@ impl Stream {
             command: AtomicU8::new(Command::Play as u8),
             clock: Clock::start(),
             playout_delay: OnceLock::new(),
+            volume: Mutex::default(),
         });
         let browser = browser.shared().clone();
         let turn = browser.turns.take(receiver.clone());
@@ -114,6 +117,26 @@ impl Stream {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Claude: asks the receiver to play at `level`, from 0, muted, to 1, its
+    /// loudest, as an AirPlay sender's volume control does: the receiver sets
+    /// its own volume, which a renderer's samples cannot raise. The latest
+    /// level goes to the receiver once the stream starts and whenever it
+    /// changes; a stream never asked leaves the receiver's volume alone. A
+    /// level that is not finite is ignored.
+    pub fn set_volume(&self, level: f32) {
+        if level.is_finite() {
+            self.shared.volumes().wanted = Some(level.clamp(0.0, 1.0));
+        }
+    }
+
+    /// Claude: the receiver's volume, from 0 to 1, as it last reported it or
+    /// last accepted it from `set_volume`; `None` until it has done either.
+    /// The stream reads it every 2 s while the receiver answers, so a change
+    /// made at the receiver shows here.
+    pub fn receiver_volume(&self) -> Option<f32> {
+        self.shared.volumes().reported
     }
 
     /// Codex: stops rendering and returns at once. The session keeps answering
@@ -203,9 +226,14 @@ struct Shared {
     command: AtomicU8,
     clock: Clock,
     playout_delay: OnceLock<Duration>,
+    volume: Mutex<Volumes>,
 }
 
 impl Shared {
+    fn volumes(&self) -> std::sync::MutexGuard<'_, Volumes> {
+        self.volume.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn command(&self) -> Command {
         match self.command.load(Ordering::Acquire) {
             0 => Command::Play,
@@ -387,6 +415,7 @@ fn connect<'a, R>(
             next_at: Instant::now() + session.keepalive().every,
             outstanding: None,
         },
+        volume: VolumeSync::new(Instant::now()),
         settings,
         render,
         session,
@@ -804,6 +833,7 @@ struct Streamer<'a, R> {
     /// Claude: the last packet handed to the delivery.
     sent: Option<u64>,
     keepalive: Keepalive,
+    volume: VolumeSync,
     late_packets: u64,
 }
 
@@ -960,7 +990,8 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
         if rtsp {
             self.read_rtsp()?;
         }
-        self.keep_alive()
+        self.keep_alive()?;
+        self.sync_volume()
     }
 
     fn read_rtsp(&mut self) -> Result<(), String> {
@@ -981,6 +1012,9 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
                     ));
                 }
                 self.keepalive.outstanding = None;
+            }
+            if let Some(level) = self.volume.answer(&response) {
+                self.shared.volumes().reported = Some(level);
             }
         }
         Ok(())
@@ -1007,6 +1041,33 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
             let cseq = self.session.connection.send(&request, deadline, &stopped)?;
             self.keepalive.outstanding = Some((cseq, now));
         }
+        Ok(())
+    }
+
+    fn sync_volume(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        let wanted = self.shared.volumes().wanted;
+        let timeout = self.settings.answer_timeout;
+        let Some(ask) = self.volume.next(wanted, now, timeout) else {
+            return Ok(());
+        };
+        let (method, body) = match ask {
+            Ask::Set(level) => ("SET_PARAMETER", volume::set_body(level)),
+            Ask::Get => ("GET_PARAMETER", volume::GET_BODY.to_owned()),
+        };
+        let request = Request {
+            method,
+            uri: &self.session.uri,
+            headers: vec![],
+            body: Some((volume::CONTENT_TYPE, body.as_bytes())),
+        };
+        let shared = self.shared;
+        let stopped = || shared.command() == Command::Stop;
+        let cseq = self
+            .session
+            .connection
+            .send(&request, now + timeout, &stopped)?;
+        self.volume.sent(cseq, now, ask);
         Ok(())
     }
 

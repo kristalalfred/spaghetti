@@ -982,3 +982,137 @@ fn the_debug_log_of_a_whole_session_holds_no_key_or_pairing_value() {
         );
     }
 }
+
+fn near(volume: Option<f32>, level: f32) -> bool {
+    volume.is_some_and(|volume| (volume - level).abs() < 1e-4)
+}
+
+#[test]
+fn a_volume_asked_before_the_stream_starts_goes_after_record_and_changes_follow() {
+    let fake = Fake::start(Behavior::default());
+    let browser = browser(&fake, false);
+    let stream = Stream::start_with(
+        &browser,
+        fake.id(),
+        Ok(airplay_2()),
+        Renders::default().renderer(None),
+    );
+    stream.set_volume(0.5);
+    assert!(wait_until(HANDSHAKE, || fake.volume() == -15.0));
+    let methods = fake.methods();
+    let position = |method: &str| methods.iter().position(|m| m == method).unwrap();
+    assert!(
+        position("RECORD") < position("SET_PARAMETER"),
+        "{methods:?}"
+    );
+    let (_, _, set) = fake
+        .requests()
+        .into_iter()
+        .find(|(_, _, r)| r.method == "SET_PARAMETER")
+        .unwrap();
+    assert_eq!(set.header("Content-Type"), Some("text/parameters"));
+    assert!(set.uri.starts_with("rtsp://"), "{}", set.uri);
+    assert!(wait_until(Duration::from_secs(1), || near(
+        stream.receiver_volume(),
+        0.5
+    )));
+
+    stream.set_volume(0.0);
+    assert!(wait_until(Duration::from_secs(1), || fake.volume() == -144.0));
+    stream.set_volume(f32::NAN);
+    stream.set_volume(2.0);
+    assert!(wait_until(Duration::from_secs(1), || fake.volume() == 0.0));
+    assert_eq!(
+        fake.bodies("SET_PARAMETER"),
+        [
+            "volume: -15.000000\r\n",
+            "volume: -144.000000\r\n",
+            "volume: 0.000000\r\n"
+        ]
+    );
+    assert!(near(stream.receiver_volume(), 1.0));
+    assert!(streaming(&stream));
+}
+
+#[test]
+fn the_receiver_volume_follows_what_the_receiver_reports() {
+    let fake = Fake::start(Behavior::default());
+    fake.set_volume(-6.0);
+    let browser = browser(&fake, false);
+    let stream = Stream::start_with(
+        &browser,
+        fake.id(),
+        Ok(airplay_2()),
+        Renders::default().renderer(None),
+    );
+    assert_eq!(stream.receiver_volume(), None);
+    assert!(wait_until(HANDSHAKE, || near(
+        stream.receiver_volume(),
+        0.8
+    )));
+    fake.set_volume(-144.0);
+    assert!(wait_until(Duration::from_secs(3), || near(
+        stream.receiver_volume(),
+        0.0
+    )));
+    assert!(
+        fake.bodies("SET_PARAMETER").is_empty(),
+        "a stream never asked leaves the receiver's volume alone"
+    );
+    assert!(
+        fake.bodies("GET_PARAMETER")
+            .iter()
+            .all(|body| body == "volume\r\n")
+    );
+    assert!(streaming(&stream));
+}
+
+#[test]
+fn a_refused_volume_change_keeps_the_stream_and_is_not_sent_again() {
+    let fake = Fake::start(Behavior {
+        rtsp: Rtsp::RefuseAt(Step::SetParameter, 400),
+        ..Behavior::default()
+    });
+    let browser = browser(&fake, false);
+    let stream = Stream::start_with(
+        &browser,
+        fake.id(),
+        Ok(airplay_2()),
+        Renders::default().renderer(None),
+    );
+    stream.set_volume(0.5);
+    assert!(wait_until(HANDSHAKE, || near(
+        stream.receiver_volume(),
+        1.0
+    )));
+    assert_eq!(fake.bodies("SET_PARAMETER").len(), 1);
+    assert!(streaming(&stream));
+}
+
+#[test]
+fn a_receiver_that_ignores_volume_readings_keeps_its_stream_and_changes() {
+    let fake = Fake::start(Behavior {
+        rtsp: Rtsp::IgnoreAt(Step::GetParameter),
+        ..Behavior::default()
+    });
+    let browser = browser(&fake, false);
+    let settings = airplay_2();
+    let answer_timeout = settings.answer_timeout;
+    let stream = Stream::start_with(
+        &browser,
+        fake.id(),
+        Ok(settings),
+        Renders::default().renderer(None),
+    );
+    assert!(wait_until(HANDSHAKE, || !fake
+        .bodies("GET_PARAMETER")
+        .is_empty()));
+    thread::sleep(answer_timeout + Duration::from_secs(1));
+    assert!(streaming(&stream), "{:?}", stream.status());
+    stream.set_volume(0.5);
+    assert!(wait_until(Duration::from_secs(1), || fake.volume() == -15.0));
+    thread::sleep(Duration::from_secs(2) + PROMPT);
+    assert_eq!(fake.bodies("GET_PARAMETER").len(), 1, "readings stopped");
+    assert!(near(stream.receiver_volume(), 0.5));
+    assert!(streaming(&stream));
+}

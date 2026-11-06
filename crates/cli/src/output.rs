@@ -171,15 +171,20 @@ pub fn print_routes(routes: &[RouteInfo]) {
         .map(|route| destination_label(&route.destination))
         .collect();
     let dest_w = col_width(destinations.iter().map(String::as_str), 30);
-    println!("{:<6} {:<7} {:<dest_w$} {:<7} STATE", "ID", "SOURCE", "DESTINATION", "VOLUME");
-    println!("{}", "-".repeat(dest_w + 34));
+    println!(
+        "{:<6} {:<7} {:<dest_w$} {:<7} {:<8} STATE",
+        "ID", "SOURCE", "DESTINATION", "VOLUME", "RECEIVER"
+    );
+    println!("{}", "-".repeat(dest_w + 43));
     for (route, destination) in routes.iter().zip(&destinations) {
+        let receiver = route.receiver_volume.map_or("-".into(), |volume| format!("{volume:.2}"));
         println!(
-            "{:<6} {:<7} {:<dest_w$} {:<7.2} {}",
+            "{:<6} {:<7} {:<dest_w$} {:<7.2} {:<8} {}",
             route.route_id,
             route.source_id,
             destination,
             route.volume,
+            receiver,
             state_label(
                 matches!(route.destination, Destination::WebRtc(_)),
                 &route.status
@@ -301,6 +306,8 @@ pub struct RouteJson<'a> {
     source_id: u32,
     destination: EndpointJson<'a>,
     volume: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receiver_volume: Option<f32>,
     status: FlowJson<'a>,
 }
 
@@ -332,6 +339,7 @@ impl<'a> From<&'a RouteInfo> for RouteJson<'a> {
                 Destination::WebRtc(peer) => EndpointJson::webrtc(peer),
             },
             volume: route.volume,
+            receiver_volume: route.receiver_volume,
             status: FlowJson::from(&route.status),
         }
     }
@@ -473,12 +481,17 @@ mod tests {
     }
 
     fn route_json(destination: Destination) -> String {
+        route_json_with(destination, None)
+    }
+
+    fn route_json_with(destination: Destination, receiver_volume: Option<f32>) -> String {
         let route = RouteInfo {
             route_id: 5,
             source_id: 3,
             destination,
             volume: 0.8,
             status: flowing(None),
+            receiver_volume,
             local_description: Some("v=0\r\n".into()),
         };
         serde_json::to_string(&RouteJson::from(&route)).unwrap()
@@ -568,9 +581,15 @@ mod tests {
             "airplay://C4:38:75:04:5E:80 +2500 ms"
         );
         assert_eq!(
-            route_json(destination),
+            route_json(destination.clone()),
             format!(
                 r#"{{"route_id":5,"source_id":3,"destination":{{"kind":"airplay","receiver":"C4:38:75:04:5E:80","delay_ms":2500}},"volume":0.8,"status":{FLOWING}}}"#
+            )
+        );
+        assert_eq!(
+            route_json_with(destination, Some(0.4)),
+            format!(
+                r#"{{"route_id":5,"source_id":3,"destination":{{"kind":"airplay","receiver":"C4:38:75:04:5E:80","delay_ms":2500}},"volume":0.8,"receiver_volume":0.4,"status":{FLOWING}}}"#
             )
         );
     }

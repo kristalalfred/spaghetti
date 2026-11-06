@@ -1487,3 +1487,28 @@ fn a_play_time_the_timeline_cannot_say_after_streaming_starts_loses_the_stream()
     );
     assert_eq!(led.setup.fake.anchors().len(), anchors);
 }
+
+#[test]
+fn a_buffered_stream_sets_the_receiver_volume_once_anchored() {
+    let Setup {
+        fake,
+        browser,
+        settings,
+        ..
+    } = setup(Behavior::default(), LEADING);
+    let stream = Stream::start_with(
+        &browser,
+        fake.id(),
+        Ok(settings),
+        Calls::default().renderer(),
+    );
+    stream.set_volume(0.25);
+    assert!(wait_until(STARTING, || fake.volume() == -22.5));
+    let methods = fake.methods();
+    let position = |method: &str| methods.iter().position(|m| m == method).unwrap();
+    assert!(
+        position("SETRATEANCHORTIME") < position("SET_PARAMETER"),
+        "{methods:?}"
+    );
+    assert!(streaming(&stream));
+}

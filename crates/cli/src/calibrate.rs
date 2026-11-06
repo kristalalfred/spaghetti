@@ -299,6 +299,7 @@ mod tests {
                 packets_lost: 0,
                 packets_retransmitted: 0,
             },
+            receiver_volume: None,
             local_description: None,
         }
     }

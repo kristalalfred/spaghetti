@@ -269,6 +269,13 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
                 Err(message) => Response::Error { message },
             }
         }
+        Request::SetReceiverVolume { route_id, volume } => {
+            let mut st = lock_state(state);
+            match st.router.set_receiver_volume(route_id, volume) {
+                Ok(()) => Response::Ok,
+                Err(message) => Response::Error { message },
+            }
+        }
         Request::SetRemoteDescription {
             peer,
             generation,
