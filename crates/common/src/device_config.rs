@@ -41,6 +41,22 @@ pub struct DeviceConfigEntry {
     pub channels: u32,
     /// Sample rate in Hz (typically 48000).
     pub sample_rate: u32,
+    /// What the device's volume and mute controls do to its audio.
+    #[serde(default)]
+    pub volume: Volume,
+}
+
+/// What a virtual device's volume and mute controls do to the audio written
+/// to it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Volume {
+    /// The device scales its audio by its volume and silences it when muted.
+    #[default]
+    Applied,
+    /// The device passes its audio through at full scale and only reports
+    /// its volume and mute, for a program that applies them elsewhere.
+    Reported,
 }
 
 impl DeviceConfigFile {

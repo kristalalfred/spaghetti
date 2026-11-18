@@ -1,4 +1,5 @@
 use serde::Serialize;
+use spaghetti_common::device_config::Volume;
 use spaghetti_common::ipc_protocol::{
     ActivityInfo, AirPlayReceiverInfo, AirPlaySupport, AppInfo, DaemonStatus, Destination,
     DeviceInfo, FlowState, FlowStatus, PeerRole, RouteInfo, SourceInfo, SourceSpec, SrtMode,
@@ -266,7 +267,18 @@ pub fn print_devices(devices: &[DeviceInfo]) {
     println!("{:<uid_w$} {:<name_w$} {:<8} FLAGS", "UID", "NAME", "CHANNELS");
     println!("{}", "-".repeat(uid_w + name_w + 31));
     for d in devices {
-        let flags = if d.is_default { "(default, protected)" } else { "" };
+        let mut flags = Vec::new();
+        if d.is_default {
+            flags.push("default, protected");
+        }
+        if d.volume == Volume::Reported {
+            flags.push("volume reported");
+        }
+        let flags = if flags.is_empty() {
+            String::new()
+        } else {
+            format!("({})", flags.join("; "))
+        };
         println!("{:<uid_w$} {:<name_w$} {:<8} {}", d.uid, d.name, d.channels, flags);
     }
 }

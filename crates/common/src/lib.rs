@@ -6,5 +6,5 @@ pub mod ipc_protocol;
 pub use activity::{ACTIVITY_SHM_NAME, ActivityRegion};
 pub use device_config::{
     DEVICE_CONFIG_PATH, DEVICE_CONFIG_VERSION, DeviceConfigEntry, DeviceConfigFile,
-    FALLBACK_DEVICE_CONFIG_PATH,
+    FALLBACK_DEVICE_CONFIG_PATH, Volume,
 };

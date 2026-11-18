@@ -177,6 +177,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1254ebf6529f3763c491acfb5ab6e960809e3c75a38584cc664f8c5667fb7107"
 
 [[package]]
+name = "audio-server-plugin"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "core-foundation-sys",
+ "coreaudio-sys",
+ "libc",
+ "serde_json",
+ "spaghetti-common",
+]
+
+[[package]]
 name = "audioadapter"
 version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1866,11 +1878,9 @@ dependencies = [
 name = "spaghetti-asp"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
+ "audio-server-plugin",
  "core-foundation-sys",
  "coreaudio-sys",
- "libc",
- "serde_json",
  "spaghetti-common",
 ]
 

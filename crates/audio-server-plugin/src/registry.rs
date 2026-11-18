@@ -18,7 +18,7 @@ use std::sync::{Arc, LazyLock};
 
 use arc_swap::ArcSwap;
 
-use spaghetti_common::audio_types::{CHANNELS, RING_BUFFER_FRAMES, SAMPLE_RATE};
+use spaghetti_common::audio_types::RING_BUFFER_FRAMES;
 use spaghetti_common::device_config::DeviceConfigEntry;
 
 use crate::devices::{DeviceInstance, DeviceRole};
@@ -34,11 +34,6 @@ pub const FIRST_OBJECT_ID: u32 = 100;
 /// Object IDs consumed per device: device, input stream, output stream,
 /// volume control, mute control.
 pub const IDS_PER_DEVICE: u32 = 5;
-
-/// UID of the always-present default loopback device.
-pub const DEFAULT_DEVICE_UID: &str = "SpaghettiDevice_UID";
-/// Display name of the default loopback device.
-pub const DEFAULT_DEVICE_NAME: &str = "Spaghetti";
 
 /// Immutable snapshot of device state. Mutations happen by constructing a
 /// fresh [`DeviceRegistry`] and [`ArcSwap::store`]-ing it.
@@ -80,14 +75,7 @@ impl DeviceRegistry {
     /// Add a device with the given identity/format. Returns the new
     /// device-ID. The registry gains one entry in `by_id`, five in
     /// `by_object_role`, and one in `by_uid`.
-    pub fn insert_device(
-        &mut self,
-        uid: String,
-        name: String,
-        channels: u32,
-        sample_rate: f64,
-        ring_frames: usize,
-    ) -> u32 {
+    pub fn insert_device(&mut self, entry: &DeviceConfigEntry, ring_frames: usize) -> u32 {
         let base = self.allocate_block();
         let device_id = base;
         let stream_in_id = base + 1;
@@ -101,10 +89,7 @@ impl DeviceRegistry {
             stream_out_id,
             volume_id,
             mute_id,
-            uid.clone(),
-            name,
-            channels,
-            sample_rate,
+            entry,
             ring_frames,
         ));
 
@@ -119,7 +104,7 @@ impl DeviceRegistry {
             .insert(volume_id, (device_id, DeviceRole::Volume));
         self.by_object_role
             .insert(mute_id, (device_id, DeviceRole::Mute));
-        self.by_uid.insert(uid, device_id);
+        self.by_uid.insert(entry.uid.clone(), device_id);
 
         device_id
     }
@@ -161,8 +146,8 @@ impl DeviceRegistry {
             .filter_map(move |id| self.by_id.get(&id))
     }
 
-    pub fn default_device(&self) -> Option<&Arc<DeviceInstance>> {
-        let device_id = self.by_uid.get(DEFAULT_DEVICE_UID)?;
+    pub fn device(&self, uid: &str) -> Option<&Arc<DeviceInstance>> {
+        let device_id = self.by_uid.get(uid)?;
         self.by_id.get(device_id)
     }
 }
@@ -182,41 +167,40 @@ pub fn store(new: DeviceRegistry) {
     REGISTRY.store(Arc::new(new));
 }
 
-/// The always-on built-in default device entry. Returned even if the config
-/// file omits it, so the plugin never loses `SpaghettiDevice_UID`.
-fn default_entry() -> DeviceConfigEntry {
-    DeviceConfigEntry {
-        uid: DEFAULT_DEVICE_UID.to_string(),
-        name: DEFAULT_DEVICE_NAME.to_string(),
-        channels: CHANNELS,
-        sample_rate: SAMPLE_RATE as u32,
-    }
+/// Claude: the devices the plugin always publishes, as config entries.
+pub fn builtin_entries() -> Vec<DeviceConfigEntry> {
+    crate::plugin()
+        .devices
+        .iter()
+        .map(|device| DeviceConfigEntry {
+            uid: device.uid.to_string(),
+            name: device.name.to_string(),
+            channels: device.channels,
+            sample_rate: device.sample_rate,
+            volume: device.volume,
+        })
+        .collect()
 }
 
-/// Build a new registry from a config snapshot, reusing existing
-/// `Arc<DeviceInstance>` entries for UIDs that already exist in `previous`
-/// (preserving ring buffers + object IDs). Newly added UIDs get fresh IDs
-/// allocated from `previous.next_id`, which is carried forward monotonically.
+/// Build a new registry from the built-in devices and a config snapshot,
+/// reusing existing `Arc<DeviceInstance>` entries for UIDs that already exist
+/// in `previous` (preserving ring buffers + object IDs). Newly added UIDs get
+/// fresh IDs allocated from `previous.next_id`, which is carried forward
+/// monotonically.
 ///
-/// The built-in default device (`SpaghettiDevice_UID`) is always included,
-/// even if the entries don't list it. If the caller's entries list it with
-/// different channels/rate, the config wins for new allocations but a
-/// surviving instance keeps its original format (reallocating a ring buffer
-/// would break in-flight IO).
+/// Claude: built-in devices come first and win over a config entry with the
+/// same UID. A surviving instance keeps its original format and volume mode
+/// even if its entry changed them (reallocating a ring buffer would break
+/// in-flight IO).
 pub fn rebuild_from_entries(
     previous: &DeviceRegistry,
+    builtin: &[DeviceConfigEntry],
     entries: &[DeviceConfigEntry],
 ) -> DeviceRegistry {
     let mut reg = DeviceRegistry::empty();
     reg.next_id = previous.next_id;
 
-    let default = entries
-        .iter()
-        .find(|e| e.uid == DEFAULT_DEVICE_UID)
-        .cloned()
-        .unwrap_or_else(default_entry);
-    add_entry(&mut reg, previous, &default);
-    for entry in entries {
+    for entry in builtin.iter().chain(entries) {
         add_entry(&mut reg, previous, entry);
     }
 
@@ -235,13 +219,7 @@ fn add_entry(reg: &mut DeviceRegistry, previous: &DeviceRegistry, entry: &Device
         return;
     }
 
-    reg.insert_device(
-        entry.uid.clone(),
-        entry.name.clone(),
-        entry.channels,
-        f64::from(entry.sample_rate),
-        RING_BUFFER_FRAMES,
-    );
+    reg.insert_device(entry, RING_BUFFER_FRAMES);
 }
 
 /// First-fire gate for unknown-object-ID warnings so repeated misses don't
@@ -260,6 +238,9 @@ pub fn warn_unknown_object(object_id: u32, context: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spaghetti_common::device_config::Volume;
+
+    const BUILTIN: &str = "builtin";
 
     fn entry(uid: &str) -> DeviceConfigEntry {
         DeviceConfigEntry {
@@ -267,33 +248,57 @@ mod tests {
             name: uid.into(),
             channels: 2,
             sample_rate: 48_000,
+            volume: Volume::Applied,
         }
     }
 
-    #[test]
-    fn default_device_is_first_even_when_listed_later() {
-        let reg = rebuild_from_entries(
-            &DeviceRegistry::empty(),
-            &[entry("a"), entry(DEFAULT_DEVICE_UID)],
-        );
-        assert_eq!(reg.by_uid[DEFAULT_DEVICE_UID], FIRST_OBJECT_ID);
-        assert_eq!(reg.by_uid["a"], FIRST_OBJECT_ID + IDS_PER_DEVICE);
-        assert_eq!(reg.default_device().unwrap().uid, DEFAULT_DEVICE_UID);
+    fn rebuild(previous: &DeviceRegistry, entries: &[DeviceConfigEntry]) -> DeviceRegistry {
+        rebuild_from_entries(previous, &[entry(BUILTIN)], entries)
     }
 
     #[test]
-    fn default_device_survives_omission() {
-        let reg = rebuild_from_entries(&DeviceRegistry::empty(), &[entry("a")]);
+    fn builtin_device_is_first_even_when_listed_later() {
+        let reg = rebuild(&DeviceRegistry::empty(), &[entry("a"), entry(BUILTIN)]);
+        assert_eq!(reg.by_uid[BUILTIN], FIRST_OBJECT_ID);
+        assert_eq!(reg.by_uid["a"], FIRST_OBJECT_ID + IDS_PER_DEVICE);
+        assert_eq!(reg.device(BUILTIN).unwrap().uid, BUILTIN);
+    }
+
+    #[test]
+    fn builtin_device_survives_omission() {
+        let reg = rebuild(&DeviceRegistry::empty(), &[entry("a")]);
         assert_eq!(reg.by_id.len(), 2);
-        assert!(reg.default_device().is_some());
+        assert!(reg.device(BUILTIN).is_some());
+    }
+
+    #[test]
+    fn builtin_device_wins_over_a_config_entry_with_its_uid() {
+        let mut listed = entry(BUILTIN);
+        listed.volume = Volume::Reported;
+        let reg = rebuild(&DeviceRegistry::empty(), &[listed]);
+        assert_eq!(reg.device(BUILTIN).unwrap().volume_mode, Volume::Applied);
+    }
+
+    #[test]
+    fn without_builtin_devices_only_config_entries_are_published() {
+        let reg = rebuild_from_entries(&DeviceRegistry::empty(), &[], &[entry("a")]);
+        assert_eq!(reg.devices().map(|d| d.uid.as_str()).collect::<Vec<_>>(), ["a"]);
+    }
+
+    #[test]
+    fn a_device_keeps_the_volume_mode_of_its_entry() {
+        let mut reported = entry("a");
+        reported.volume = Volume::Reported;
+        let reg = rebuild(&DeviceRegistry::empty(), &[reported]);
+        assert_eq!(reg.device("a").unwrap().volume_mode, Volume::Reported);
     }
 
     #[test]
     fn rebuild_keeps_surviving_instances_and_retires_removed_ids() {
-        let first = rebuild_from_entries(&DeviceRegistry::empty(), &[entry("a"), entry("b")]);
+        let first = rebuild(&DeviceRegistry::empty(), &[entry("a"), entry("b")]);
         let a_before = Arc::clone(&first.by_id[&first.by_uid["a"]]);
 
-        let second = rebuild_from_entries(&first, &[entry("a"), entry("c")]);
+        let second = rebuild(&first, &[entry("a"), entry("c")]);
         let a_after = &second.by_id[&second.by_uid["a"]];
         assert!(Arc::ptr_eq(&a_before, a_after));
         assert!(!second.by_uid.contains_key("b"));
@@ -303,7 +308,7 @@ mod tests {
 
     #[test]
     fn duplicate_uids_publish_one_device() {
-        let reg = rebuild_from_entries(&DeviceRegistry::empty(), &[entry("a"), entry("a")]);
+        let reg = rebuild(&DeviceRegistry::empty(), &[entry("a"), entry("a")]);
         assert_eq!(reg.by_id.len(), 2);
         assert_eq!(reg.devices().count(), 2);
     }

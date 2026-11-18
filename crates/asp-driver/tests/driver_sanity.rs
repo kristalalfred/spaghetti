@@ -7,7 +7,8 @@ use std::ptr;
 
 use coreaudio_sys::{
     kAudioDevicePropertyDeviceCanBeDefaultDevice, kAudioDevicePropertyDeviceUID,
-    kAudioDevicePropertyStreams, kAudioHardwareNoError, kAudioObjectPropertyOwnedObjects,
+    kAudioDevicePropertyStreams, kAudioHardwareNoError, kAudioObjectPropertyManufacturer,
+    kAudioObjectPropertyOwnedObjects,
     kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeOutput,
     kAudioPlugInPropertyDeviceList, AudioObjectPropertyAddress,
     AudioServerPlugInDriverInterface, CFUUIDBytes,
@@ -37,9 +38,14 @@ type DriverRef = *mut *mut AudioServerPlugInDriverInterface;
 fn dylib_path() -> std::ffi::CString {
     let manifest = env!("CARGO_MANIFEST_DIR"); // crates/asp-driver
     let ws = std::path::Path::new(manifest).parent().unwrap().parent().unwrap();
-    let release = ws.join("target/release/libspaghetti_asp.dylib");
-    let debug = ws.join("target/debug/libspaghetti_asp.dylib");
-    let path = if release.exists() { release } else { debug };
+    // Claude: the newest build, so a stale release build is not what is tested.
+    let path = ["release", "debug"]
+        .map(|profile| ws.join(format!("target/{profile}/libspaghetti_asp.dylib")))
+        .into_iter()
+        .filter_map(|path| Some((path.metadata().ok()?.modified().ok()?, path)))
+        .max()
+        .map(|(_, path)| path)
+        .expect("libspaghetti_asp.dylib is built");
     std::ffi::CString::new(path.to_str().unwrap()).unwrap()
 }
 
@@ -236,4 +242,33 @@ fn query_interface_driver_uuid() {
     assert_eq!(result, 0, "Should return S_OK");
     assert!(!out.is_null());
     assert_eq!(out, driver as *mut c_void, "Should return same driver ref");
+}
+
+#[test]
+fn plugin_and_device_report_spaghetti_as_manufacturer() {
+    let driver = get_driver();
+    let vtable = unsafe { &**driver };
+    let get_data = vtable.GetPropertyData.expect("GetPropertyData is None");
+    let address = addr(kAudioObjectPropertyManufacturer, kAudioObjectPropertyScopeGlobal);
+    for object in [1, DEVICE_ID] {
+        let mut name: CFStringRef = ptr::null();
+        let mut out_size: u32 = 0;
+        let status = unsafe {
+            get_data(
+                driver, object, 0, &address, 0, ptr::null(),
+                std::mem::size_of::<CFStringRef>() as u32,
+                &mut out_size, &mut name as *mut CFStringRef as *mut c_void,
+            )
+        };
+        assert_eq!(status, kAudioHardwareNoError as i32);
+        assert_eq!(cf_string(name), "Spaghetti", "object {object}");
+    }
+}
+
+fn cf_string(string: CFStringRef) -> String {
+    use core_foundation_sys::string::{CFStringGetCString, kCFStringEncodingUTF8};
+    let mut buffer = [0i8; 256];
+    let ok = unsafe { CFStringGetCString(string, buffer.as_mut_ptr(), 256, kCFStringEncodingUTF8) };
+    assert_ne!(ok, 0);
+    unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) }.to_string_lossy().into_owned()
 }

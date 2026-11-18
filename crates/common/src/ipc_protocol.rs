@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Result as IoResult, Write};
 
+use crate::device_config::Volume;
+
 /// How a tap affects its source process's audio output.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TapMode {
@@ -43,7 +45,12 @@ pub enum Request {
     SetReceiverVolume { route_id: u32, volume: f32 },
     /// Hand a WebRTC peer the answer to its offer, or the offer it answers.
     SetRemoteDescription { peer: PeerRef, generation: u32, sdp: String },
-    CreateDevice { name: String, channels: Option<u32> },
+    CreateDevice {
+        name: String,
+        channels: Option<u32>,
+        #[serde(default)]
+        volume: Volume,
+    },
     DestroyDevice { device_uid: String },
     ListDevices,
     GetActivity,
@@ -282,6 +289,8 @@ pub struct DeviceInfo {
     /// True for the built-in Spaghetti device that cannot be destroyed.
     #[serde(default)]
     pub is_default: bool,
+    #[serde(default)]
+    pub volume: Volume,
 }
 
 /// A CoreAudio device as seen by the system — not necessarily daemon-managed.

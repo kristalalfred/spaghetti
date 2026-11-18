@@ -1,7 +1,7 @@
 //! Config-file watcher.
 //!
-//! A single background thread polls both the primary and fallback config
-//! paths every [`POLL_INTERVAL`]. When a file appears or its mtime moves
+//! A single background thread polls the plugin's config paths every
+//! [`POLL_INTERVAL`]. When a file appears or its mtime moves
 //! forward, the watcher parses it and swaps a rebuilt [`DeviceRegistry`]
 //! into the `ArcSwap`. After every successful swap it notifies the HAL host
 //! via `PropertiesChanged` so Core Audio re-queries the device list.
@@ -15,9 +15,7 @@ use std::sync::Once;
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use spaghetti_common::device_config::{
-    DEVICE_CONFIG_PATH, DEVICE_CONFIG_VERSION, DeviceConfigFile, FALLBACK_DEVICE_CONFIG_PATH,
-};
+use spaghetti_common::device_config::{DEVICE_CONFIG_VERSION, DeviceConfigFile};
 
 use crate::log;
 use crate::registry;
@@ -37,13 +35,20 @@ pub fn start() {
     START.call_once(|| {
         let mut watch = WatchState::default();
         let entries = watch.poll().map(|file| file.devices).unwrap_or_default();
-        let initial = registry::rebuild_from_entries(&registry::current(), &entries);
+        let initial = registry::rebuild_from_entries(
+            &registry::current(),
+            &registry::builtin_entries(),
+            &entries,
+        );
         log(&format!(
             "initial registry: {:?}",
             initial.devices().map(|d| d.uid.as_str()).collect::<Vec<_>>()
         ));
         registry::store(initial);
 
+        if crate::plugin().config_paths.is_empty() {
+            return;
+        }
         thread::spawn(move || {
             loop {
                 thread::sleep(POLL_INTERVAL);
@@ -128,7 +133,8 @@ fn apply_config(file: &DeviceConfigFile) {
     }
 
     let previous = registry::current();
-    let new = registry::rebuild_from_entries(&previous, &file.devices);
+    let new =
+        registry::rebuild_from_entries(&previous, &registry::builtin_entries(), &file.devices);
 
     let added: Vec<String> = new
         .by_uid
@@ -155,8 +161,9 @@ fn apply_config(file: &DeviceConfigFile) {
 
 /// Return the first candidate path that currently exists, with its mtime.
 fn pick_live_path() -> Option<(PathBuf, SystemTime)> {
-    [DEVICE_CONFIG_PATH, FALLBACK_DEVICE_CONFIG_PATH]
-        .into_iter()
+    crate::plugin()
+        .config_paths
+        .iter()
         .map(PathBuf::from)
         .find_map(|path| {
             let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok()?;

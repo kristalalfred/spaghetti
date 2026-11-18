@@ -11,6 +11,7 @@ use output::{
     print_system_devices,
 };
 use serde_json::json;
+use spaghetti_common::device_config::Volume;
 use spaghetti_common::ipc_protocol::{
     AirPlayReceiverInfo, Destination, Request, Response, SourceSpec, SrtMode, SrtSocket, TapMode,
 };
@@ -202,6 +203,10 @@ enum DeviceAction {
         /// Number of channels
         #[arg(short, long, default_value = "2")]
         channels: u32,
+        /// Pass audio through at full scale and only report the device's
+        /// volume and mute, for a program that applies them elsewhere
+        #[arg(long)]
+        report_volume: bool,
     },
     /// Destroy a virtual device
     Destroy {
@@ -480,12 +485,22 @@ fn run_command(cmd: Command, out: Output) -> Result<(), Box<dyn Error>> {
                 };
                 out.emit(&devices, || print_devices(&devices))?;
             }
-            Some(DeviceAction::Create { name, channels }) => {
+            Some(DeviceAction::Create {
+                name,
+                channels,
+                report_volume,
+            }) => {
+                let volume = if report_volume {
+                    Volume::Reported
+                } else {
+                    Volume::Applied
+                };
                 let Response::DeviceCreated { device_uid } = client::request(
                     &mut stream,
                     &Request::CreateDevice {
                         name,
                         channels: Some(channels),
+                        volume,
                     },
                 )?
                 else {

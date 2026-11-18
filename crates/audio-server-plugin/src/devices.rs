@@ -12,6 +12,8 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
+use spaghetti_common::device_config::{DeviceConfigEntry, Volume};
+
 use coreaudio_sys::{
     AudioStreamBasicDescription, kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked,
     kAudioFormatFlagsNativeEndian, kAudioFormatLinearPCM,
@@ -70,6 +72,9 @@ pub struct DeviceInstance {
     pub volume: AtomicU32,
     /// Output mute state (`0` unmuted, `1` muted).
     pub mute: AtomicU32,
+    /// Claude: whether `volume` and `mute` scale the audio or are only
+    /// reported.
+    pub volume_mode: Volume,
 
     // ---- IO state ---------------------------------------------------------
     /// Active `StartIO` count minus `StopIO` count.
@@ -88,21 +93,16 @@ pub struct DeviceInstance {
 impl DeviceInstance {
     /// Allocate a fresh device. All atomics start at their resting values:
     /// unity volume, unmuted, IO stopped, ring buffer zeroed.
-    // A params struct would add noise for a constructor only ever called
-    // from `DeviceRegistry::insert_device`; the arg list stays flat.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device_id: u32,
         stream_in_id: u32,
         stream_out_id: u32,
         volume_id: u32,
         mute_id: u32,
-        uid: String,
-        name: String,
-        channels: u32,
-        sample_rate: f64,
+        entry: &DeviceConfigEntry,
         ring_frames: usize,
     ) -> Self {
+        let channels = entry.channels;
         let len = ring_frames * channels as usize;
         let mut buf = Vec::with_capacity(len);
         buf.resize_with(len, || AtomicU32::new(0));
@@ -113,14 +113,15 @@ impl DeviceInstance {
             stream_out_id,
             volume_id,
             mute_id,
-            uid,
-            name,
+            uid: entry.uid.clone(),
+            name: entry.name.clone(),
             channels,
-            sample_rate,
+            sample_rate: f64::from(entry.sample_rate),
             ring_buffer: buf.into_boxed_slice(),
             ring_frames,
             volume: AtomicU32::new(1.0f32.to_bits()),
             mute: AtomicU32::new(0),
+            volume_mode: entry.volume,
             io_running_count: AtomicU32::new(0),
             timestamp_count: AtomicU64::new(0),
             anchor_host_time: AtomicU64::new(0),
@@ -152,24 +153,20 @@ impl DeviceInstance {
 mod tests {
     use super::*;
 
-    fn instance(channels: u32, sample_rate: f64, ring_frames: usize) -> DeviceInstance {
-        DeviceInstance::new(
-            100,
-            101,
-            102,
-            103,
-            104,
-            "test_uid".into(),
-            "Test".into(),
+    fn instance(channels: u32, sample_rate: u32, ring_frames: usize) -> DeviceInstance {
+        let entry = DeviceConfigEntry {
+            uid: "test_uid".into(),
+            name: "Test".into(),
             channels,
             sample_rate,
-            ring_frames,
-        )
+            volume: Volume::Applied,
+        };
+        DeviceInstance::new(100, 101, 102, 103, 104, &entry, ring_frames)
     }
 
     #[test]
     fn asbd_reflects_channels_and_rate() {
-        let dev = instance(6, 44_100.0, 1024);
+        let dev = instance(6, 44_100, 1024);
         let asbd = dev.asbd();
         assert_eq!(asbd.mChannelsPerFrame, 6);
         assert_eq!(asbd.mSampleRate, 44_100.0);
@@ -181,7 +178,7 @@ mod tests {
 
     #[test]
     fn asbd_default_stereo() {
-        let dev = instance(2, 48_000.0, 16_384);
+        let dev = instance(2, 48_000, 16_384);
         let asbd = dev.asbd();
         assert_eq!(asbd.mChannelsPerFrame, 2);
         assert_eq!(asbd.mBytesPerFrame, 8);
@@ -190,13 +187,13 @@ mod tests {
 
     #[test]
     fn ring_buffer_scales_with_channels() {
-        let stereo = instance(2, 48_000.0, 16_384);
+        let stereo = instance(2, 48_000, 16_384);
         assert_eq!(stereo.ring_buffer.len(), 16_384 * 2);
 
-        let six_channel = instance(6, 48_000.0, 16_384);
+        let six_channel = instance(6, 48_000, 16_384);
         assert_eq!(six_channel.ring_buffer.len(), 16_384 * 6);
 
-        let mono = instance(1, 48_000.0, 16_384);
+        let mono = instance(1, 48_000, 16_384);
         assert_eq!(mono.ring_buffer.len(), 16_384);
     }
 }

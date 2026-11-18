@@ -8,9 +8,10 @@ license.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
+audio-server-plugin = { path = "../audio-server-plugin" }
 spaghetti-common = { path = "../common" }
 coreaudio-sys = { version = "0.2", features = ["core_audio", "audio_server_plugin"] }
+
+
+[dev-dependencies]
 core-foundation-sys = "0.8"
-libc = "0.2"
-arc-swap = "1"
-serde_json = "1"

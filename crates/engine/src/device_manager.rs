@@ -26,7 +26,7 @@ use tokio::time::Instant;
 
 use spaghetti_common::device_config::{
     DEVICE_CONFIG_PATH, DEVICE_CONFIG_VERSION, DeviceConfigEntry, DeviceConfigFile,
-    FALLBACK_DEVICE_CONFIG_PATH,
+    FALLBACK_DEVICE_CONFIG_PATH, Volume,
 };
 use spaghetti_common::ipc_protocol::DeviceInfo;
 
@@ -116,6 +116,7 @@ impl DeviceManager {
         &self,
         name: &str,
         channels: Option<u32>,
+        volume: Volume,
     ) -> Result<DeviceInfo, String> {
         let trimmed = name.trim();
         if trimmed.is_empty() {
@@ -133,6 +134,7 @@ impl DeviceManager {
             name: trimmed.to_string(),
             channels,
             sample_rate: DEFAULT_SAMPLE_RATE,
+            volume,
         };
 
         {
@@ -301,6 +303,7 @@ fn default_entry() -> DeviceConfigEntry {
         name: SPAGHETTI_DEVICE_NAME.to_string(),
         channels: DEFAULT_CHANNELS,
         sample_rate: DEFAULT_SAMPLE_RATE,
+        volume: Volume::Applied,
     }
 }
 
@@ -310,6 +313,7 @@ fn entry_to_info(e: &DeviceConfigEntry) -> DeviceInfo {
         name: e.name.clone(),
         channels: e.channels,
         is_default: e.uid == SPAGHETTI_DEVICE_UID,
+        volume: e.volume,
     }
 }
 
@@ -401,7 +405,7 @@ mod tests {
         let found = Arc::new(AtomicBool::new(true));
         let mgr = mgr_with_path(&path, fake_lookup(Arc::clone(&found)));
 
-        let err = mgr.create_device("   ", None).await.unwrap_err();
+        let err = mgr.create_device("   ", None, Volume::Applied).await.unwrap_err();
         assert!(err.contains("empty"));
     }
 
@@ -412,11 +416,28 @@ mod tests {
         let found = Arc::new(AtomicBool::new(true));
         let mgr = mgr_with_path(&path, fake_lookup(Arc::clone(&found)));
 
-        let info = mgr.create_device("Stream", Some(2)).await.unwrap();
+        let info = mgr.create_device("Stream", Some(2), Volume::Applied).await.unwrap();
         assert!(info.uid.starts_with("spaghetti_virtual_"));
         let on_disk = load_config(&path).unwrap().unwrap();
         assert_eq!(on_disk.devices.len(), 2);
         assert_eq!(on_disk.devices[1].uid, info.uid);
+    }
+
+    #[tokio::test]
+    async fn a_reported_volume_is_kept_on_disk_and_listed() {
+        let dir = tempdir_path("create-reported");
+        let path = dir.join("devices.json");
+        let found = Arc::new(AtomicBool::new(true));
+        let mgr = mgr_with_path(&path, fake_lookup(Arc::clone(&found)));
+
+        let info = mgr
+            .create_device("Knob", Some(2), Volume::Reported)
+            .await
+            .unwrap();
+        assert_eq!(info.volume, Volume::Reported);
+        let on_disk = load_config(&path).unwrap().unwrap();
+        assert_eq!(on_disk.devices[1].volume, Volume::Reported);
+        assert_eq!(on_disk.devices[0].volume, Volume::Applied);
     }
 
     #[tokio::test(start_paused = true)]
@@ -426,7 +447,7 @@ mod tests {
         let found = Arc::new(AtomicBool::new(false));
         let mgr = mgr_with_path(&path, fake_lookup(Arc::clone(&found)));
 
-        let err = mgr.create_device("Ghost", Some(2)).await.unwrap_err();
+        let err = mgr.create_device("Ghost", Some(2), Volume::Applied).await.unwrap_err();
         assert!(err.contains("timed out"));
         // Rollback: only the default remains.
         let listed = mgr.list_devices();
@@ -459,6 +480,7 @@ mod tests {
             name: "Test".into(),
             channels: 2,
             sample_rate: 48000,
+            volume: Volume::Applied,
         };
         {
             let mut cfg = mgr.write_lock();

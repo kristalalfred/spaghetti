@@ -36,11 +36,13 @@ use coreaudio_sys::{
     CFStringCreateWithCString, kCFAllocatorDefault, kCFStringEncodingUTF8,
 };
 
+use spaghetti_common::device_config::Volume;
+
 use crate::devices::{DeviceInstance, DeviceRole};
 use crate::iface::{DRIVER_INTERFACE_UUID, DRIVER_REF, DriverRef};
-use crate::log;
 use crate::registry::{self, OBJECT_ID_PLUGIN};
-use spaghetti_common::activity::{ACTIVITY_SHM_NAME, ActivityRegion};
+use crate::{log, plugin};
+use spaghetti_common::activity::ActivityRegion;
 
 // ---------------------------------------------------------------------------
 // Constants (scoped to this module)
@@ -125,11 +127,10 @@ pub static DRIVER: DriverState = DriverState {
 /// device's sample rate in `start_io`.
 static HOST_TICKS_PER_SECOND: AtomicU64 = AtomicU64::new(0);
 
-/// Pointer to the mmap-ed activity region shared with the daemon. Null until
-/// `initialize` sets it up; access is guarded by a null check.
+/// Pointer to the mmap-ed activity region shared with other processes. Null
+/// until `initialize` sets it up; access is guarded by a null check.
 ///
-/// NOTE: the activity shm is single-region in this phase — only the default
-/// device writes to it. Multi-device activity reporting is a follow-up.
+/// Claude: only the plugin's activity device writes to it.
 static ACTIVITY_PTR: AtomicPtr<ActivityRegion> = AtomicPtr::new(std::ptr::null_mut());
 
 const UNSUPPORTED: OSStatus = 0x756E_6F70u32 as OSStatus; // 'unop' = kAudioHardwareUnsupportedOperationError
@@ -317,8 +318,10 @@ pub unsafe extern "C" fn initialize(
     // Claude: the region's name is system-wide and creating it unlinks the old
     // one, so a test harness that loads the driver without a host must leave
     // the live driver's region alone.
-    if !host.is_null() {
-        init_activity_region();
+    if !host.is_null()
+        && let Some(activity) = &plugin().activity
+    {
+        init_activity_region(activity.shm_name);
     }
 
     log("initialize: returning noErr");
@@ -328,10 +331,10 @@ pub unsafe extern "C" fn initialize(
 /// Open, size, and mmap the activity shared-memory region. Publishes the result
 /// via `ACTIVITY_PTR`. All failure paths log and leave the pointer null so the
 /// IO callback skips activity updates.
-fn init_activity_region() {
+fn init_activity_region(shm_name: &str) {
     use std::ffi::CString;
 
-    let name = match CString::new(ACTIVITY_SHM_NAME) {
+    let name = match CString::new(shm_name) {
         Ok(n) => n,
         Err(e) => {
             log(&format!("activity: bad shm name: {e}"));
@@ -851,7 +854,7 @@ fn get_plugin_property(
                 pw.write_u32_slice(&ids)
             }
         }
-        x if x == kAudioObjectPropertyManufacturer => pw.write_cfstr("Spaghetti"),
+        x if x == kAudioObjectPropertyManufacturer => pw.write_cfstr(plugin().manufacturer),
         x if x == kAudioPlugInPropertyTranslateUIDToDevice => {
             translate_uid_to_device(qualifier_size, qualifier_data, pw)
         }
@@ -909,9 +912,9 @@ fn get_device_property(
         x if x == kAudioObjectPropertyClass => pw.write_u32(kAudioDeviceClassID),
         x if x == kAudioObjectPropertyOwner => pw.write_u32(OBJECT_ID_PLUGIN),
         x if x == kAudioObjectPropertyName => pw.write_cfstr(&instance.name),
-        x if x == kAudioObjectPropertyManufacturer => pw.write_cfstr("Spaghetti"),
+        x if x == kAudioObjectPropertyManufacturer => pw.write_cfstr(plugin().manufacturer),
         x if x == kAudioDevicePropertyDeviceUID => pw.write_cfstr(&instance.uid),
-        x if x == kAudioDevicePropertyModelUID => pw.write_cfstr("SpaghettiModel_UID"),
+        x if x == kAudioDevicePropertyModelUID => pw.write_cfstr(plugin().model_uid),
         x if x == kAudioDevicePropertyTransportType => {
             pw.write_u32(kAudioDeviceTransportTypeVirtual)
         }
@@ -1219,17 +1222,19 @@ fn notify_host_property_changed(object_id: u32, selector: u32) {
 // IO operations
 // ---------------------------------------------------------------------------
 
-/// Mirror the default-device IO-running state into the activity region. The
-/// activity shm is single-region for now (see ACTIVITY_PTR comment); multi-
-/// device reporting is follow-up work.
+/// Claude: mirrors the activity device's IO-running state into the activity
+/// region.
 fn publish_io_running() {
     let ptr = ACTIVITY_PTR.load(Ordering::Acquire);
     if ptr.is_null() {
         return;
     }
+    let Some(activity) = &plugin().activity else {
+        return;
+    };
     let reg = registry::current();
     let running = reg
-        .default_device()
+        .device(activity.device_uid)
         .map(|d| u32::from(d.io_running_count.load(Ordering::SeqCst) > 0))
         .unwrap_or(0);
     unsafe { (*ptr).io_running.store(running, Ordering::Relaxed) };
@@ -1405,18 +1410,20 @@ pub unsafe extern "C" fn do_io_operation(
     let sample_count = frame_count * channels;
     let buf = main_buffer as *mut f32;
 
-    let is_default = instance.uid == registry::DEFAULT_DEVICE_UID;
+    let reports_activity = plugin()
+        .activity
+        .as_ref()
+        .is_some_and(|activity| instance.uid == activity.device_uid);
 
     match operation_id {
         x if x == kAudioServerPlugInIOOperationWriteMix => {
             let sample_time = unsafe { (*io_cycle_info).mOutputTime.mSampleTime } as usize;
             let offset = (sample_time % ring_frames) * channels;
 
-            let muted = instance.mute.load(Ordering::Relaxed) != 0;
-            let gain = if muted {
-                0.0_f32
-            } else {
-                f32::from_bits(instance.volume.load(Ordering::Relaxed))
+            let gain = match instance.volume_mode {
+                Volume::Reported => 1.0_f32,
+                Volume::Applied if instance.mute.load(Ordering::Relaxed) != 0 => 0.0,
+                Volume::Applied => f32::from_bits(instance.volume.load(Ordering::Relaxed)),
             };
 
             let mut peak: f32 = 0.0;
@@ -1430,7 +1437,7 @@ pub unsafe extern "C" fn do_io_operation(
                 instance.ring_buffer[ring_idx].store(scaled.to_bits(), Ordering::Relaxed);
             }
 
-            if is_default {
+            if reports_activity {
                 let activity = ACTIVITY_PTR.load(Ordering::Acquire);
                 if !activity.is_null() {
                     unsafe {
@@ -1477,6 +1484,58 @@ pub unsafe extern "C" fn end_io_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spaghetti_common::device_config::DeviceConfigEntry;
+
+    fn entry(uid: &str, volume: Volume) -> DeviceConfigEntry {
+        DeviceConfigEntry {
+            uid: uid.into(),
+            name: uid.into(),
+            channels: 2,
+            sample_rate: 48_000,
+            volume,
+        }
+    }
+
+    /// Claude: writes `samples` to the device at half volume, muted or not,
+    /// and reads them back from its input.
+    fn loop_back(volume: Volume, muted: bool, samples: &[f32]) -> Vec<f32> {
+        let mut reg = registry::DeviceRegistry::empty();
+        let device_id = reg.insert_device(&entry("loop", volume), 1024);
+        let instance = std::sync::Arc::clone(&reg.by_id[&device_id]);
+        registry::store(reg);
+        instance.volume.store(0.5f32.to_bits(), Ordering::Relaxed);
+        instance.mute.store(u32::from(muted), Ordering::Relaxed);
+
+        let cycle: AudioServerPlugInIOCycleInfo = unsafe { std::mem::zeroed() };
+        let frames = (samples.len() / 2) as u32;
+        let io = |operation: u32, buffer: &mut [f32]| unsafe {
+            do_io_operation(
+                std::ptr::null_mut(),
+                device_id,
+                0,
+                0,
+                operation,
+                frames,
+                &cycle,
+                buffer.as_mut_ptr().cast(),
+                std::ptr::null_mut(),
+            )
+        };
+        let mut written = samples.to_vec();
+        assert_eq!(io(kAudioServerPlugInIOOperationWriteMix, &mut written), 0);
+        let mut read = vec![0.0; samples.len()];
+        assert_eq!(io(kAudioServerPlugInIOOperationReadInput, &mut read), 0);
+        read
+    }
+
+    #[test]
+    fn loopback_volume_is_applied_or_only_reported() {
+        let samples = [0.8, -0.4, 0.2, -1.0];
+        assert_eq!(loop_back(Volume::Applied, false, &samples), [0.4, -0.2, 0.1, -0.5]);
+        assert_eq!(loop_back(Volume::Applied, true, &samples), [0.0; 4]);
+        assert_eq!(loop_back(Volume::Reported, false, &samples), samples);
+        assert_eq!(loop_back(Volume::Reported, true, &samples), samples);
+    }
 
     #[test]
     fn list_writes_are_truncated_to_capacity() {

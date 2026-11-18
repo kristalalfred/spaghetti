@@ -287,8 +287,12 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
                 Err(message) => Response::Error { message },
             }
         }
-        Request::CreateDevice { name, channels } => {
-            match shared.devices.create_device(&name, channels).await {
+        Request::CreateDevice {
+            name,
+            channels,
+            volume,
+        } => {
+            match shared.devices.create_device(&name, channels, volume).await {
                 Ok(info) => Response::DeviceCreated { device_uid: info.uid },
                 Err(message) => Response::Error { message },
             }
