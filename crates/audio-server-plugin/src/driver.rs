@@ -143,7 +143,7 @@ use crate::uuid_eq;
 
 /// Create a CFStringRef from a Rust string. Returns null on allocation failure.
 /// The caller owns the returned +1 reference.
-fn cfstr(s: &str) -> CFStringRef {
+pub(crate) fn cfstr(s: &str) -> CFStringRef {
     let cstr = std::ffi::CString::new(s).unwrap_or_else(|_| std::ffi::CString::new("").unwrap());
     unsafe { CFStringCreateWithCString(kCFAllocatorDefault, cstr.as_ptr(), kCFStringEncodingUTF8) }
 }
@@ -1147,6 +1147,7 @@ unsafe fn set_volume_property(
             instance
                 .volume
                 .store(new_scalar.to_bits(), Ordering::Relaxed);
+            crate::storage::save(instance);
             notify_host_property_changed(control_id, kAudioLevelControlPropertyScalarValue);
             notify_host_property_changed(control_id, kAudioLevelControlPropertyDecibelValue);
             kAudioHardwareNoError as OSStatus
@@ -1158,6 +1159,7 @@ unsafe fn set_volume_property(
             let db = unsafe { *(data as *const f32) }.clamp(-96.0, 0.0);
             let scalar = db_to_scalar(db).clamp(0.0, 1.0);
             instance.volume.store(scalar.to_bits(), Ordering::Relaxed);
+            crate::storage::save(instance);
             notify_host_property_changed(control_id, kAudioLevelControlPropertyScalarValue);
             notify_host_property_changed(control_id, kAudioLevelControlPropertyDecibelValue);
             kAudioHardwareNoError as OSStatus
@@ -1182,6 +1184,7 @@ unsafe fn set_mute_property(
             instance
                 .mute
                 .store(if v != 0 { 1 } else { 0 }, Ordering::Relaxed);
+            crate::storage::save(instance);
             notify_host_property_changed(control_id, kAudioBooleanControlPropertyValue);
             kAudioHardwareNoError as OSStatus
         }

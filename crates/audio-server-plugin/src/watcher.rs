@@ -19,6 +19,7 @@ use spaghetti_common::device_config::{DEVICE_CONFIG_VERSION, DeviceConfigFile};
 
 use crate::log;
 use crate::registry;
+use crate::storage;
 
 /// Poll period for mtime checks. Chosen to balance UI responsiveness against
 /// wasted syscalls; the whole point of `ArcSwap` is that reads on the IO path
@@ -44,6 +45,7 @@ pub fn start() {
             "initial registry: {:?}",
             initial.devices().map(|d| d.uid.as_str()).collect::<Vec<_>>()
         ));
+        initial.devices().for_each(|device| storage::restore(device));
         registry::store(initial);
 
         if crate::plugin().config_paths.is_empty() {
@@ -149,6 +151,11 @@ fn apply_config(file: &DeviceConfigFile) {
         .cloned()
         .collect();
 
+    for uid in &added {
+        if let Some(device) = new.device(uid) {
+            storage::restore(device);
+        }
+    }
     drop(previous);
     registry::store(new);
 

@@ -24,6 +24,7 @@ mod devices;
 pub(crate) mod driver;
 mod iface;
 pub(crate) mod registry;
+mod storage;
 mod watcher;
 
 use std::ffi::c_void;
