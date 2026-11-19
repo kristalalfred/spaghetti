@@ -1,7 +1,9 @@
-//! Claude: the host clock every timestamp in the engine is in: mach absolute
-//! time, which Core Audio stamps `AudioTimeStamp::mHostTime` with on macOS
-//! and iOS alike. iOS has no `AudioGetCurrentHostTime`, so the engine reads
-//! the clock itself.
+//! Claude: the host clock every timestamp in the engine is in. On Apple
+//! platforms it is mach absolute time, which Core Audio stamps
+//! `AudioTimeStamp::mHostTime` with on macOS and iOS alike; iOS has no
+//! `AudioGetCurrentHostTime`, so the engine reads the clock itself. On
+//! Windows it is the performance counter, which WASAPI stamps its positions
+//! with in 100 ns units.
 
 use std::ops::{Add, Sub};
 use std::time::Duration;
@@ -37,6 +39,32 @@ mod clock {
 
     pub fn now() -> u64 {
         unsafe { mach_absolute_time() }
+    }
+}
+
+#[cfg(windows)]
+mod clock {
+    use std::sync::OnceLock;
+
+    use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+
+    /// Claude: nanoseconds are ticks times `numer / denom`.
+    pub fn ratio() -> (u64, u64) {
+        static FREQUENCY: OnceLock<u64> = OnceLock::new();
+        let frequency = *FREQUENCY.get_or_init(|| {
+            let mut frequency = 0i64;
+            unsafe { QueryPerformanceFrequency(&mut frequency) }
+                .expect("QueryPerformanceFrequency failed");
+            assert!(frequency > 0, "the performance counter has no frequency");
+            frequency as u64
+        });
+        (1_000_000_000, frequency)
+    }
+
+    pub fn now() -> u64 {
+        let mut ticks = 0i64;
+        let _ = unsafe { QueryPerformanceCounter(&mut ticks) };
+        ticks as u64
     }
 }
 

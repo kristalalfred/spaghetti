@@ -239,18 +239,27 @@ pub(crate) struct Txt(pub(crate) Vec<(String, String)>);
 impl Txt {
     /// Claude: parses DNS-SD TXT record data: length-prefixed `key=value`
     /// strings, where a key without `=` has an empty value.
+    #[cfg(any(unix, test))]
     pub(crate) fn parse(mut data: &[u8]) -> Txt {
-        let mut entries = Vec::new();
+        let mut strings = Vec::new();
         while let Some((&len, rest)) = data.split_first() {
             let len = usize::from(len).min(rest.len());
-            let entry = String::from_utf8_lossy(&rest[..len]);
+            strings.push(String::from_utf8_lossy(&rest[..len]));
             data = &rest[len..];
-            if entry.is_empty() {
-                continue;
-            }
-            let (key, value) = entry.split_once('=').unwrap_or((&entry, ""));
-            entries.push((key.to_owned(), value.to_owned()));
         }
+        Txt::from_strings(strings.iter().map(|s| s.as_ref()))
+    }
+
+    /// Claude: the TXT record's `key=value` strings, already split apart.
+    pub(crate) fn from_strings<'a>(strings: impl IntoIterator<Item = &'a str>) -> Txt {
+        let entries = strings
+            .into_iter()
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                let (key, value) = entry.split_once('=').unwrap_or((entry, ""));
+                (key.to_owned(), value.to_owned())
+            })
+            .collect();
         Txt(entries)
     }
 

@@ -6,6 +6,12 @@ mod audiotoolbox;
 use audiotoolbox as backend;
 #[cfg(target_vendor = "apple")]
 pub use audiotoolbox::{Decoder, Encoder};
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use self::windows as backend;
+#[cfg(windows)]
+pub use self::windows::{Decoder, Encoder};
 
 /// Claude: every stream is decoded at this rate, so a source can report its
 /// timing before its first packet says what the stream's rate is.

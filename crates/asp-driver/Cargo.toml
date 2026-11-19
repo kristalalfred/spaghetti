@@ -7,11 +7,11 @@ license.workspace = true
 [lib]
 crate-type = ["cdylib"]
 
-[dependencies]
+[target.'cfg(target_os = "macos")'.dependencies]
 audio-server-plugin = { path = "../audio-server-plugin" }
 spaghetti-common = { path = "../common" }
 coreaudio-sys = { version = "0.2", features = ["core_audio", "audio_server_plugin"] }
 
 
-[dev-dependencies]
+[target.'cfg(target_os = "macos")'.dev-dependencies]
 core-foundation-sys = "0.8"

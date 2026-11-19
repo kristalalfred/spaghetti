@@ -1,8 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
-use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixDatagram;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -14,6 +12,7 @@ use super::wire::{
     Body, Dataset, FollowInfo, Message, PortIdentity, Timestamp, Tlv, apple_signaling,
 };
 use super::{ClockIdentity, Config, Endpoint, Timebase, Timing};
+use crate::sys::{self, Interest, WakeSocket};
 
 const ELECTION: Duration = Duration::from_secs(2);
 const ANNOUNCE_WITHOUT_TIMING: Duration = Duration::from_secs(3);
@@ -34,7 +33,7 @@ pub(super) enum Command {
 
 pub(super) struct Control {
     pub sender: mpsc::Sender<Command>,
-    pub wake: UnixDatagram,
+    pub wake: WakeSocket,
 }
 
 impl Control {
@@ -138,14 +137,16 @@ fn bind_socket(ipv6: bool, port: u16) -> io::Result<UdpSocket> {
         }
         socket.set_nonblocking(true)?;
         socket.bind(&address.into())?;
-        Ok(socket.into())
+        let socket = socket.into();
+        sys::ignore_unreachable(&socket)?;
+        Ok(socket)
     };
     make().map_err(|e| io::Error::new(e.kind(), format!("could not bind PTP UDP {address}: {e}")))
 }
 
 pub(super) fn run(
     sockets: Sockets,
-    wake: UnixDatagram,
+    wake: WakeSocket,
     commands: mpsc::Receiver<Command>,
     own: Timebase,
     config: Config,
@@ -231,34 +232,17 @@ pub(super) fn run(
             peer.tick(now, &sockets, own);
             deadline = deadline.min(peer.deadline(now));
         }
-        let mut descriptors: Vec<_> = sockets
-            .sockets
-            .iter()
-            .map(|s| libc::pollfd {
-                fd: s.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            })
-            .collect();
-        descriptors.push(libc::pollfd {
-            fd: wake.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        });
-        let timeout = deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis()
-            .saturating_add(1)
-            .min(i32::MAX as u128) as i32;
-        let ready = unsafe {
-            libc::poll(
-                descriptors.as_mut_ptr(),
-                descriptors.len() as libc::nfds_t,
-                timeout,
-            )
-        };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
+        let interests = [
+            Interest::readable(&sockets.sockets[0]),
+            Interest::readable(&sockets.sockets[1]),
+            Interest::readable(&sockets.sockets[2]),
+            Interest::readable(&sockets.sockets[3]),
+            Interest::readable(&wake),
+        ];
+        let mut ready = [false; 5];
+        let left = deadline.saturating_duration_since(Instant::now());
+        let timeout = Duration::from_millis(left.as_millis() as u64 + 1);
+        if let Err(error) = sys::wait(&interests, &mut ready, timeout) {
             if error.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
@@ -267,11 +251,11 @@ pub(super) fn run(
             }
             return;
         }
-        if descriptors[4].revents != 0 {
+        if ready[4] {
             while wake.recv(&mut buffer).is_ok() {}
         }
         for (index, socket) in sockets.sockets.iter().enumerate() {
-            if descriptors[index].revents == 0 {
+            if !ready[index] {
                 continue;
             }
             for _ in 0..64 {

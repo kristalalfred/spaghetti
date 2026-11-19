@@ -234,7 +234,8 @@ pub struct DaemonStatus {
 pub struct AppInfo {
     pub name: String,
     pub bundle_id: Option<String>,
-    /// The `.app` the processes run from; absent for a process outside any bundle.
+    /// The app the processes run from: its `.app` on macOS, absent for a process
+    /// outside any bundle, and its executable on Windows.
     pub bundle_path: Option<String>,
     pub pids: Vec<u32>,
 }
@@ -318,8 +319,11 @@ pub enum AirPlaySupport {
     Unsupported { reason: String },
 }
 
-/// Socket path for daemon IPC.
+/// Where the daemon listens: a Unix socket's path, or on Windows a named pipe's.
+#[cfg(unix)]
 pub const SOCKET_PATH: &str = "/tmp/spaghetti.sock";
+#[cfg(windows)]
+pub const SOCKET_PATH: &str = r"\\.\pipe\spaghetti";
 
 /// Write a length-prefixed JSON message.
 pub fn write_message<W: Write>(writer: &mut W, msg: &impl Serialize) -> IoResult<()> {

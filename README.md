@@ -1,12 +1,20 @@
 # Spaghetti
 
-Route macOS app audio to physical or virtual output devices, to AirPlay receivers, or to other machines over SRT, from the CLI. [weave-adapter-spaghetti](https://github.com/kristalalfred/weave-adapter-spaghetti) adds WebRTC links signaled by open-weave.
+Route app audio on macOS and Windows to output devices, to AirPlay receivers, or to other machines over SRT, from the CLI. [weave-adapter-spaghetti](https://github.com/kristalalfred/weave-adapter-spaghetti) adds WebRTC links signaled by open-weave.
 
-Requires macOS, Rust, and Xcode Command Line Tools.
+On macOS, requires Rust and Xcode Command Line Tools, and installs a virtual audio driver, the daemon and the CLI:
 
 ```sh
 ./scripts/install.sh
 ```
+
+On Windows 10 (version 2004 or later) or 11, requires Rust's MSVC toolchain, the Visual Studio Build Tools with the C++ workload, and CMake. Build the daemon and the CLI, and run `spaghettid` in a terminal of its own:
+
+```sh
+cargo build --release -p spaghetti -p spaghettid
+```
+
+Windows has no virtual devices, and `--mute` is refused there: muting an app in Windows also silences what is captured of it.
 
 Find an app, tap its audio as a source, and route it to the default Spaghetti device:
 
@@ -128,9 +136,11 @@ fn example(captured: &[f32], left: &mut [f32], right: &mut [f32]) -> Result<(), 
 | Discontinuities | A push dated more than 1 ms off where the previous one ended, a push a route had no room for, and a push after `ProgramInput::discontinuity` each start a new run. A route drops what it still holds from before the new run and primes again. |
 | Several routes | One output mixes up to `MAX_PROGRAM_ROUTES` (8) routes. One input feeds up to 8 routes. |
 | Removal | `remove_program_input` destroys the sources made from the input. `remove_program_output` fades out and destroys the routes to the output. The real-time ends keep working: an input feeds nothing, an output renders silence. Drop them outside the real-time thread. |
-| Input devices | macOS only. `SourceSpec::Input { device_uid }` captures a Core Audio input device's first input stream, its first two channels or its one channel on both, while a route or calibration takes its frames. Each frame is dated by the device's time stamp less its input latency, and a change to the device's format, rate, latency or streams, or its removal, ends the source as `Lost`, with the reason in `SourceInfo::failure`. |
+| Input devices | macOS and Windows. `SourceSpec::Input { device_uid }` captures an input device while a route or calibration takes its frames. On macOS it captures a Core Audio device's first input stream, its first two channels or its one channel on both; each frame is dated by the device's time stamp less its input latency, and a change to the device's format, rate, latency or streams, or its removal, ends the source as `Lost`, with the reason in `SourceInfo::failure`. On Windows it captures a capture endpoint in stereo at the rate the system mixes it at, each buffer dated by the time WASAPI gives its first frame, and a failure of the stream ends the source as `Lost`. |
 | Calibration | `Router::calibrate` measures how much later one destination on a delay sounds than another where a recording hears both, a `Recording::Input` device or a `Recording::Program` input that dates its pushes, and returns at once. `Calibrating::state` reports progress and the result: both residuals and the output's `latency_offset_ms` that aligns it with the reference. It waits, within a bound, for the output's timing to settle, and fails with `Unsettled` when it does not. The calibration holds its AirPlay receivers and program outputs against new routes while it runs, ends with `EndpointRemoved` when a program input or output it uses is removed or the router drops, and releases everything it opened before reporting `Done`. `Calibrating::cancel`, or dropping the handle, stops it. A program input recording must date each push within a quarter frame of the line through its pushes. |
 | State | `Router::list_routes` reports each device or program route's `Playback`: `Playing` when the output's latest render played the route's source at any volume, `Silent` while the route waits for audio or for its schedule or after a refused render, and `Stopped` when the output has not rendered for 100 ms plus 4096 frames at its rate. `list_sources` reports a program source as `Idle` without routes, then `Connected`, `Flowing` while the input pushes, and `Stalled` 3 s after it stops. |
+
+On Windows the engine captures apps through process loopback, one process and those under it, and plays to and captures from WASAPI endpoints in shared mode, each identified by its endpoint ID. Opus goes through libopus and AAC through Media Foundation, whose encoder takes 44.1 and 48 kHz and at most 192 kb/s.
 
 The engine also builds for iOS (`aarch64-apple-ios`, `aarch64-apple-ios-sim`). Those targets have no Core Audio HAL: process taps, input and output devices and the virtual-device functions are unavailable, and a `SourceSpec::Tap`, `SourceSpec::Input` or `Destination::Device` is refused when it is created. Program I/O, SRT, WebRTC and AirPlay remain available.
 

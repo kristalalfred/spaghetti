@@ -2,7 +2,10 @@ mod airplay2;
 mod backlog;
 mod browse;
 mod clock;
+#[cfg(unix)]
 mod dns_sd;
+#[cfg(windows)]
+mod dns_service;
 mod events;
 #[cfg(test)]
 mod fake;
@@ -16,6 +19,7 @@ mod rtsp;
 mod session;
 mod srp;
 mod stream;
+mod sys;
 mod tlv8;
 mod turns;
 

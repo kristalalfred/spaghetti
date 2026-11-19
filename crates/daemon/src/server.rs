@@ -2,15 +2,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use spaghetti_common::ipc_protocol::*;
-use spaghetti_engine::{ActivityReader, DeviceManager, FpsTracker, Router};
+use spaghetti_engine::Router;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-/// Freshness window for the driver's last WriteMix timestamp — older than this
-/// and the activity snapshot is considered stale (driver idle or gone).
-const ACTIVITY_FRESHNESS_NS: u64 = 200_000_000;
+use crate::driver::Driver;
+use crate::ipc::{Listener, Stream};
 
 const HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const CLIENT_DRAIN_LIMIT: Duration = Duration::from_secs(1);
@@ -30,51 +28,31 @@ impl DaemonState {
     }
 }
 
-/// Per-server (not per-connection) activity tracking. Kept outside `DaemonState`
-/// so the FPS window stays consistent across concurrent clients.
-///
-/// `reader` is behind a `Mutex` so the lazy-attach path (first successful open
-/// after daemon starts before the driver has loaded) can update it safely.
-pub struct ActivityState {
-    pub reader: Mutex<Option<ActivityReader>>,
-    pub fps: FpsTracker,
-}
-
-/// Claude: `devices` stays outside the `state` mutex because device
+/// Claude: `driver` stays outside the `state` mutex because device
 /// create/destroy waits on coreaudiod and must not block other requests.
 struct Shared {
     state: Mutex<DaemonState>,
-    devices: DeviceManager,
-    activity: ActivityState,
+    driver: Driver,
     cancel: CancellationToken,
 }
 
 pub struct Server {
-    listener: UnixListener,
+    listener: Listener,
     shared: Arc<Shared>,
     clients: JoinSet<()>,
     pub cancel: CancellationToken,
 }
 
 impl Server {
-    pub async fn bind(
-        activity_reader: Option<ActivityReader>,
-        device_manager: DeviceManager,
-    ) -> std::io::Result<Self> {
-        // Remove stale socket file if it exists from a previous run
-        let _ = std::fs::remove_file(SOCKET_PATH);
-        let listener = UnixListener::bind(SOCKET_PATH)?;
+    pub fn bind(driver: Driver) -> std::io::Result<Self> {
+        let listener = Listener::bind()?;
         let cancel = CancellationToken::new();
         Ok(Self {
             listener,
             clients: JoinSet::new(),
             shared: Arc::new(Shared {
                 state: Mutex::new(DaemonState::new()),
-                devices: device_manager,
-                activity: ActivityState {
-                    reader: Mutex::new(activity_reader),
-                    fps: FpsTracker::new(),
-                },
+                driver,
                 cancel: cancel.clone(),
             }),
             cancel,
@@ -88,8 +66,8 @@ impl Server {
                 _ = health_log.tick() => lock_state(&self.shared.state).router.log_health(),
                 accept = self.listener.accept() => {
                     match accept {
-                        Ok((stream, _)) => {
-                            self.clients.spawn(handle_client(stream, Arc::clone(&self.shared)));
+                        Ok((stream, peer)) => {
+                            self.clients.spawn(handle_client(stream, peer, Arc::clone(&self.shared)));
                         }
                         Err(e) => tracing::error!("accept error: {e}"),
                     }
@@ -159,8 +137,7 @@ async fn drop_with_timeout(value: impl Send + 'static, limit: Duration) -> Resul
     }
 }
 
-async fn handle_client(mut stream: UnixStream, shared: Arc<Shared>) {
-    let peer = stream.peer_addr().map(|a| format!("{a:?}")).unwrap_or_else(|_| "unknown".into());
+async fn handle_client(mut stream: Stream, peer: String, shared: Arc<Shared>) {
     loop {
         let frame = tokio::select! {
             biased;
@@ -291,28 +268,32 @@ async fn dispatch(request: Request, shared: &Shared) -> Response {
             name,
             channels,
             volume,
-        } => {
-            match shared.devices.create_device(&name, channels, volume).await {
-                Ok(info) => Response::DeviceCreated { device_uid: info.uid },
-                Err(message) => Response::Error { message },
-            }
-        }
+        } => match shared.driver.create_device(&name, channels, volume).await {
+            Ok(device_uid) => Response::DeviceCreated { device_uid },
+            Err(message) => Response::Error { message },
+        },
         Request::DestroyDevice { device_uid } => {
             let removed = {
                 let st = lock_state(state);
                 let in_use = st.router.routes_targeting(&device_uid);
-                shared.devices.remove_device(&device_uid, &in_use)
+                shared.driver.remove_device(&device_uid, &in_use)
             };
             match removed {
                 Ok(()) => {
-                    shared.devices.wait_until_removed(&device_uid).await;
+                    shared.driver.wait_until_removed(&device_uid).await;
                     Response::Ok
                 }
                 Err(message) => Response::Error { message },
             }
         }
-        Request::ListDevices => Response::Devices(shared.devices.list_devices()),
-        Request::GetActivity => Response::Activity(read_activity(&shared.activity)),
+        Request::ListDevices => match shared.driver.list_devices() {
+            Ok(devices) => Response::Devices(devices),
+            Err(message) => Response::Error { message },
+        },
+        Request::GetActivity => match shared.driver.activity() {
+            Ok(activity) => Response::Activity(activity),
+            Err(message) => Response::Error { message },
+        },
         Request::ListSystemDevices => Response::SystemDevices(
             spaghetti_engine::list_all_devices()
                 .into_iter()
@@ -352,57 +333,6 @@ async fn receiver_listing(
     }
 }
 
-/// Build an [`ActivityInfo`] response from the driver's shm snapshot.
-///
-/// Returns zeroed / inactive values when the shm region is unavailable.
-/// If the region was not available at daemon start, attempts a lazy open on
-/// each call — the driver may have loaded after the daemon started.
-fn read_activity(activity: &ActivityState) -> ActivityInfo {
-    let mut guard = match activity.reader.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-
-    // Lazy attach: try opening now if we don't have a reader yet.
-    if guard.is_none() {
-        match ActivityReader::open() {
-            Ok(r) => {
-                tracing::info!("activity shm attached (lazy)");
-                *guard = Some(r);
-            }
-            Err(_) => {
-                return ActivityInfo {
-                    active: false,
-                    frames_per_second: 0,
-                    peak_db: -96.0,
-                    io_running: false,
-                    total_frames: 0,
-                };
-            }
-        }
-    }
-
-    let reader = guard.as_ref().expect("reader was just set");
-    let snap = reader.snapshot();
-    let fps = activity.fps.update(snap.frames_written);
-    let stale = reader.is_stale(snap.last_write_host_time, ACTIVITY_FRESHNESS_NS);
-
-    let peak_db = if snap.peak > 0.0 {
-        let db = 20.0 * snap.peak.log10();
-        if db < -96.0 { -96.0 } else { db }
-    } else {
-        -96.0
-    };
-
-    ActivityInfo {
-        active: snap.io_running && !stale,
-        frames_per_second: fps,
-        peak_db,
-        io_running: snap.io_running,
-        total_frames: snap.frames_written,
-    }
-}
-
 /// Recover from a poisoned mutex rather than panicking the daemon.
 fn lock_state(state: &Mutex<DaemonState>) -> std::sync::MutexGuard<'_, DaemonState> {
     match state.lock() {
@@ -416,7 +346,7 @@ fn lock_state(state: &Mutex<DaemonState>) -> std::sync::MutexGuard<'_, DaemonSta
 
 /// Async version of length-prefixed message write.
 async fn write_message_async(
-    stream: &mut UnixStream,
+    stream: &mut Stream,
     msg: &impl serde::Serialize,
 ) -> std::io::Result<()> {
     let json = serde_json::to_vec(msg)
@@ -431,7 +361,7 @@ async fn write_message_async(
 ///
 /// Only I/O failures (EOF, socket errors) are returned as errors — JSON
 /// parsing is left to the caller so decode errors don't close the connection.
-async fn read_frame_async(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
+async fn read_frame_async(stream: &mut Stream) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;

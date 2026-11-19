@@ -5,6 +5,7 @@
 //! embedded at compile time and rendered with the daemon's path and the user's
 //! log path on install.
 
+use crate::DaemonAction;
 use crate::output::Output;
 use serde::Serialize;
 use std::fs;
@@ -12,7 +13,24 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 pub const AGENT_LABEL: &str = "com.spaghetti.daemon";
+pub const START: &str = "spaghetti daemon start";
+pub const STOP: &str = "stop it with: spaghetti daemon stop";
 const PLIST_TEMPLATE: &str = include_str!("daemon_agent.plist");
+
+pub fn run(action: DaemonAction, out: Output) -> Result<(), String> {
+    match action {
+        DaemonAction::Install => install(out),
+        DaemonAction::Uninstall => uninstall(out),
+        DaemonAction::Start => start(out),
+        DaemonAction::Stop => stop(out),
+        DaemonAction::Restart => restart(out),
+        DaemonAction::Status => status(out),
+        DaemonAction::Logs { .. } if out == Output::Json => {
+            Err("daemon logs has no JSON output".into())
+        }
+        DaemonAction::Logs { follow, lines } => logs(follow, lines),
+    }
+}
 
 fn home_dir() -> Result<PathBuf, String> {
     std::env::var("HOME")

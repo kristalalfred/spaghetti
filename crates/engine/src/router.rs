@@ -10,7 +10,7 @@ use spaghetti_common::ipc_protocol::{
 
 use crate::airplay_sender::AirPlayOutput;
 use crate::audio;
-use crate::bus::DeviceBus;
+use crate::bus::{self, DeviceBus};
 use crate::calibration::{Calibrating, Calibration, Feed, Job, Leg, Planned, Recording, Role};
 use crate::flow::{FlowMeter, Link};
 use crate::input::InputSource;
@@ -374,7 +374,7 @@ impl Router {
                     delay_ms: None,
                     latency_offset_ms: None,
                 },
-            ) => {
+            ) if bus::DIRECT => {
                 let bus = match self.buses.entry(uid.clone()) {
                     Entry::Occupied(bus) => bus.into_mut(),
                     Entry::Vacant(vacant) => vacant.insert(DeviceBus::open(uid)?),

@@ -5,7 +5,10 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::dns_sd;
+#[cfg(unix)]
+use crate::dns_sd::browse as browse_network;
+#[cfg(windows)]
+use crate::dns_service::browse as browse_network;
 use crate::receiver::{Service, Txt};
 use crate::turns::Turns;
 use crate::{Receiver, ReceiverId};
@@ -16,7 +19,8 @@ const WARM_UP: Duration = Duration::from_secs(1);
 const ABORT_CHECK: Duration = Duration::from_millis(20);
 
 /// Claude: a live view of the AirPlay receivers on the local network, kept by
-/// browsing `_raop._tcp` and `_airplay._tcp` through the system's mDNSResponder.
+/// browsing `_raop._tcp` and `_airplay._tcp` through the system's DNS-SD:
+/// mDNSResponder on Apple platforms, the DNS client service on Windows.
 /// A receiver advertising both services is one receiver. Streams started
 /// through one browser take turns at each receiver.
 pub struct Browser {
@@ -31,7 +35,7 @@ impl Browser {
         let stop = Arc::new(AtomicBool::new(false));
         let spawned = thread::Builder::new().name("airplay-browse".into()).spawn({
             let (shared, stop) = (shared.clone(), stop.clone());
-            move || dns_sd::browse(&shared, &stop)
+            move || browse_network(&shared, &stop)
         });
         if let Err(e) = spawned {
             shared.fail(format!("could not start browsing ({e})"));

@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use airplay::{
     Browser, FRAMES_PER_PACKET, Protocol, ReceiverId, Render, SAMPLE_RATE, Status, Stream,
 };
-use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "usage: play
@@ -196,8 +195,17 @@ fn read_wav(path: &str) -> Result<Vec<[f32; 2]>, String> {
     Err(invalid("no audio data"))
 }
 
+#[cfg(unix)]
+fn log_first_play_time(at: Instant) {
+    tracing::info!(mach_ns = mach_time(at), "first frame's play time");
+}
+
+#[cfg(windows)]
+fn log_first_play_time(_: Instant) {}
+
 /// Claude: an `Instant` as nanoseconds of `mach_absolute_time`, the clock
 /// receivers on this Mac such as shairport-sync log in.
+#[cfg(unix)]
 fn mach_time(at: Instant) -> u64 {
     let now = Instant::now();
     let mut time = libc::timespec {
@@ -221,10 +229,7 @@ fn play(browser: &Browser, id: ReceiverId, options: Options) -> Result<(), Strin
         let rendered_all = rendered_all.clone();
         move |render: Render<'_>| {
             let first = *first_play_at.get_or_insert_with(|| {
-                info!(
-                    mach_ns = mach_time(render.play_at),
-                    "first frame's play time"
-                );
+                log_first_play_time(render.play_at);
                 render.play_at
             });
             let since_first = render.play_at - first;

@@ -17,3 +17,6 @@ spaghetti-common = { path = "../common" }
 spaghetti-engine = { path = "../engine" }
 tokio = { version = "1", features = ["rt", "signal", "time", "macros"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+tokio = { version = "1", features = ["io-util", "net", "rt"] }

@@ -51,6 +51,7 @@ unsafe extern "C" {
     ) -> i32;
 }
 
+pub const DIRECT: bool = true;
 pub const MAX_BUS_ROUTES: usize = 64;
 const INITIAL_SLOTS: usize = 4;
 const IDLE_CHECK: Duration = Duration::from_secs(1);

@@ -1,7 +1,9 @@
 mod calibrate;
 mod client;
+#[cfg_attr(not(target_os = "macos"), path = "daemon_unmanaged.rs")]
 mod daemon_mgmt;
 mod output;
+mod transport;
 
 use clap::{Parser, Subcommand};
 use client::UNEXPECTED;
@@ -17,7 +19,6 @@ use spaghetti_common::ipc_protocol::{
 };
 use std::error::Error;
 use std::io::{ErrorKind, IsTerminal, Write};
-use std::os::unix::net::UnixStream;
 
 #[derive(Parser)]
 #[command(name = "spaghetti", about = "Route audio any way you like")]
@@ -288,7 +289,7 @@ fn route_destination(
     }
 }
 
-fn run_monitor(stream: UnixStream, out: Output) -> Result<(), Box<dyn Error>> {
+fn run_monitor(stream: client::Stream, out: Output) -> Result<(), Box<dyn Error>> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -299,8 +300,8 @@ fn run_monitor(stream: UnixStream, out: Output) -> Result<(), Box<dyn Error>> {
     result
 }
 
-async fn monitor_loop(mut stream: UnixStream, out: Output) -> Result<(), Box<dyn Error>> {
-    // Blocking Unix socket, polled from a periodic task. Using the std socket
+async fn monitor_loop(mut stream: client::Stream, out: Output) -> Result<(), Box<dyn Error>> {
+    // Blocking socket or pipe, polled from a periodic task. Using the std socket
     // keeps the CLI deps minimal; each request/response is small so blocking
     // the single-threaded runtime for the round-trip is acceptable here.
     let tty = std::io::stdout().is_terminal();
@@ -547,7 +548,7 @@ fn run_command(cmd: Command, out: Output) -> Result<(), Box<dyn Error>> {
 }
 
 fn create_source(
-    stream: &mut UnixStream,
+    stream: &mut client::Stream,
     out: Output,
     source: SourceSpec,
 ) -> Result<(), Box<dyn Error>> {
@@ -579,21 +580,6 @@ fn list_system_devices(out: Output) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn run_daemon(action: DaemonAction, out: Output) -> Result<(), String> {
-    match action {
-        DaemonAction::Install => daemon_mgmt::install(out),
-        DaemonAction::Uninstall => daemon_mgmt::uninstall(out),
-        DaemonAction::Start => daemon_mgmt::start(out),
-        DaemonAction::Stop => daemon_mgmt::stop(out),
-        DaemonAction::Restart => daemon_mgmt::restart(out),
-        DaemonAction::Status => daemon_mgmt::status(out),
-        DaemonAction::Logs { .. } if out == Output::Json => {
-            Err("daemon logs has no JSON output".into())
-        }
-        DaemonAction::Logs { follow, lines } => daemon_mgmt::logs(follow, lines),
-    }
-}
-
 fn main() {
     let cli = Cli::parse();
     let out = if cli.json { Output::Json } else { Output::Text };
@@ -607,7 +593,7 @@ fn main() {
         // Daemon-management commands don't talk to the daemon socket; they
         // shell out to launchctl / tail. Handle them before `run_command` so
         // they work even when the daemon is not running.
-        Some(Command::Daemon { action }) => run_daemon(action, out).map_err(Into::into),
+        Some(Command::Daemon { action }) => daemon_mgmt::run(action, out).map_err(Into::into),
         Some(Command::SystemDevices) => list_system_devices(out),
         Some(Command::Calibrate(args)) => calibrate::run(args, out),
         Some(cmd) => run_command(cmd, out),

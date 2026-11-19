@@ -97,48 +97,6 @@ pub mod input {
     }
 }
 
-pub mod bus {
-    use std::convert::Infallible;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU32;
-
-    use spaghetti_common::ipc_protocol::TapMode;
-
-    use crate::flow::FlowMeter;
-    use crate::mixer::Cycles;
-
-    pub struct DeviceBus(Infallible);
-
-    impl DeviceBus {
-        pub fn open(_device_uid: &str) -> Result<Self, String> {
-            Err("device buses need macOS".into())
-        }
-
-        pub fn attach(
-            &mut self,
-            _pids: &[u32],
-            _mode: TapMode,
-            _volume: Arc<AtomicU32>,
-            _meter: Arc<FlowMeter>,
-            _cycles: Arc<Cycles>,
-        ) -> Result<usize, String> {
-            match self.0 {}
-        }
-
-        pub fn retarget(&self, _slot: usize, _pids: &[u32], _mode: TapMode) -> Result<(), String> {
-            match self.0 {}
-        }
-
-        pub fn detach(&mut self, _slot: usize) {
-            match self.0 {}
-        }
-
-        pub fn is_empty(&self) -> bool {
-            match self.0 {}
-        }
-    }
-}
-
 pub mod device_output {
     use std::convert::Infallible;
     use std::sync::Arc;
@@ -156,12 +114,12 @@ pub mod device_output {
     pub struct DeviceOutput(Infallible);
 
     pub fn check_schedule(
-        device: DeviceId,
+        device: &DeviceId,
         _source: &SourceTiming,
         _delay: f64,
         _latency_offset_ms: Option<i32>,
     ) -> Result<(), String> {
-        match device {}
+        match *device {}
     }
 
     impl DeviceOutput {

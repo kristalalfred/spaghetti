@@ -686,12 +686,7 @@ fn drain(socket: &UdpSocket) -> Vec<(Message, SocketAddr, Instant)> {
     let mut messages = Vec::new();
     let mut bytes = [0; 2048];
     loop {
-        let mut descriptor = libc::pollfd {
-            fd: socket.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        if unsafe { libc::poll(&mut descriptor, 1, 20) } != 1 {
+        if !sys::poll([Interest::readable(socket)], Duration::from_millis(20))[0] {
             break;
         }
         let (length, source) = socket.recv_from(&mut bytes).unwrap();
@@ -789,12 +784,7 @@ fn software_timestamp_loopback_latency_distribution() {
     let worker = thread::spawn(move || {
         for _ in 0..COUNT {
             let mut bytes = [0; 2048];
-            let mut descriptor = libc::pollfd {
-                fd: receiver.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 1000) }, 1);
+            assert!(sys::poll([Interest::readable(&receiver)], Duration::from_secs(1))[0]);
             receiver.recv_from(&mut bytes).unwrap();
             let at = Instant::now();
             measure.send(at).unwrap();
@@ -860,25 +850,7 @@ fn duplicate_subscribers_and_ipv6_scope_validation() {
 
 #[test]
 fn a_second_local_address_is_the_source_of_event_and_general_datagrams() {
-    let mut addresses = std::ptr::null_mut();
-    assert_eq!(unsafe { libc::getifaddrs(&mut addresses) }, 0);
-    let mut cursor = addresses;
-    let mut local = None;
-    while !cursor.is_null() {
-        let interface = unsafe { &*cursor };
-        if !interface.ifa_addr.is_null()
-            && unsafe { (*interface.ifa_addr).sa_family } == libc::AF_INET as _
-        {
-            let address = unsafe { &*interface.ifa_addr.cast::<libc::sockaddr_in>() };
-            let ip = Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes());
-            if ip.is_loopback() && ip != Ipv4Addr::LOCALHOST {
-                local = Some(SocketAddr::from((ip, 0)));
-            }
-        }
-        cursor = interface.ifa_next;
-    }
-    unsafe { libc::freeifaddrs(addresses) };
-    let Some(local) = local else {
+    let Some(local) = sys::second_loopback().map(|ip| SocketAddr::from((ip, 0))) else {
         eprintln!("second-address PTP test skipped: no second IPv4 loopback address");
         return;
     };

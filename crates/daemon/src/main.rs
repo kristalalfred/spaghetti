@@ -1,10 +1,10 @@
-use std::fs;
+use std::future::Future;
 
-use spaghetti_engine::{ActivityReader, DeviceManager};
 use tokio::signal;
-use tokio::signal::unix::SignalKind;
 use tracing_subscriber::EnvFilter;
 
+mod driver;
+mod ipc;
 mod server;
 
 fn init_logging() {
@@ -28,60 +28,55 @@ fn main() -> anyhow::Result<()> {
 async fn run() -> anyhow::Result<()> {
     tracing::info!("spaghettid starting...");
 
-    // Bootstrap the device config file before anything else. On a fresh
-    // install this writes the default entry so the HAL plugin can publish
-    // `SpaghettiDevice_UID` when it loads.
-    let device_manager = DeviceManager::new();
+    let driver = driver::Driver::open();
+    driver.look_for_device();
 
-    // Activity shm is a soft dependency — daemon keeps running if the driver's
-    // shm region is unavailable (reads will just return defaults).
-    let activity_reader = match ActivityReader::open() {
-        Ok(r) => {
-            tracing::info!("activity shm opened: {}", spaghetti_common::ACTIVITY_SHM_NAME);
-            Some(r)
-        }
-        Err(e) => {
-            tracing::warn!("activity shm unavailable: {e}");
-            None
-        }
-    };
-
-    let mut server = server::Server::bind(activity_reader, device_manager).await?;
+    let mut server = server::Server::bind(driver)?;
     tracing::info!(
         "Listening on {}",
         spaghetti_common::ipc_protocol::SOCKET_PATH
     );
 
-    // Probe for the virtual device in the background so we log whether the
-    // driver is installed without blocking the socket bind.
-    tokio::task::spawn_blocking(|| match spaghetti_engine::find_device_by_uid("SpaghettiDevice_UID") {
-        Some(id) => tracing::info!("Found Spaghetti device: object_id={id}"),
-        None => tracing::warn!(
-            "Spaghetti virtual device not found — is the driver installed and coreaudiod loaded it?"
-        ),
-    });
-
-    let mut sigterm = signal::unix::signal(SignalKind::terminate())?;
+    let terminated = termination()?;
 
     let cancel = server.cancel.clone();
 
-    // Run server until a shutdown request, Ctrl-C, or SIGTERM (launchd stop).
+    // Run server until a shutdown request, Ctrl-C, or termination (launchd stop).
     tokio::select! {
         _ = server.run() => {},
         _ = signal::ctrl_c() => {
             tracing::info!("Shutting down (SIGINT)...");
         }
-        _ = sigterm.recv() => {
-            tracing::info!("Shutting down (SIGTERM)...");
+        signal = terminated => {
+            tracing::info!("Shutting down ({signal})...");
         }
         () = cancel.cancelled() => {
             tracing::info!("Shutting down...");
         }
     }
 
-    let shutdown = server.shutdown().await;
-    let _ = fs::remove_file(spaghetti_common::ipc_protocol::SOCKET_PATH);
-    shutdown.map_err(anyhow::Error::msg)?;
+    server.shutdown().await.map_err(anyhow::Error::msg)?;
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn termination() -> std::io::Result<impl Future<Output = &'static str>> {
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+    Ok(async move {
+        sigterm.recv().await;
+        "SIGTERM"
+    })
+}
+
+#[cfg(windows)]
+fn termination() -> std::io::Result<impl Future<Output = &'static str>> {
+    let mut close = signal::windows::ctrl_close()?;
+    let mut shutdown = signal::windows::ctrl_shutdown()?;
+    Ok(async move {
+        tokio::select! {
+            _ = close.recv() => "console closed",
+            _ = shutdown.recv() => "system shutdown",
+        }
+    })
 }

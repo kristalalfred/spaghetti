@@ -162,6 +162,16 @@ impl Encoder {
         self.codec.frames_per_packet() as usize
     }
 
+    /// Claude: the frames an AAC encoder primes with, which its output trails
+    /// its input by: 2112, after Apple's TN2258. Opus streams count their
+    /// look-ahead in `OPUS_DELAY_FRAMES` instead.
+    pub fn priming_frames(&self) -> usize {
+        match self.codec {
+            Codec::Aac => 2112,
+            Codec::Opus => 0,
+        }
+    }
+
     /// Claude: feeds interleaved stereo frames at the source rate and hands each
     /// packet they complete to `each`, in order.
     pub fn encode(&mut self, pcm: &[f32], mut each: impl FnMut(&[u8])) -> Result<(), String> {

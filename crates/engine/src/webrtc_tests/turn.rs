@@ -29,7 +29,9 @@ impl Default for Settings {
 
 #[derive(Default)]
 struct Seen {
-    challenged: u32,
+    /// Claude: by client: every socket of an engine with several interfaces
+    /// that reaches the relay asks on its own.
+    challenged: HashMap<SocketAddr, u32>,
     stale: u32,
     refused: u32,
     allocated: Vec<(SocketAddr, Instant)>,
@@ -62,7 +64,7 @@ impl Drop for FakeTurn {
 
 impl FakeTurn {
     async fn start(settings: Settings) -> Self {
-        let control = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let control = Arc::new(UdpSocket::bind((super::server_ip(), 0)).await.unwrap());
         let relay = if settings.separate_relay {
             let lan = crate::webrtc::default_route_ipv4().unwrap();
             Arc::new(UdpSocket::bind((lan, 0)).await.unwrap())
@@ -189,10 +191,10 @@ impl Relay {
         format!("nonce-{}", self.nonce)
     }
 
-    fn refuse(&self, request: &Message, code: u16) -> Vec<u8> {
+    fn refuse(&self, client: SocketAddr, request: &Message, code: u16) -> Vec<u8> {
         let mut seen = self.seen.lock().unwrap();
         match code {
-            401 => seen.challenged += 1,
+            401 => *seen.challenged.entry(client).or_default() += 1,
             438 => seen.stale += 1,
             _ => seen.refused += 1,
         }
@@ -208,14 +210,14 @@ impl Relay {
             || request.attribute(Attr::Username) != Some(USERNAME.as_bytes())
             || request.attribute(Attr::Realm) != Some(REALM.as_bytes())
         {
-            return self.refuse(request, 401);
+            return self.refuse(client, request, 401);
         }
         if request.attribute(Attr::Nonce) != Some(self.nonce().as_bytes()) {
-            return self.refuse(request, 438);
+            return self.refuse(client, request, 438);
         }
         let key = stun::long_term_key(USERNAME, REALM, PASSWORD);
         if request.integrity(&key) != Some(true) {
-            return self.refuse(request, 401);
+            return self.refuse(client, request, 401);
         }
         let success = MessageBuilder::new(request.method, Class::Success, request.transaction);
         let lifetime = self.settings.lifetime;
@@ -223,10 +225,10 @@ impl Relay {
         let reply = match request.method {
             Method::Allocate => {
                 if request.attribute(Attr::RequestedTransport) != Some(&[17, 0, 0, 0][..]) {
-                    return self.refuse(request, 400);
+                    return self.refuse(client, request, 400);
                 }
                 if self.allocations.contains_key(&client) {
-                    return self.refuse(request, 437);
+                    return self.refuse(client, request, 437);
                 }
                 let (SocketAddr::V4(relayed), SocketAddr::V4(mapped)) =
                     (self.relay_address, client)
@@ -248,7 +250,7 @@ impl Relay {
             }
             Method::Refresh => {
                 let Some(allocation) = self.allocations.get_mut(&client) else {
-                    return self.refuse(request, 437);
+                    return self.refuse(client, request, 437);
                 };
                 if request.lifetime() == Some(Duration::ZERO) {
                     self.allocations.remove(&client);
@@ -262,10 +264,10 @@ impl Relay {
             }
             _ => {
                 let Some(peer) = request.address(Attr::XorPeerAddress) else {
-                    return self.refuse(request, 400);
+                    return self.refuse(client, request, 400);
                 };
                 let Some(allocation) = self.allocations.get_mut(&client) else {
-                    return self.refuse(request, 437);
+                    return self.refuse(client, request, 437);
                 };
                 let ip = IpAddr::V4(*peer.ip());
                 allocation.permissions.insert(ip, now + PERMISSION_LIFETIME);
@@ -570,10 +572,13 @@ async fn a_refused_turn_credential_offers_no_relayed_candidate_and_connects_dire
     {
         let seen = turn.seen();
         assert!(seen.allocated.is_empty());
-        assert_eq!(
-            seen.challenged, 2,
-            "the challenge and the refused credential, and no retry after"
-        );
+        assert!(!seen.challenged.is_empty());
+        for (client, challenged) in &seen.challenged {
+            assert_eq!(
+                *challenged, 2,
+                "{client}: the challenge and the refused credential, and no retry after"
+            );
+        }
     }
 
     engine.exchange(route, source, direct).await;

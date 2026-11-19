@@ -20,6 +20,8 @@
 //! Each bundle loads into `coreaudiod` as its own image, so drivers built on
 //! this crate run side by side without sharing state.
 
+#![cfg(target_os = "macos")]
+
 mod devices;
 pub(crate) mod driver;
 mod iface;

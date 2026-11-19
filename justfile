@@ -13,6 +13,9 @@ check-ios:
     IPHONEOS_DEPLOYMENT_TARGET=17.0 cargo clippy -p spaghetti-engine --all-targets --target aarch64-apple-ios -- -D warnings
     IPHONEOS_DEPLOYMENT_TARGET=17.0 cargo clippy -p spaghetti-engine --all-targets --target aarch64-apple-ios-sim -- -D warnings
 
+check-windows host:
+    ./scripts/check-windows.sh {{host}}
+
 airplay-interop:
     ./scripts/airplay-interop.sh
 

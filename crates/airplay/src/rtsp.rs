@@ -1,13 +1,13 @@
 use std::fmt::{self, Write as _};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 use socket2::{Domain, Socket, Type};
 use tracing::debug;
 
 use crate::hap;
+use crate::sys::{self, Interest};
 
 const MAX_HEAD: usize = 64 * 1024;
 const MAX_BODY: usize = 1024 * 1024;
@@ -264,8 +264,8 @@ impl Connection {
         self.common.push((name, value));
     }
 
-    pub(crate) fn fd(&self) -> RawFd {
-        self.stream.as_raw_fd()
+    pub(crate) fn readable(&self) -> Interest {
+        Interest::readable(&self.stream)
     }
 
     /// Claude: from now on, every request is sealed and every response opened
@@ -430,12 +430,12 @@ pub(crate) fn connect(
     socket.set_nonblocking(true)?;
     match socket.connect(&address.into()) {
         Ok(()) => {}
-        Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => loop {
+        Err(e) if sys::connect_in_progress(&e) => loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Err(io::Error::new(ErrorKind::TimedOut, "connection timed out"));
             }
-            if writable(socket.as_raw_fd(), left.min(ABORT_CHECK)) {
+            if sys::poll([Interest::writable(&socket)], left.min(ABORT_CHECK))[0] {
                 if let Some(e) = socket.take_error()? {
                     return Err(e);
                 }
@@ -449,17 +449,6 @@ pub(crate) fn connect(
     }
     socket.set_nonblocking(false)?;
     Ok(socket.into())
-}
-
-fn writable(fd: RawFd, timeout: Duration) -> bool {
-    let mut pollfd = libc::pollfd {
-        fd,
-        events: libc::POLLOUT,
-        revents: 0,
-    };
-    let ms = timeout.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32;
-    let ready = unsafe { libc::poll(&mut pollfd, 1, ms) };
-    ready > 0 && pollfd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) != 0
 }
 
 pub(crate) enum OpenError {
@@ -487,7 +476,7 @@ fn is_transient(error: &io::Error) -> bool {
             | ErrorKind::NetworkUnreachable
             | ErrorKind::NetworkDown
             | ErrorKind::TimedOut
-    ) || error.raw_os_error() == Some(libc::EHOSTDOWN)
+    ) || error.raw_os_error() == Some(sys::error::HOST_DOWN)
 }
 
 pub(crate) enum ReadError {
@@ -581,7 +570,8 @@ mod tests {
 
     /// Claude: whether writing to `socket` once its peer has gone fails
     /// rather than raising SIGPIPE.
-    fn raises_no_sigpipe(socket: &impl AsRawFd) -> bool {
+    #[cfg(target_vendor = "apple")]
+    fn raises_no_sigpipe(socket: &impl std::os::fd::AsRawFd) -> bool {
         let mut set: libc::c_int = 0;
         let mut len = size_of_val(&set) as libc::socklen_t;
         let got = unsafe {
@@ -602,6 +592,7 @@ mod tests {
     /// by `connect`, never end a host program that leaves SIGPIPE at its
     /// default, as an app embedding the crate may. A socket made raw has no
     /// such guard.
+    #[cfg(target_vendor = "apple")]
     #[test]
     fn connections_to_receivers_fail_writes_after_a_close_without_a_signal() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -710,19 +701,24 @@ mod tests {
 
     #[test]
     fn connections_failing_as_a_waking_receiver_does_are_transient() {
+        use crate::sys::error::*;
         let os = io::Error::from_raw_os_error;
         for error in [
-            os(libc::ECONNREFUSED),
-            os(libc::EHOSTUNREACH),
-            os(libc::EHOSTDOWN),
-            os(libc::ENETUNREACH),
-            os(libc::ENETDOWN),
-            os(libc::ETIMEDOUT),
+            os(CONNECTION_REFUSED),
+            os(HOST_UNREACHABLE),
+            os(HOST_DOWN),
+            os(NETWORK_UNREACHABLE),
+            os(NETWORK_DOWN),
+            os(TIMED_OUT),
             io::Error::new(ErrorKind::TimedOut, "connection timed out"),
         ] {
             assert!(is_transient(&error), "{error}");
         }
-        for error in [os(libc::EADDRNOTAVAIL), os(libc::EACCES), os(libc::EINVAL)] {
+        for error in [
+            os(ADDRESS_NOT_AVAILABLE),
+            os(ACCESS_DENIED),
+            os(INVALID_ARGUMENT),
+        ] {
             assert!(!is_transient(&error), "{error}");
         }
     }
@@ -797,7 +793,9 @@ mod tests {
     }
 
     /// Claude: a request far larger than the kernel buffers on both ends, to
-    /// a peer that never reads it.
+    /// a peer that never reads it. Windows takes the whole request on
+    /// loopback without the peer reading, so the write never stalls there.
+    #[cfg(unix)]
     #[test]
     fn a_stalled_write_gives_up_when_stopped_or_late_and_breaks_the_connection() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

@@ -19,9 +19,6 @@ use crate::ts::{PACKET_LEN, TsMuxer};
 const PACKETS_PER_MESSAGE: usize = 7;
 const QUEUED_MESSAGES: usize = 64;
 const POLL: Duration = Duration::from_millis(5);
-/// Claude: the frames AudioToolbox's AAC encoder primes with, after Apple's
-/// TN2258, which its output trails its input by.
-const AAC_DELAY_FRAMES: usize = 2112;
 
 /// Claude: a route's output as AAC in MPEG-TS over SRT. The encoder thread
 /// drains the route's ring at the source's own pace.
@@ -110,7 +107,7 @@ fn encode(
         source_rate,
         f64::from(encoder.format().sample_rate),
         frames_per_packet,
-        AAC_DELAY_FRAMES,
+        encoder.priming_frames(),
     );
     let mut stream = Stream::new(encoder);
     let mut pcm = vec![0.0; frames_per_packet * CHANNELS];

@@ -48,13 +48,13 @@ fn schedule(
 /// Claude: refused as opening a route from `source` to the device would be
 /// for its delay, without opening anything.
 pub fn check_schedule(
-    device: AudioObjectID,
+    device: &AudioObjectID,
     source: &SourceTiming,
     delay: f64,
     latency_offset_ms: Option<i32>,
 ) -> Result<(), String> {
-    let rate = audio::nominal_rate(device).ok_or("could not read the device's rate")?;
-    let schedule = schedule(device, rate, delay, latency_offset_ms);
+    let rate = audio::nominal_rate(*device).ok_or("could not read the device's rate")?;
+    let schedule = schedule(*device, rate, delay, latency_offset_ms);
     Playout::new(source, rate, host_time::ticks_per_second(), Some(schedule)).map(|_| ())
 }
 

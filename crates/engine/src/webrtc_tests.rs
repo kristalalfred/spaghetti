@@ -551,6 +551,17 @@ fn is_host_candidate(sdp: &str, peer: &Option<String>) -> bool {
         .any(|candidate| Some(candidate.to_string()) == *peer)
 }
 
+/// Claude: where a fake server listens. The engine binds its sockets to
+/// interface addresses; on Windows a socket bound to one cannot reach
+/// 127.0.0.1, so there it listens on the default route's address instead.
+pub(crate) fn server_ip() -> std::net::Ipv4Addr {
+    if cfg!(windows) {
+        crate::webrtc::default_route_ipv4().unwrap()
+    } else {
+        std::net::Ipv4Addr::LOCALHOST
+    }
+}
+
 /// Claude: a STUN server that answers each request at once with `mapped`, and
 /// answers it once more when `late` is notified.
 async fn fake_stun(
@@ -560,7 +571,7 @@ async fn fake_stun(
     Arc<tokio::sync::Notify>,
     tokio::task::JoinHandle<()>,
 ) {
-    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let socket = UdpSocket::bind((server_ip(), 0)).await.unwrap();
     let address = socket.local_addr().unwrap();
     let late = Arc::new(tokio::sync::Notify::new());
     let task = tokio::spawn({
@@ -837,7 +848,7 @@ async fn garbage_on_the_media_sockets_does_not_end_the_link() {
 async fn an_unanswered_offer_describes_itself_after_the_stun_deadline_and_stays_connecting() {
     let engine = Engine::new();
     let (fixture, _input) = engine.fixture(48000.0);
-    let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let silent = UdpSocket::bind((server_ip(), 0)).await.unwrap();
     let created = Instant::now();
     let offering = WebRtcPeer {
         stun: vec![silent.local_addr().unwrap().to_string()],

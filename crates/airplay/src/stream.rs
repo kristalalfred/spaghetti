@@ -4,7 +4,6 @@ mod volume;
 
 use std::any::Any;
 use std::net::SocketAddr;
-use std::os::fd::RawFd;
 use std::panic::{self, AssertUnwindSafe};
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
@@ -23,6 +22,7 @@ use crate::ptp::{Endpoint, Ptp};
 use crate::raop;
 use crate::rtsp::{Connection, OpenError, ReadError, Request};
 use crate::session::{AudioLatency, Session};
+use crate::sys::{self, Interest};
 use crate::turns::Turn;
 use crate::{
     Browser, Counters, FRAMES_PER_PACKET, LATENCY, Protocol, Receiver, ReceiverId, Render, Status,
@@ -786,7 +786,7 @@ impl Delivery {
     }
 
     /// Claude: the socket whose readiness `on_ready` answers.
-    fn interest(&self) -> libc::pollfd {
+    fn interest(&self) -> Interest {
         match self {
             Delivery::Realtime(realtime) => realtime.interest(),
             Delivery::Buffered(buffered) => buffered.interest(),
@@ -976,11 +976,8 @@ impl<R: FnMut(Render<'_>)> Streamer<'_, R> {
             .map_or(deadline, |wake| deadline.min(wake))
             .saturating_duration_since(Instant::now())
             .min(POLL_SLICE);
-        let [delivery, rtsp] = poll(
-            [
-                self.delivery.interest(),
-                readable(self.session.connection.fd()),
-            ],
+        let [delivery, rtsp] = sys::poll(
+            [self.delivery.interest(), self.session.connection.readable()],
             timeout,
         );
         if self.shared.command() == Command::Stop {
@@ -1086,25 +1083,6 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
         .copied()
         .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
         .unwrap_or("no message")
-}
-
-fn readable(fd: RawFd) -> libc::pollfd {
-    libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    }
-}
-
-/// Claude: which of `fds` are ready for what they wait on, or have failed or
-/// hung up.
-fn poll<const N: usize>(mut fds: [libc::pollfd; N], timeout: Duration) -> [bool; N] {
-    let ms = timeout.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32;
-    let ready = unsafe { libc::poll(fds.as_mut_ptr(), N as libc::nfds_t, ms) };
-    if ready <= 0 {
-        return [false; N];
-    }
-    fds.map(|p| p.revents & (p.events | libc::POLLHUP | libc::POLLERR) != 0)
 }
 
 #[cfg(test)]

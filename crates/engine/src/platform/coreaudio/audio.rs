@@ -2,8 +2,8 @@ use core_foundation::base::TCFType;
 use core_foundation::string::CFString;
 use core_foundation_sys::string::CFStringRef;
 use coreaudio_sys::*;
-use spaghetti_common::ipc_protocol::SystemDeviceInfo;
 
+use crate::platform::SystemDevice;
 use crate::{abl, tap};
 use std::mem;
 use std::ptr;
@@ -93,28 +93,6 @@ fn get_all_devices() -> Option<Vec<AudioObjectID>> {
     }
 
     Some(devices)
-}
-
-/// Claude: a Core Audio device as the system lists it, with the channels
-/// its input and output streams carry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SystemDevice {
-    pub uid: String,
-    pub name: String,
-    pub input_channels: u32,
-    pub output_channels: u32,
-}
-
-/// Claude: the wire form lists a device's output channels only.
-impl From<SystemDevice> for SystemDeviceInfo {
-    fn from(device: SystemDevice) -> Self {
-        Self {
-            uid: device.uid,
-            name: device.name,
-            channels: device.output_channels,
-            is_output: device.output_channels > 0,
-        }
-    }
 }
 
 /// Claude: every device the system lists but the private aggregates that
@@ -374,29 +352,4 @@ fn get_device_uid(device_id: AudioObjectID) -> Option<String> {
     // Safety: CoreAudio returns a +1 retained CFString; wrap so it gets released.
     let cf_string: CFString = unsafe { CFString::wrap_under_create_rule(cf_string_ref) };
     Some(cf_string.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_wire_listing_keeps_its_shape_and_lists_output_channels() {
-        for (input_channels, output_channels, is_output) in
-            [(2, 0, false), (1, 2, true), (0, 8, true)]
-        {
-            let wire = SystemDeviceInfo::from(SystemDevice {
-                uid: "d".into(),
-                name: "D".into(),
-                input_channels,
-                output_channels,
-            });
-            assert_eq!(
-                serde_json::to_string(&wire).unwrap(),
-                format!(
-                    r#"{{"uid":"d","name":"D","channels":{output_channels},"is_output":{is_output}}}"#
-                )
-            );
-        }
-    }
 }

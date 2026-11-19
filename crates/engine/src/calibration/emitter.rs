@@ -75,7 +75,12 @@ impl Emitter {
     /// emitter pushed that frame already.
     pub fn schedule(&mut self, at: u64) -> Option<u64> {
         let after = at.saturating_sub(self.origin) as f64 / self.ticks_per_frame;
-        let first = after.ceil() as u64;
+        let mut first = after.ceil() as u64;
+        // Claude: dates round to whole ticks, so the frame before may already
+        // be due at `at` where a frame is not a whole number of ticks.
+        if first > 0 && self.date(first - 1) >= at {
+            first -= 1;
+        }
         if first < self.next {
             return None;
         }

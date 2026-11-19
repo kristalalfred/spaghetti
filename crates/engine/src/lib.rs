@@ -56,6 +56,7 @@ pub use calibration::{
     ProbeFailure, Recording, RecordingFailure, Residual, Role,
 };
 pub use host_time::HostTime;
+pub use platform::SystemDevice;
 pub use program_io::{
     BufferError, Frames, MAX_CALLBACK_FRAMES, MAX_PROGRAM_RATE, MAX_PROGRAM_ROUTES,
     MIN_PROGRAM_RATE, ProgramInput, ProgramOutput,
@@ -65,9 +66,9 @@ pub use spec::{Destination, InProcess, Playback, RouteInfo, SourceInfo, SourceSp
 
 #[cfg(target_os = "macos")]
 pub use activity::{ActivityReader, FpsTracker};
-#[cfg(target_os = "macos")]
-pub use audio::{SystemDevice, default_input_device, find_device_by_uid, list_all_devices};
+#[cfg(any(target_os = "macos", windows))]
+pub use audio::{default_input_device, find_device_by_uid, list_all_devices};
 #[cfg(target_os = "macos")]
 pub use device_manager::DeviceManager;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub use tap::list_audio_apps;

@@ -389,6 +389,8 @@ fn bind(address: Ipv4Addr) -> Result<(UdpSocket, SocketAddr), String> {
     let socket = std::net::UdpSocket::bind((address, 0))
         .and_then(|socket| socket.set_nonblocking(true).map(|()| socket))
         .map_err(|e| format!("bind a WebRTC socket on {address}: {e}"))?;
+    #[cfg(windows)]
+    ignore_unreachable(&socket).map_err(|e| format!("configure a WebRTC socket: {e}"))?;
     let local = socket
         .local_addr()
         .map_err(|e| format!("WebRTC socket address: {e}"))?;
@@ -397,10 +399,42 @@ fn bind(address: Ipv4Addr) -> Result<(UdpSocket, SocketAddr), String> {
     Ok((socket, local))
 }
 
+/// Claude: keeps ICMP errors for datagrams sent from `socket` out of its
+/// receives, as on Unix. Windows otherwise fails the socket's next receive
+/// with `WSAECONNRESET` after a datagram to a closed port, such as a STUN
+/// request to a server that is down.
+#[cfg(windows)]
+fn ignore_unreachable(socket: &std::net::UdpSocket) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+
+    use windows::Win32::Networking::WinSock::{SIO_UDP_CONNRESET, SOCKET, SOCKET_ERROR, WSAIoctl};
+
+    let off: u32 = 0;
+    let mut returned = 0;
+    let result = unsafe {
+        WSAIoctl(
+            SOCKET(socket.as_raw_socket() as usize),
+            SIO_UDP_CONNRESET,
+            Some((&raw const off).cast()),
+            size_of_val(&off) as u32,
+            None,
+            0,
+            &mut returned,
+            None,
+            None,
+        )
+    };
+    if result == SOCKET_ERROR {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Claude: the IPv4 address of every interface that is up, except loopback
 /// and link-local ones. A link offers a host candidate on each, so a peer
 /// reaches it on a network other than the default route's, such as the LAN
 /// while a VPN holds the default route.
+#[cfg(unix)]
 pub fn interface_ipv4s() -> Vec<Ipv4Addr> {
     let mut addresses = Vec::new();
     let mut interfaces = std::ptr::null_mut();
@@ -430,6 +464,62 @@ pub fn interface_ipv4s() -> Vec<Ipv4Addr> {
         }
     }
     unsafe { libc::freeifaddrs(interfaces) };
+    addresses
+}
+
+#[cfg(windows)]
+pub fn interface_ipv4s() -> Vec<Ipv4Addr> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+        GetAdaptersAddresses, IF_TYPE_SOFTWARE_LOOPBACK, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    use windows::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
+
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut size = 16 * 1024u32;
+    let mut buffer: Vec<u64> = Vec::new();
+    for _ in 0..3 {
+        buffer.resize((size as usize).div_ceil(8), 0);
+        let status = unsafe {
+            GetAdaptersAddresses(
+                u32::from(AF_INET.0),
+                flags,
+                None,
+                Some(buffer.as_mut_ptr().cast()),
+                &mut size,
+            )
+        };
+        const ERROR_BUFFER_OVERFLOW: u32 = 111;
+        match status {
+            0 => break,
+            ERROR_BUFFER_OVERFLOW => continue,
+            _ => return Vec::new(),
+        }
+    }
+    let mut addresses = Vec::new();
+    let mut adapter = buffer.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+    while let Some(current) = unsafe { adapter.as_ref() } {
+        adapter = current.Next;
+        if current.OperStatus != IfOperStatusUp || current.IfType == IF_TYPE_SOFTWARE_LOOPBACK {
+            continue;
+        }
+        let mut unicast = current.FirstUnicastAddress;
+        while let Some(address) = unsafe { unicast.as_ref() } {
+            unicast = address.Next;
+            let Some(socket) = (unsafe { address.Address.lpSockaddr.as_ref() }) else {
+                continue;
+            };
+            if socket.sa_family != AF_INET {
+                continue;
+            }
+            let socket = unsafe { &*address.Address.lpSockaddr.cast::<SOCKADDR_IN>() };
+            let ip = Ipv4Addr::from(u32::from_be(unsafe { socket.sin_addr.S_un.S_addr }));
+            if !ip.is_link_local() && !ip.is_unspecified() && !addresses.contains(&ip) {
+                addresses.push(ip);
+            }
+        }
+    }
     addresses
 }
 

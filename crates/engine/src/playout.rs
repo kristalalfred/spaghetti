@@ -702,8 +702,12 @@ mod tests {
     use crate::ring::Captured;
 
     const TONE_HZ: f64 = 440.0;
-    const TICKS_PER_SECOND: f64 = 24_000_000.0;
     const RENDER_FRAMES: usize = 512;
+
+    /// Claude: the host clock's, which the ring dates its pushes by.
+    fn ticks_per_second() -> f64 {
+        crate::host_time::ticks_per_second()
+    }
     /// Claude: resampling this much off shifts pitch by 5 cents, about the
     /// smallest change a listener hears.
     const INAUDIBLE_PPM: f32 = 3000.0;
@@ -928,7 +932,7 @@ mod tests {
                 sample_rate: source_rate,
                 delivery: source.span(),
             };
-            let playout = Playout::new(&timing, device_rate, TICKS_PER_SECOND, None).unwrap();
+            let playout = Playout::new(&timing, device_rate, ticks_per_second(), None).unwrap();
             Self {
                 ring: playout.ring(),
                 playout,
@@ -968,7 +972,7 @@ mod tests {
                 delivery: sim.source.span(),
             };
             sim.playout =
-                Playout::new(&timing, device_rate, TICKS_PER_SECOND, Some(schedule)).unwrap();
+                Playout::new(&timing, device_rate, ticks_per_second(), Some(schedule)).unwrap();
             sim.ring = sim.playout.ring();
             sim.dated_from = Some(0);
             sim.next_render = start;
@@ -1048,13 +1052,13 @@ mod tests {
                 } else {
                     let (mut left, mut right) =
                         (vec![0.0; RENDER_FRAMES], vec![0.0; RENDER_FRAMES]);
-                    let now = (self.next_render * TICKS_PER_SECOND) as u64;
+                    let now = (self.next_render * ticks_per_second()) as u64;
                     let output = self.next_render + self.render_ahead;
                     self.playout.render(
                         &self.ring,
                         &mut [&mut left, &mut right],
                         now,
-                        (output * TICKS_PER_SECOND) as u64,
+                        (output * ticks_per_second()) as u64,
                     );
                     assert_eq!(left, right);
                     self.rendered.extend_from_slice(&left);
@@ -1073,13 +1077,13 @@ mod tests {
             let stamp = self.source.publish(&push, rate);
             let captured = match self.dated_from {
                 Some(first) if push.media >= first => {
-                    Captured::Estimated((push.media as f64 / rate * TICKS_PER_SECOND) as u64)
+                    Captured::Estimated((push.media as f64 / rate * ticks_per_second()) as u64)
                 }
                 _ => Captured::Unknown,
             };
             self.ring.push_with(
                 push.frames,
-                (stamp * TICKS_PER_SECOND) as u64,
+                (stamp * ticks_per_second()) as u64,
                 captured,
                 |f, _| {
                     (0.5 * (2.0 * std::f64::consts::PI * TONE_HZ * (push.media + f) as f64 / rate)
@@ -1580,9 +1584,9 @@ mod tests {
             sample_rate: 48000.0,
             delivery: Arc::new(DeliverySpan::new(4800.0)),
         };
-        let mut playout = Playout::new(&timing, 48000.0, TICKS_PER_SECOND, None).unwrap();
+        let mut playout = Playout::new(&timing, 48000.0, ticks_per_second(), None).unwrap();
         let ring = Ring::new(48000.0);
-        let now = (10.0 * TICKS_PER_SECOND) as u64;
+        let now = (10.0 * ticks_per_second()) as u64;
         ring.push_with(960, now + 1, Captured::Unknown, |_, _| 0.25);
         let (mut left, mut right) = (vec![0.0; RENDER_FRAMES], vec![0.0; RENDER_FRAMES]);
         playout.render(&ring, &mut [&mut left, &mut right], now, now);
@@ -1656,7 +1660,7 @@ mod tests {
                 sample_rate: rate,
                 delivery: Arc::new(DeliverySpan::new(rate)),
             };
-            Playout::new(&timing, device, TICKS_PER_SECOND, schedule)
+            Playout::new(&timing, device, ticks_per_second(), schedule)
         };
         for device in [8000.0, 44100.0, 48000.0, 96000.0] {
             assert_eq!(
@@ -1695,7 +1699,7 @@ mod tests {
                 sample_rate: rate,
                 delivery: Arc::new(DeliverySpan::new(0.0)),
             };
-            Playout::new(&timing, device, TICKS_PER_SECOND, None)
+            Playout::new(&timing, device, ticks_per_second(), None)
         };
         assert_eq!(ring_capacity(48000.0, 500.0), None);
         for (rate, device) in [
@@ -1727,7 +1731,7 @@ mod tests {
             sample_rate: 48000.0,
             delivery: Arc::new(DeliverySpan::new(480.0)),
         };
-        let playout = Playout::new(&timing, 48000.0, TICKS_PER_SECOND, None).unwrap();
+        let playout = Playout::new(&timing, 48000.0, ticks_per_second(), None).unwrap();
         let health = playout.health();
         assert_eq!(health.report().unstamped_renders, 0);
         playout.count_unstamped_render();
@@ -1770,7 +1774,7 @@ mod tests {
             Playout::new(
                 &timing,
                 44100.0,
-                TICKS_PER_SECOND,
+                ticks_per_second(),
                 Some(Schedule {
                     delay: 2.5,
                     latency,
@@ -1791,7 +1795,7 @@ mod tests {
             sample_rate: rate,
             delivery: Arc::new(DeliverySpan::new(rate)),
         };
-        let limit = Playout::new(&timing, 44100.0, TICKS_PER_SECOND, None)
+        let limit = Playout::new(&timing, 44100.0, ticks_per_second(), None)
             .unwrap()
             .max_held_seconds();
         let schedule = Schedule {
@@ -1915,7 +1919,7 @@ mod tests {
     /// returns the left channel.
     fn render_heard(playout: &mut Playout, ring: &Ring, heard: f64) -> Vec<f32> {
         let to_output = playout.delay_frames() as f64 / 48000.0;
-        let output = ((heard - to_output) * TICKS_PER_SECOND) as u64;
+        let output = ((heard - to_output) * ticks_per_second()) as u64;
         let (mut left, mut right) = (vec![0.0; 480], vec![0.0; 480]);
         playout.render(ring, &mut [&mut left, &mut right], output, output);
         left
@@ -1935,9 +1939,9 @@ mod tests {
             delay: 0.1,
             latency: 0.0,
         };
-        let mut playout = Playout::new(&timing, 48000.0, TICKS_PER_SECOND, Some(schedule)).unwrap();
+        let mut playout = Playout::new(&timing, 48000.0, ticks_per_second(), Some(schedule)).unwrap();
         let ring = Ring::new(48000.0);
-        let dated = |seconds: f64| Captured::Estimated((seconds * TICKS_PER_SECOND) as u64);
+        let dated = |seconds: f64| Captured::Estimated((seconds * ticks_per_second()) as u64);
         for block in 0..10 {
             let captured = 100.0 + block as f64 * 0.01;
             ring.push_with(480, 0, dated(captured), |_, _| 0.5);
@@ -1982,9 +1986,9 @@ mod tests {
             delay: 0.1,
             latency: 0.0,
         };
-        let mut playout = Playout::new(&timing, 48000.0, TICKS_PER_SECOND, Some(schedule)).unwrap();
+        let mut playout = Playout::new(&timing, 48000.0, ticks_per_second(), Some(schedule)).unwrap();
         let ring = Ring::new(48000.0);
-        let measured = |seconds: f64| Captured::Measured((seconds * TICKS_PER_SECOND) as u64);
+        let measured = |seconds: f64| Captured::Measured((seconds * ticks_per_second()) as u64);
         let push = |from: f64, value: f32| {
             for block in 0..30 {
                 ring.push_with(480, 0, measured(from + block as f64 * 0.01), |_, _| value);
@@ -2049,24 +2053,24 @@ mod tests {
             delay: 0.1,
             latency: 0.0,
         };
-        let captured = (100.0 * TICKS_PER_SECOND) as u64;
+        let captured = (100.0 * ticks_per_second()) as u64;
         for (later, plays) in [
-            (0.1 * TICKS_PER_SECOND, true),
+            (0.1 * ticks_per_second(), true),
             ((1u64 << 31) as f64, false),
             ((1u64 << 32) as f64, false),
         ] {
             let mut playout =
-                Playout::new(&timing, 48000.0, TICKS_PER_SECOND, Some(schedule)).unwrap();
+                Playout::new(&timing, 48000.0, ticks_per_second(), Some(schedule)).unwrap();
             let ring = Ring::new(48000.0);
             for block in 0..10 {
-                let at = captured + (block as f64 * 0.01 * TICKS_PER_SECOND) as u64;
+                let at = captured + (block as f64 * 0.01 * ticks_per_second()) as u64;
                 ring.push_with(480, at, Captured::Estimated(at), |_, _| 0.5);
             }
             let now = captured + later as u64;
             let (mut left, mut right) = (vec![0.0; 480], vec![0.0; 480]);
             let mut peak = 0.0f32;
             for render in 0..8 {
-                let at = now + (render as f64 * 0.01 * TICKS_PER_SECOND) as u64;
+                let at = now + (render as f64 * 0.01 * ticks_per_second()) as u64;
                 playout.render(&ring, &mut [&mut left, &mut right], at, at);
                 peak = left.iter().fold(peak, |peak, s| peak.max(s.abs()));
             }

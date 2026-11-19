@@ -34,7 +34,7 @@ pub enum Captured {
     /// does not start at the very frame where the previous one ended also
     /// starts a new run, however close its date, so a run holds every frame
     /// the device captured over it exactly once.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
     Counted { at: u64, position: u64 },
     /// Claude: the host time estimated through another clock, whose estimate
     /// may move between pushes. The source marks its own discontinuities.

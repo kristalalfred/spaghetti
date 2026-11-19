@@ -3,11 +3,12 @@ mod runtime;
 mod servo;
 mod wire;
 use std::net::SocketAddr;
-use std::os::unix::net::UnixDatagram;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+use crate::sys;
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
@@ -261,7 +262,7 @@ impl Ptp {
         #[cfg(test)]
         let general_port = sockets.general_port;
         let (wake, reader) =
-            UnixDatagram::pair().map_err(|e| format!("could not open PTP wake socket: {e}"))?;
+            sys::wake_pair().map_err(|e| format!("could not open PTP wake socket: {e}"))?;
         wake.set_nonblocking(true).map_err(|e| e.to_string())?;
         reader.set_nonblocking(true).map_err(|e| e.to_string())?;
         let (sender, commands) = mpsc::channel();
@@ -435,10 +436,12 @@ mod tests {
             assert!(Timebase::new(TIMELINE, host, PtpTime { nanos: 0 }, rate).is_none());
         }
         let zero = Timebase::new(TIMELINE, host, PtpTime { nanos: 0 }, 1.0).unwrap();
-        assert!(zero.network(host - Duration::from_nanos(1)).is_none());
+        // Claude: a microsecond, as Windows counts instants under its
+        // performance counter's tick apart as equal.
+        assert!(zero.network(host - Duration::from_micros(1)).is_none());
         let max = Timebase::new(TIMELINE, host, PtpTime { nanos: u64::MAX }, 1.0).unwrap();
         assert_eq!(max.network(host), Some(PtpTime { nanos: u64::MAX }));
-        assert!(max.network(host + Duration::from_nanos(1)).is_none());
+        assert!(max.network(host + Duration::from_micros(1)).is_none());
         let slow = Timebase::new(TIMELINE, host, PtpTime { nanos: 0 }, f64::MIN_POSITIVE).unwrap();
         assert!(slow.host(PtpTime { nanos: 1 }).is_none());
         let fast = Timebase::new(TIMELINE, host, PtpTime { nanos: 0 }, f64::MAX).unwrap();

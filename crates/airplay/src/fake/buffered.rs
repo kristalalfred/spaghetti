@@ -1,6 +1,5 @@
 use std::io::{self, ErrorKind, Read};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
@@ -252,21 +251,12 @@ fn read_bytewise(stream: &mut TcpStream, chunk: &mut [u8]) -> io::Result<usize> 
     if stream.read(&mut chunk[..1])? == 0 {
         return Ok(0);
     }
+    stream.set_nonblocking(true)?;
     let mut taken = 1;
-    while taken < chunk.len() {
-        let got = unsafe {
-            libc::recv(
-                stream.as_raw_fd(),
-                chunk[taken..].as_mut_ptr().cast(),
-                1,
-                libc::MSG_DONTWAIT,
-            )
-        };
-        if got <= 0 {
-            break;
-        }
+    while taken < chunk.len() && matches!(stream.read(&mut chunk[taken..=taken]), Ok(1)) {
         taken += 1;
     }
+    stream.set_nonblocking(false)?;
     Ok(taken)
 }
 

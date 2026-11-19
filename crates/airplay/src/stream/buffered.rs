@@ -1,6 +1,5 @@
 use std::io::{self, ErrorKind, Write};
 use std::net::TcpStream;
-use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 use tracing::debug;
@@ -12,6 +11,7 @@ use crate::clock::{self, PACKET_DURATION};
 use crate::hap::Counted;
 use crate::packet::{BUFFERED_PACKET_LEN, write_buffered_packet};
 use crate::ptp::{Peer, Timebase, Timeline, Timing};
+use crate::sys::Interest;
 use crate::{Counters, FRAMES_PER_PACKET};
 
 /// Claude: buffered audio: each packet sealed and queued whole on the data
@@ -107,7 +107,7 @@ impl Buffered {
         self.outbox.push(write, play_at)
     }
 
-    pub(super) fn interest(&self) -> libc::pollfd {
+    pub(super) fn interest(&self) -> Interest {
         self.outbox.interest()
     }
 
@@ -278,15 +278,11 @@ impl Outbox {
     }
 
     /// Claude: the socket, writable when packets wait.
-    pub(super) fn interest(&self) -> libc::pollfd {
-        libc::pollfd {
-            fd: if self.queued > 0 {
-                self.socket.as_raw_fd()
-            } else {
-                -1
-            },
-            events: libc::POLLOUT,
-            revents: 0,
+    pub(super) fn interest(&self) -> Interest {
+        if self.queued > 0 {
+            Interest::writable(&self.socket)
+        } else {
+            Interest::NONE
         }
     }
 
@@ -323,7 +319,7 @@ impl Outbox {
     }
 
     /// Claude: how much of the first packet waiting has gone out.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn partly_written(&self) -> usize {
         self.written
     }
@@ -441,7 +437,7 @@ mod tests {
     /// until the outbox is empty, fails, or `within` ends.
     fn drain(outbox: &mut Outbox, within: Duration) -> Result<(), String> {
         let until = Instant::now() + within;
-        while outbox.interest().fd >= 0 && Instant::now() < until {
+        while outbox.interest().waits() && Instant::now() < until {
             thread::sleep(Duration::from_millis(2));
             outbox.flush()?;
         }
@@ -579,7 +575,7 @@ mod tests {
             if let Err(reason) = outbox.push(packet(n, &mut key), now + lead) {
                 break reason;
             }
-            if outbox.interest().fd >= 0 {
+            if outbox.interest().waits() {
                 first_waiting.get_or_insert(now);
             }
             n += 1;
@@ -621,7 +617,9 @@ mod tests {
     /// Claude: a connection whose sending end writes whatever room its buffer
     /// has. macOS otherwise lets a write proceed only with 2048 bytes free, so
     /// that a 1450-byte packet goes whole or not at all.
+    #[cfg(unix)]
     fn connection_writing_in_part() -> (TcpStream, TcpStream) {
+        use std::os::fd::AsRawFd;
         let (sender, receiver) = connection();
         let one: libc::c_int = 1;
         let set = unsafe {
@@ -640,6 +638,7 @@ mod tests {
     /// Claude: pushes copies of `packets`, all due at `due`, onto a
     /// connection nobody reads until one goes out only in part, returning how
     /// many were pushed.
+    #[cfg(unix)]
     fn push_until_partly_written(
         outbox: &mut Outbox,
         packets: &[[u8; LEN]],
@@ -679,6 +678,9 @@ mod tests {
         assert_eq!(reading.join().unwrap(), (vec![], 0), "nothing was written");
     }
 
+    // Claude: Windows takes a whole packet into a full send buffer or none
+    // of it, so no packet goes out in part there.
+    #[cfg(unix)]
     #[test]
     fn a_packet_sent_in_part_then_due_fails_without_completing_or_splicing() {
         let (sender, receiver) = connection_writing_in_part();
@@ -707,6 +709,9 @@ mod tests {
         assert!(pushed > packets.len());
     }
 
+    // Claude: Windows takes a whole packet into a full send buffer or none
+    // of it, so no packet goes out in part there.
+    #[cfg(unix)]
     #[test]
     fn a_packet_sent_in_part_goes_on_whole_once_the_receiver_reads_again() {
         let (sender, receiver) = connection_writing_in_part();
@@ -802,7 +807,7 @@ mod tests {
             let mut buffered = Buffered::start(audio, peer, &settings).unwrap();
             let silence = [0.0; FRAMES_PER_PACKET];
             let mut packet = buffered.first_packet();
-            while buffered.interest().fd < 0 {
+            while !buffered.interest().waits() {
                 let play_at = buffered.play_at(packet).unwrap();
                 buffered.send(packet, play_at, &silence, &silence).unwrap();
                 packet += 1;
@@ -819,7 +824,7 @@ mod tests {
             thread::sleep(Duration::from_millis(100));
             let reading = read(receiver, 64 * 1024, None, usize::MAX);
             thread::sleep(Duration::from_millis(100));
-            assert!(buffered.interest().fd >= 0);
+            assert!(buffered.interest().waits());
             let reason = buffered.flush().unwrap_err();
             assert!(reason.contains("stepped (epoch 0 to 1)"), "{reason}");
             let play_at = Instant::now() + LONG;

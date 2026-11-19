@@ -1,6 +1,5 @@
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
-use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
@@ -13,6 +12,7 @@ use crate::backlog::Backlog;
 use crate::clock::{self, Clock, PACKET_DURATION, Timeline};
 use crate::packet::{self, AudioHeader, MAX_AUDIO_PACKET_LEN, MAX_RETRANSMISSION_LEN, Sync};
 use crate::session::{AudioLatency, Offer, RealtimeAudio, Resend};
+use crate::sys::{self, Interest};
 use crate::{Counters, FRAMES_PER_PACKET};
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(1);
@@ -35,8 +35,11 @@ impl Sockets {
             SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
             SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
         };
-        let bind =
-            || UdpSocket::bind(any).map_err(|e| format!("could not open a UDP socket ({e})"));
+        let bind = || {
+            UdpSocket::bind(any)
+                .and_then(|socket| sys::ignore_unreachable(&socket).map(|()| socket))
+                .map_err(|e| format!("could not open a UDP socket ({e})"))
+        };
         let (control, timing, audio) = (bind()?, bind()?, bind()?);
         control.set_nonblocking(true).map_err(|e| e.to_string())?;
         let port = |socket: &UdpSocket| {
@@ -216,12 +219,8 @@ impl Realtime {
     }
 
     /// Claude: the control socket, where retransmit requests come in.
-    pub(super) fn interest(&self) -> libc::pollfd {
-        libc::pollfd {
-            fd: self.sockets.control.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        }
+    pub(super) fn interest(&self) -> Interest {
+        Interest::readable(&self.sockets.control)
     }
 
     pub(super) fn answer_control(&mut self) {

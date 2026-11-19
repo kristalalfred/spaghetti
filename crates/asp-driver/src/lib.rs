@@ -1,5 +1,7 @@
 //! Spaghetti's AudioServerPlugIn driver, loaded by coreaudiod.
 
+#![cfg(target_os = "macos")]
+
 use std::ffi::c_void;
 
 use audio_server_plugin::{Activity, Device, Plugin, Volume};

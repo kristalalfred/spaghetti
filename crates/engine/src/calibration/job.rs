@@ -154,7 +154,7 @@ impl Leg {
             Planned::Device { uid } => audio::find_device_by_uid(&uid)
                 .ok_or_else(|| format!("device '{uid}' not found"))
                 .and_then(|device| {
-                    device_output::check_schedule(device, &timing, delay, offset)?;
+                    device_output::check_schedule(&device, &timing, delay, offset)?;
                     Ok(Target::Device {
                         device,
                         delay: Some(delay),

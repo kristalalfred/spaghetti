@@ -1,6 +1,5 @@
 use std::io::{Cursor, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -9,12 +8,14 @@ use std::time::{Duration, Instant};
 use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, Tag};
 use plist::{Dictionary, Value};
+use socket2::{Domain, SockRef, Socket, Type};
 
 use crate::browse::{Event, InstanceKey, Kind};
 use crate::clock::{Clock, Ntp};
 use crate::ptp::{Endpoint, Peer, Ptp, Timing};
 use crate::receiver::tests::txt;
 use crate::rtsp::{PLIST, Response, decode_response};
+use crate::sys::{self, Interest};
 use crate::tlv8::{self, Tlv};
 use crate::{Browser, FRAMES_PER_PACKET, ReceiverId, SAMPLE_RATE, hap, pairing, srp};
 
@@ -202,7 +203,9 @@ struct Events {
 /// takes AirPlay 1 and AirPlay 2 on one port.
 pub(crate) struct Fake {
     address: SocketAddr,
-    listener: TcpListener,
+    /// Claude: shared with the accept thread rather than cloned: a clone is
+    /// a socket of its own on Windows, which `wake`'s listen would not reach.
+    listener: Arc<TcpListener>,
     control: UdpSocket,
     timing: UdpSocket,
     state: Arc<State>,
@@ -219,7 +222,7 @@ impl Fake {
     /// as a speaker's does in standby.
     pub(crate) fn asleep(behavior: Behavior) -> Fake {
         let localhost = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-        let listener = bound_without_listening();
+        let listener = Arc::new(bound_without_listening());
         listener.set_nonblocking(true).unwrap();
         let audio = UdpSocket::bind(localhost).unwrap();
         let control = UdpSocket::bind(localhost).unwrap();
@@ -236,7 +239,7 @@ impl Fake {
         };
         let fake = Fake {
             address: listener.local_addr().unwrap(),
-            listener: listener.try_clone().unwrap(),
+            listener: Arc::clone(&listener),
             control: control.try_clone().unwrap(),
             timing,
             state: Arc::default(),
@@ -298,7 +301,7 @@ impl Fake {
     }
 
     pub(crate) fn wake(&self) {
-        assert_eq!(unsafe { libc::listen(self.listener.as_raw_fd(), 16) }, 0);
+        SockRef::from(&self.listener).listen(16).unwrap();
     }
 
     pub(crate) fn address(&self) -> SocketAddr {
@@ -483,23 +486,28 @@ impl Fake {
     }
 
     /// Claude: sends a timing request saying it was sent at `sent`, and returns
-    /// the reply with the instants around the exchange.
+    /// the reply with the instants around the exchange. A request a loaded
+    /// host loses is sent again, and a reply to an earlier request is skipped.
     pub(crate) fn time(&self, sent: Ntp) -> (Instant, [u8; 32], Instant) {
         let mut request = [0u8; 32];
         request[..4].copy_from_slice(&[0x80, 0xD2, 0x00, 0x07]);
         request[24..32].copy_from_slice(&sent.to_be_bytes());
-        let before = Instant::now();
-        self.timing
-            .send_to(&request, self.client(&self.state.timing_port))
-            .unwrap();
         let mut reply = [0u8; 32];
-        let deadline = before + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            match self.timing.recv(&mut reply) {
-                Ok(32) => return (before, reply, Instant::now()),
-                _ if Instant::now() > deadline => panic!("no timing reply"),
-                _ => {}
+            let before = Instant::now();
+            self.timing
+                .send_to(&request, self.client(&self.state.timing_port))
+                .unwrap();
+            let resend = before + Duration::from_millis(200);
+            while Instant::now() < resend {
+                if let Ok(32) = self.timing.recv(&mut reply)
+                    && reply[8..16] == request[24..32]
+                {
+                    return (before, reply, Instant::now());
+                }
             }
+            assert!(Instant::now() < deadline, "no timing reply");
         }
     }
 
@@ -611,39 +619,19 @@ impl Drop for Fake {
 /// Claude: whether the other end has closed `stream`, which a read would
 /// show, looking without taking anything or waiting.
 fn at_end(stream: &TcpStream) -> bool {
-    let mut byte = 0u8;
-    let peeked = unsafe {
-        libc::recv(
-            stream.as_raw_fd(),
-            (&raw mut byte).cast(),
-            1,
-            libc::MSG_PEEK | libc::MSG_DONTWAIT,
-        )
-    };
-    peeked == 0
+    sys::poll([Interest::readable(stream)], Duration::ZERO)[0]
+        && stream.peek(&mut [0]).is_ok_and(|peeked| peeked == 0)
 }
 
 /// Claude: a TCP socket bound to a localhost port but not listening on it.
-/// macOS answers no connection to the port, and no other socket can take it.
+/// The host answers no connection to the port, and no other socket can take
+/// it.
 fn bound_without_listening() -> TcpListener {
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    assert!(fd >= 0);
-    let socket = unsafe { TcpListener::from_raw_fd(fd) };
-    let address = libc::sockaddr_in {
-        sin_len: size_of::<libc::sockaddr_in>() as u8,
-        sin_family: libc::AF_INET as u8,
-        sin_port: 0,
-        sin_addr: libc::in_addr {
-            s_addr: u32::from(Ipv4Addr::LOCALHOST).to_be(),
-        },
-        sin_zero: [0; 8],
-    };
-    let len = size_of_val(&address) as libc::socklen_t;
-    assert_eq!(
-        unsafe { libc::bind(fd, (&raw const address).cast(), len) },
-        0
-    );
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
     socket
+        .bind(&SocketAddr::from((Ipv4Addr::LOCALHOST, 0)).into())
+        .unwrap();
+    socket.into()
 }
 
 #[derive(Debug, Clone, Copy)]

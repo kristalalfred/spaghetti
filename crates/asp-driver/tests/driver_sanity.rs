@@ -2,6 +2,8 @@
 //! Loads the cdylib via dlopen (mirroring what coreaudiod does).
 //! Run with: cargo test -p spaghetti-asp --test driver_sanity -- --nocapture
 
+#![cfg(target_os = "macos")]
+
 use std::ffi::c_void;
 use std::ptr;
 
