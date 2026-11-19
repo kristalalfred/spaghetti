@@ -4,50 +4,61 @@
 //! the clock itself.
 
 use std::ops::{Add, Sub};
-use std::sync::OnceLock;
 use std::time::Duration;
 
-#[repr(C)]
-struct Timebase {
-    numer: u32,
-    denom: u32,
+#[cfg(target_vendor = "apple")]
+mod clock {
+    use std::sync::OnceLock;
+
+    #[repr(C)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+
+    unsafe extern "C" {
+        fn mach_absolute_time() -> u64;
+        fn mach_timebase_info(info: *mut Timebase) -> i32;
+    }
+
+    /// Claude: nanoseconds are ticks times `numer / denom`.
+    pub fn ratio() -> (u64, u64) {
+        static TIMEBASE: OnceLock<(u64, u64)> = OnceLock::new();
+        *TIMEBASE.get_or_init(|| {
+            let mut info = Timebase { numer: 0, denom: 0 };
+            let status = unsafe { mach_timebase_info(&mut info) };
+            assert!(
+                status == 0 && info.numer > 0 && info.denom > 0,
+                "mach_timebase_info failed: {status}"
+            );
+            (u64::from(info.numer), u64::from(info.denom))
+        })
+    }
+
+    pub fn now() -> u64 {
+        unsafe { mach_absolute_time() }
+    }
 }
 
-unsafe extern "C" {
-    fn mach_absolute_time() -> u64;
-    fn mach_timebase_info(info: *mut Timebase) -> i32;
-}
-
-fn timebase() -> (u64, u64) {
-    static TIMEBASE: OnceLock<(u64, u64)> = OnceLock::new();
-    *TIMEBASE.get_or_init(|| {
-        let mut info = Timebase { numer: 0, denom: 0 };
-        let status = unsafe { mach_timebase_info(&mut info) };
-        assert!(
-            status == 0 && info.numer > 0 && info.denom > 0,
-            "mach_timebase_info failed: {status}"
-        );
-        (u64::from(info.numer), u64::from(info.denom))
-    })
-}
+use clock::ratio;
 
 /// Claude: the host time now, in ticks.
 pub fn now() -> u64 {
-    unsafe { mach_absolute_time() }
+    clock::now()
 }
 
 pub fn ticks_per_second() -> f64 {
-    let (numer, denom) = timebase();
+    let (numer, denom) = ratio();
     1e9 * denom as f64 / numer as f64
 }
 
 pub fn to_nanos(ticks: u64) -> u64 {
-    let (numer, denom) = timebase();
+    let (numer, denom) = ratio();
     (u128::from(ticks) * u128::from(numer) / u128::from(denom)) as u64
 }
 
 pub fn from_nanos(nanos: u64) -> u64 {
-    let (numer, denom) = timebase();
+    let (numer, denom) = ratio();
     (u128::from(nanos) * u128::from(denom) / u128::from(numer)) as u64
 }
 

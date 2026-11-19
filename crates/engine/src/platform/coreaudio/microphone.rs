@@ -6,7 +6,7 @@
 
 use coreaudio_sys::AudioObjectID;
 
-use crate::audio;
+use super::audio;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Access {

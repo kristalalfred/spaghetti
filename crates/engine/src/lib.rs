@@ -5,6 +5,7 @@
 //! Apple platforms have no Core Audio HAL, so there a program brings its own
 //! audio I/O through `Router::add_program_input` and `add_program_output`.
 
+#[cfg(target_vendor = "apple")]
 mod abl;
 mod adts;
 mod airplay_sender;
@@ -45,28 +46,10 @@ mod webrtc_tests;
 #[cfg(target_os = "macos")]
 mod activity;
 #[cfg(target_os = "macos")]
-mod audio;
-#[cfg(target_os = "macos")]
-mod bus;
-#[cfg(target_os = "macos")]
 mod device_manager;
-#[cfg(target_os = "macos")]
-mod device_output;
-#[cfg(target_os = "macos")]
-mod input;
-#[cfg(target_os = "macos")]
-mod microphone;
-#[cfg(target_os = "macos")]
-mod stereo_out;
-#[cfg(target_os = "macos")]
-mod tap;
-#[cfg(target_os = "macos")]
-mod watch;
+mod platform;
 
-#[cfg(not(target_os = "macos"))]
-mod no_hal;
-#[cfg(not(target_os = "macos"))]
-use no_hal::{audio, bus, device_output, input, tap};
+use platform::{audio, bus, device_output, input, tap};
 
 pub use calibration::{
     Calibrated, Calibrating, Calibration, CalibrationFailure, CalibrationState, Movement,

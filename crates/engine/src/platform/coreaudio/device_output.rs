@@ -5,16 +5,16 @@ use coreaudio_sys::*;
 use spaghetti_common::ipc_protocol::FlowStatus;
 
 use crate::abl;
-use crate::audio;
+use super::audio;
 use crate::flow::{FlowMeter, Link};
 use crate::host_time;
-use crate::microphone;
+use super::microphone;
 use crate::mixer::{Cycles, Fader};
 use crate::playout::{Playout, PlayoutHealth, Schedule};
 use crate::ring::{CHANNELS, Ring};
 use crate::sinks::SourceTiming;
 use crate::spec::Playback;
-use crate::stereo_out::StereoOut;
+use super::stereo_out::StereoOut;
 
 /// Claude: a route's output to a Core Audio device. The device pulls through an
 /// IOProc of the route's own, and `Playout` resamples the route's ring to the

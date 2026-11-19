@@ -14,8 +14,8 @@ use crate::host_time;
 use crate::mixer::{Cycles, Fader, START_LIMIT};
 use crate::ring::CHANNELS;
 use crate::rt_slots::RtSlots;
-use crate::stereo_out::StereoOut;
-use crate::tap::AGGREGATE_UID_PREFIX;
+use super::stereo_out::StereoOut;
+use super::tap::AGGREGATE_UID_PREFIX;
 
 unsafe extern "C" {
     unsafe fn spaghetti_create_tap(
@@ -121,8 +121,8 @@ struct Running {
 
 impl Running {
     fn start(device_uid: &str, taps: &[SlotTap], state: Arc<BusState>) -> Result<Self, String> {
-        if let Some(device) = crate::audio::find_device_by_uid(device_uid) {
-            crate::microphone::before_opening(device)?;
+        if let Some(device) = super::audio::find_device_by_uid(device_uid) {
+            super::microphone::before_opening(device)?;
         }
         let device = CString::new(device_uid).map_err(|e| format!("invalid device UID: {e}"))?;
         let uid = format!(
@@ -259,8 +259,8 @@ impl DeviceBus {
                 .map_err(|e| format!("starting the bus watcher failed: {e}"))?
         };
         tracing::info!(device_uid, slots = taps.len(), "opened device bus");
-        let sample_rate = crate::audio::find_device_by_uid(device_uid)
-            .and_then(crate::audio::nominal_rate)
+        let sample_rate = super::audio::find_device_by_uid(device_uid)
+            .and_then(super::audio::nominal_rate)
             .unwrap_or(48000.0);
         Ok(Self {
             watched,

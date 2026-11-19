@@ -1,5 +1,7 @@
 fn main() {
-    println!("cargo:rustc-link-lib=framework=AudioToolbox");
+    if std::env::var("CARGO_CFG_TARGET_VENDOR").as_deref() == Ok("apple") {
+        println!("cargo:rustc-link-lib=framework=AudioToolbox");
+    }
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         cc::Build::new()

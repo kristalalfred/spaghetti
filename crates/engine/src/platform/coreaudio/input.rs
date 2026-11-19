@@ -31,13 +31,13 @@ use coreaudio_sys::*;
 use spaghetti_common::ipc_protocol::{FlowState, FlowStatus};
 
 use crate::abl;
-use crate::audio;
+use super::audio;
 use crate::delivery::DeliverySpan;
 use crate::flow::{FlowMeter, Link};
 use crate::host_time;
 use crate::ring::{CHANNELS, Captured, Ring};
 use crate::sinks::{MAX_SINKS, Sinks, SourceTiming};
-use crate::watch::{Watch, Watcher};
+use super::watch::{Watch, Watcher};
 
 /// Claude: how the first input stream's frames lie in the buffers an IOProc is
 /// handed. A stream's buffers come first in the list, before other streams'.
@@ -382,7 +382,7 @@ impl Capture {
         format: InputFormat,
         shared: Arc<Shared>,
     ) -> Result<Self, String> {
-        crate::microphone::before_reading_input()?;
+        super::microphone::before_reading_input()?;
         let stream = format.stream;
         let mut capture = Self {
             running: Arc::new(Running {

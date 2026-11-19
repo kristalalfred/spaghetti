@@ -10,7 +10,7 @@ use coreaudio_sys::*;
 use spaghetti_common::ipc_protocol::{AppInfo, FlowStatus, TapMode};
 
 use crate::abl;
-use crate::bus::is_running_output;
+use super::bus::is_running_output;
 use crate::delivery::DeliverySpan;
 use crate::flow::{FlowMeter, Link};
 use crate::host_time;
@@ -176,8 +176,8 @@ struct Opened {
 
 impl Opened {
     fn open(source_id: u32, pids: &[u32], mode: TapMode) -> Result<Self, String> {
-        if let Some(clock) = crate::audio::default_output_device() {
-            crate::microphone::before_opening(clock)?;
+        if let Some(clock) = super::audio::default_output_device() {
+            super::microphone::before_opening(clock)?;
         }
         let process_tap = ProcessTap::create(pids, mode, &aggregate_uid(source_id))?;
         let format = unsafe { query_device_stream_format(process_tap.aggregate) }?;
