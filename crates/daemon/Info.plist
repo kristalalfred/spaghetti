@@ -8,6 +8,8 @@
     <string>spaghettid</string>
     <key>NSLocalNetworkUsageDescription</key>
     <string>Spaghetti sends and receives audio over SRT and WebRTC with computers on your network.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Spaghetti records the input devices you route, and macOS asks the same of playing to a device that has an input.</string>
     <key>NSAudioCaptureUsageDescription</key>
     <string>Spaghetti captures the audio of the apps you route.</string>
 </dict>

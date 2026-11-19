@@ -24,8 +24,17 @@ pub fn find_device_by_uid(target_uid: &str) -> Option<AudioObjectID> {
 
 /// Claude: the UID of the input device the system records from by default.
 pub fn default_input_device() -> Option<String> {
+    default_device(kAudioHardwarePropertyDefaultInputDevice).and_then(get_device_uid)
+}
+
+/// Claude: the device the system plays to by default.
+pub(crate) fn default_output_device() -> Option<AudioObjectID> {
+    default_device(kAudioHardwarePropertyDefaultOutputDevice)
+}
+
+fn default_device(selector: AudioObjectPropertySelector) -> Option<AudioObjectID> {
     let property_address = AudioObjectPropertyAddress {
-        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mSelector: selector,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain,
     };
@@ -41,9 +50,7 @@ pub fn default_input_device() -> Option<String> {
             (&mut device as *mut AudioObjectID).cast(),
         )
     };
-    (status == 0 && device != kAudioObjectUnknown)
-        .then(|| get_device_uid(device))
-        .flatten()
+    (status == 0 && device != kAudioObjectUnknown).then_some(device)
 }
 
 /// Enumerate all audio devices on the system.

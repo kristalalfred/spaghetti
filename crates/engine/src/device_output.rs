@@ -8,6 +8,7 @@ use crate::abl;
 use crate::audio;
 use crate::flow::{FlowMeter, Link};
 use crate::host_time;
+use crate::microphone;
 use crate::mixer::{Cycles, Fader};
 use crate::playout::{Playout, PlayoutHealth, Schedule};
 use crate::ring::{CHANNELS, Ring};
@@ -66,6 +67,7 @@ impl DeviceOutput {
         delay: Option<f64>,
         latency_offset_ms: Option<i32>,
     ) -> Result<(Self, Arc<Ring>), String> {
+        microphone::before_opening(device)?;
         let rate = audio::nominal_rate(device).ok_or("could not read the device's rate")?;
         let channels: u32 = audio::stream_configuration(device, kAudioObjectPropertyScopeOutput)
             .unwrap_or_default()

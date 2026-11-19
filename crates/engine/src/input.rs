@@ -382,6 +382,7 @@ impl Capture {
         format: InputFormat,
         shared: Arc<Shared>,
     ) -> Result<Self, String> {
+        crate::microphone::before_reading_input()?;
         let stream = format.stream;
         let mut capture = Self {
             running: Arc::new(Running {

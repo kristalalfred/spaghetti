@@ -176,6 +176,9 @@ struct Opened {
 
 impl Opened {
     fn open(source_id: u32, pids: &[u32], mode: TapMode) -> Result<Self, String> {
+        if let Some(clock) = crate::audio::default_output_device() {
+            crate::microphone::before_opening(clock)?;
+        }
         let process_tap = ProcessTap::create(pids, mode, &aggregate_uid(source_id))?;
         let format = unsafe { query_device_stream_format(process_tap.aggregate) }?;
         tracing::info!(

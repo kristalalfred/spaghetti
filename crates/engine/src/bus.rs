@@ -121,6 +121,9 @@ struct Running {
 
 impl Running {
     fn start(device_uid: &str, taps: &[SlotTap], state: Arc<BusState>) -> Result<Self, String> {
+        if let Some(device) = crate::audio::find_device_by_uid(device_uid) {
+            crate::microphone::before_opening(device)?;
+        }
         let device = CString::new(device_uid).map_err(|e| format!("invalid device UID: {e}"))?;
         let uid = format!(
             "{AGGREGATE_UID_PREFIX}{}_bus_{}",
