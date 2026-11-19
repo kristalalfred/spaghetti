@@ -55,6 +55,8 @@ mod device_output;
 #[cfg(target_os = "macos")]
 mod input;
 #[cfg(target_os = "macos")]
+mod stereo_out;
+#[cfg(target_os = "macos")]
 mod tap;
 #[cfg(target_os = "macos")]
 mod watch;

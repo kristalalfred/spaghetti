@@ -13,12 +13,14 @@ use crate::playout::{Playout, PlayoutHealth, Schedule};
 use crate::ring::{CHANNELS, Ring};
 use crate::sinks::SourceTiming;
 use crate::spec::Playback;
+use crate::stereo_out::StereoOut;
 
-/// Claude: a route's output to a Core Audio device. The device pulls through the
-/// render callback, and `Playout` resamples the route's ring to the device rate.
-/// With a delay, each frame sounds that many seconds after its capture.
+/// Claude: a route's output to a Core Audio device. The device pulls through an
+/// IOProc of the route's own, and `Playout` resamples the route's ring to the
+/// device rate. With a delay, each frame sounds that many seconds after its
+/// capture.
 pub struct DeviceOutput {
-    unit: OutputUnit,
+    io: OutputIo,
     health: Arc<PlayoutHealth>,
     meter: Arc<FlowMeter>,
     cycles: Arc<Cycles>,
@@ -64,30 +66,16 @@ impl DeviceOutput {
         delay: Option<f64>,
         latency_offset_ms: Option<i32>,
     ) -> Result<(Self, Arc<Ring>), String> {
-        let mut unit = unsafe { OutputUnit::new(device) }?;
+        let rate = audio::nominal_rate(device).ok_or("could not read the device's rate")?;
+        let channels: u32 = audio::stream_configuration(device, kAudioObjectPropertyScopeOutput)
+            .unwrap_or_default()
+            .iter()
+            .sum();
+        if channels == 0 {
+            return Err("the device has no output channels".into());
+        }
 
-        let device_format = unsafe { unit.device_format() }?;
-        tracing::info!(
-            sample_rate = device_format.mSampleRate,
-            channels_per_frame = device_format.mChannelsPerFrame,
-            format_flags = device_format.mFormatFlags,
-            is_non_interleaved =
-                (device_format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0,
-            "destination device format (output unit output scope)"
-        );
-
-        let dst_asbd = route_format(device_format.mSampleRate);
-        tracing::info!(
-            sample_rate = dst_asbd.mSampleRate,
-            channels_per_frame = dst_asbd.mChannelsPerFrame,
-            format_flags = dst_asbd.mFormatFlags,
-            bytes_per_frame = dst_asbd.mBytesPerFrame,
-            "dst_asbd (output unit client format)"
-        );
-        unsafe { unit.set_client_format(&dst_asbd) }?;
-
-        let schedule = delay
-            .map(|delay| schedule(device, device_format.mSampleRate, delay, latency_offset_ms));
+        let schedule = delay.map(|delay| schedule(device, rate, delay, latency_offset_ms));
         if let Some(schedule) = schedule {
             tracing::info!(
                 delay_ms = schedule.delay * 1000.0,
@@ -95,39 +83,37 @@ impl DeviceOutput {
                 "scheduled playout"
             );
         }
-        let playout = Playout::new(
-            &source,
-            dst_asbd.mSampleRate,
-            host_time::ticks_per_second(),
-            schedule,
-        )?;
+        let playout = Playout::new(&source, rate, host_time::ticks_per_second(), schedule)?;
         let ring = playout.ring();
         let health = playout.health();
         tracing::info!(
             src_rate = source.sample_rate,
-            dst_rate = dst_asbd.mSampleRate,
+            dst_rate = rate,
             delay_frames = playout.delay_frames(),
             "created resampler"
         );
 
         let meter = Arc::new(FlowMeter::new());
         let cycles = Arc::new(Cycles::new());
-        unsafe {
-            unit.connect(
-                Arc::clone(&ring),
-                playout,
-                Fader::new(
-                    f32::from_bits(volume.load(Ordering::Relaxed)),
-                    dst_asbd.mSampleRate,
-                ),
-                volume,
-                Arc::clone(&meter),
-                Arc::clone(&cycles),
+        let frames = audio::max_buffer_frames(device).unwrap_or(FALLBACK_BUFFER_FRAMES) as usize;
+        let io = unsafe {
+            OutputIo::new(
+                device,
+                OutputState {
+                    ring: Arc::clone(&ring),
+                    playout,
+                    fader: Fader::new(f32::from_bits(volume.load(Ordering::Relaxed)), rate),
+                    volume,
+                    meter: Arc::clone(&meter),
+                    cycles: Arc::clone(&cycles),
+                    planes: [vec![0.0; frames], vec![0.0; frames]],
+                    logged_once: false,
+                },
             )
         }?;
         Ok((
             Self {
-                unit,
+                io,
                 health,
                 meter,
                 cycles,
@@ -148,7 +134,7 @@ impl DeviceOutput {
     }
 
     pub fn start(&self) -> Result<(), String> {
-        unsafe { self.unit.start() }
+        unsafe { self.io.start() }
     }
 
     /// Claude: the render callback's cycles.
@@ -170,272 +156,152 @@ impl DeviceOutput {
     }
 }
 
-struct OutputCallbackState {
+/// Claude: buffers sized for more frames than any device asks of an IOProc.
+const FALLBACK_BUFFER_FRAMES: u32 = 16384;
+
+struct OutputState {
     ring: Arc<Ring>,
     playout: Playout,
     volume: Arc<AtomicU32>,
     fader: Fader,
     meter: Arc<FlowMeter>,
     cycles: Arc<Cycles>,
+    /// Claude: the route's stereo, rendered here before it is laid out in the
+    /// device's buffers.
+    planes: [Vec<f32>; CHANNELS],
     logged_once: bool,
 }
 
-struct OutputUnit {
-    unit: AudioUnit,
-    /// Claude: leaked Box handed to the render callback; freed after the unit is disposed.
-    render_state: *mut OutputCallbackState,
+/// Claude: the route's IOProc on the device, with the device's inputs off for
+/// it.
+struct OutputIo {
+    device: AudioObjectID,
+    ioproc: AudioDeviceIOProcID,
+    /// Claude: leaked Box handed to the IOProc; freed once it is destroyed.
+    state: *mut OutputState,
 }
 
-// Claude: the unit is driven from one control thread at a time, and the render
-// state is only touched by the render callback while the unit exists.
-unsafe impl Send for OutputUnit {}
+// Claude: the IOProc is driven from one control thread at a time, and its
+// state is only touched by the IOProc while it exists.
+unsafe impl Send for OutputIo {}
 
-impl OutputUnit {
-    unsafe fn new(device_id: AudioObjectID) -> Result<Self, String> {
-        let desc = AudioComponentDescription {
-            componentType: kAudioUnitType_Output,
-            componentSubType: kAudioUnitSubType_HALOutput,
-            componentManufacturer: kAudioUnitManufacturer_Apple,
-            componentFlags: 0,
-            componentFlagsMask: 0,
-        };
-
-        let comp = unsafe { AudioComponentFindNext(std::ptr::null_mut(), &desc) };
-        if comp.is_null() {
-            return Err("no HALOutput component found".into());
-        }
-
-        let mut unit: AudioUnit = std::ptr::null_mut();
-        let status = unsafe { AudioComponentInstanceNew(comp, &mut unit) };
-        if status != 0 {
-            return Err(format!("AudioComponentInstanceNew failed: {status}"));
-        }
-        let output = Self {
-            unit,
-            render_state: std::ptr::null_mut(),
-        };
-
+impl OutputIo {
+    unsafe fn new(device: AudioObjectID, state: OutputState) -> Result<Self, String> {
+        let state = Box::into_raw(Box::new(state));
+        let mut ioproc: AudioDeviceIOProcID = None;
         let status = unsafe {
-            AudioUnitSetProperty(
-                unit,
-                kAudioOutputUnitProperty_CurrentDevice,
-                kAudioUnitScope_Global,
-                0,
-                &device_id as *const AudioObjectID as *const _,
-                std::mem::size_of::<AudioObjectID>() as u32,
-            )
+            AudioDeviceCreateIOProcID(device, Some(route_ioproc), state.cast(), &mut ioproc)
         };
-        if status != 0 {
-            return Err(format!("set output device failed: {status}"));
+        if status != 0 || ioproc.is_none() {
+            drop(unsafe { Box::from_raw(state) });
+            return Err(format!("AudioDeviceCreateIOProcID failed: {status:#010x}"));
         }
-
-        Ok(output)
-    }
-
-    /// Claude: the output scope is the device side of the unit. The input scope
-    /// is the client side and defaults to 44.1 kHz whatever the device runs at.
-    unsafe fn device_format(&self) -> Result<AudioStreamBasicDescription, String> {
-        let mut format: AudioStreamBasicDescription = unsafe { std::mem::zeroed() };
-        let mut size = std::mem::size_of::<AudioStreamBasicDescription>() as u32;
-        let status = unsafe {
-            AudioUnitGetProperty(
-                self.unit,
-                kAudioUnitProperty_StreamFormat,
-                kAudioUnitScope_Output,
-                0,
-                &mut format as *mut _ as *mut _,
-                &mut size,
-            )
+        let io = Self {
+            device,
+            ioproc,
+            state,
         };
-        if status != 0 {
-            return Err(format!("get output device format failed: {status}"));
+        if audio::has_input(device) {
+            let status = unsafe { spaghetti_read_last_inputs_only(device, ioproc, 0) };
+            if status != 0 {
+                tracing::warn!(status, "could not turn off the device's inputs");
+            }
         }
-        if format.mSampleRate <= 0.0 {
-            return Err(format!(
-                "output device reports sample rate {}",
-                format.mSampleRate
-            ));
-        }
-        Ok(format)
-    }
-
-    unsafe fn set_client_format(&self, format: &AudioStreamBasicDescription) -> Result<(), String> {
-        let status = unsafe {
-            AudioUnitSetProperty(
-                self.unit,
-                kAudioUnitProperty_StreamFormat,
-                kAudioUnitScope_Input,
-                0,
-                format as *const AudioStreamBasicDescription as *const _,
-                std::mem::size_of::<AudioStreamBasicDescription>() as u32,
-            )
-        };
-        if status != 0 {
-            return Err(format!("set output unit client format failed: {status}"));
-        }
-        Ok(())
-    }
-
-    unsafe fn connect(
-        &mut self,
-        ring: Arc<Ring>,
-        playout: Playout,
-        fader: Fader,
-        volume: Arc<AtomicU32>,
-        meter: Arc<FlowMeter>,
-        cycles: Arc<Cycles>,
-    ) -> Result<(), String> {
-        self.render_state = Box::into_raw(Box::new(OutputCallbackState {
-            ring,
-            playout,
-            fader,
-            volume,
-            meter,
-            cycles,
-            logged_once: false,
-        }));
-
-        let render_cb = AURenderCallbackStruct {
-            inputProc: Some(route_render_callback),
-            inputProcRefCon: self.render_state.cast(),
-        };
-        let status = unsafe {
-            AudioUnitSetProperty(
-                self.unit,
-                kAudioUnitProperty_SetRenderCallback,
-                kAudioUnitScope_Input,
-                0,
-                &render_cb as *const _ as *const _,
-                std::mem::size_of::<AURenderCallbackStruct>() as u32,
-            )
-        };
-        if status != 0 {
-            return Err(format!("set render callback failed: {status}"));
-        }
-
-        let status = unsafe { AudioUnitInitialize(self.unit) };
-        if status != 0 {
-            return Err(format!("initialize output unit failed: {status}"));
-        }
-        Ok(())
+        Ok(io)
     }
 
     unsafe fn start(&self) -> Result<(), String> {
-        let status = unsafe { AudioOutputUnitStart(self.unit) };
+        let status = unsafe { AudioDeviceStart(self.device, self.ioproc) };
         if status != 0 {
-            return Err(format!("start output unit failed: {status}"));
+            return Err(format!("AudioDeviceStart failed: {status:#010x}"));
         }
         Ok(())
     }
 }
 
-impl Drop for OutputUnit {
+impl Drop for OutputIo {
     fn drop(&mut self) {
         unsafe {
-            AudioOutputUnitStop(self.unit);
-            AudioUnitUninitialize(self.unit);
-            AudioComponentInstanceDispose(self.unit);
-            if !self.render_state.is_null() {
-                drop(Box::from_raw(self.render_state));
-            }
+            AudioDeviceStop(self.device, self.ioproc);
+            AudioDeviceDestroyIOProcID(self.device, self.ioproc);
+            drop(Box::from_raw(self.state));
         }
     }
 }
 
-fn output_planes(buffers: &mut [AudioBuffer], frames: usize) -> Option<[&mut [f32]; CHANNELS]> {
-    let [left, right] = buffers else {
-        return None;
-    };
-    let plane = |buffer: &mut AudioBuffer| {
-        (!buffer.mData.is_null()
-            && buffer.mDataByteSize as usize >= frames * std::mem::size_of::<f32>())
-        .then(|| unsafe { std::slice::from_raw_parts_mut(buffer.mData as *mut f32, frames) })
-    };
-    Some([plane(left)?, plane(right)?])
+unsafe extern "C" {
+    unsafe fn spaghetti_read_last_inputs_only(
+        device: AudioObjectID,
+        ioproc: AudioDeviceIOProcID,
+        count: u32,
+    ) -> i32;
 }
 
-/// Render callback for the output unit — drains the ring buffer into the output device.
-unsafe extern "C" fn route_render_callback(
-    in_ref_con: *mut std::ffi::c_void,
-    _io_action_flags: *mut AudioUnitRenderActionFlags,
-    in_time_stamp: *const AudioTimeStamp,
-    _in_bus_number: u32,
-    in_number_frames: u32,
-    io_data: *mut AudioBufferList,
+/// Claude: drains the route's ring into the device's first two output
+/// channels.
+unsafe extern "C" fn route_ioproc(
+    _device: AudioObjectID,
+    _now: *const AudioTimeStamp,
+    _input: *const AudioBufferList,
+    _input_time: *const AudioTimeStamp,
+    output: *mut AudioBufferList,
+    output_time: *const AudioTimeStamp,
+    client: *mut std::ffi::c_void,
 ) -> OSStatus {
-    if io_data.is_null() {
+    if output.is_null() || client.is_null() {
         return 0;
     }
-
     let now = host_time::now();
-    let state = unsafe { &mut *(in_ref_con as *mut OutputCallbackState) };
-    let buffers = unsafe { abl::buffers_mut(io_data) };
-    let n_buffers = buffers.len();
-    let ring_frames = state.ring.available();
-
-    let Some(mut out) = output_planes(buffers, in_number_frames as usize) else {
-        for buffer in unsafe { abl::buffers_mut(io_data) } {
-            if !buffer.mData.is_null() {
-                unsafe {
-                    std::ptr::write_bytes(
-                        buffer.mData.cast::<u8>(),
-                        0,
-                        buffer.mDataByteSize as usize,
-                    )
-                };
-            }
+    let state = unsafe { &mut *(client as *mut OutputState) };
+    let buffers = unsafe { abl::buffers_mut(output) };
+    for buffer in buffers.iter_mut() {
+        if !buffer.mData.is_null() {
+            unsafe {
+                std::ptr::write_bytes(buffer.mData.cast::<u8>(), 0, buffer.mDataByteSize as usize)
+            };
         }
+    }
+    let Some(device) = StereoOut::new(buffers) else {
         return 0;
     };
+    let frames = device.frames;
+    let [left, right] = &mut state.planes;
+    let (Some(left), Some(right)) = (left.get_mut(..frames), right.get_mut(..frames)) else {
+        return 0;
+    };
+    let mut out = [left, right];
 
-    let stamped = unsafe { in_time_stamp.as_ref() }
+    let stamped = unsafe { output_time.as_ref() }
         .filter(|time| time.mFlags & kAudioTimeStampHostTimeValid != 0)
         .map(|time| time.mHostTime);
     let output = stamped.unwrap_or_else(|| {
         state.playout.count_unstamped_render();
         now
     });
+    let ring_frames = state.ring.available();
     state.playout.render(&state.ring, &mut out, now, output);
     if state.playout.is_playing() {
-        state.meter.record(
-            (in_number_frames as usize * CHANNELS * std::mem::size_of::<f32>()) as u64,
-            now,
-        );
+        state
+            .meter
+            .record((frames * CHANNELS * std::mem::size_of::<f32>()) as u64, now);
     }
 
     let volume = f32::from_bits(state.volume.load(Ordering::Relaxed));
     state.fader.planar(&mut out, volume);
-    state
-        .cycles
-        .tick(now, in_number_frames as usize, state.playout.device_rate());
+    for (frame, (&left, &right)) in out[0].iter().zip(out[1].iter()).enumerate() {
+        unsafe { device.add(frame, left, right) };
+    }
+    state.cycles.tick(now, frames, state.playout.device_rate());
 
     if !state.logged_once {
         state.logged_once = true;
         tracing::info!(
-            n_buffers,
-            in_number_frames,
+            frames,
             ring_frames,
             peak_abs_f32 = out[0].iter().fold(0.0f32, |p, s| p.max(s.abs())),
-            "render callback first fire"
+            "route IOProc first fire"
         );
     }
 
     0
-}
-
-/// Claude: the layout every route hands its output unit: non-interleaved stereo f32.
-fn route_format(sample_rate: f64) -> AudioStreamBasicDescription {
-    AudioStreamBasicDescription {
-        mSampleRate: sample_rate,
-        mFormatID: kAudioFormatLinearPCM,
-        mFormatFlags: kAudioFormatFlagIsFloat
-            | kAudioFormatFlagIsPacked
-            | kAudioFormatFlagIsNonInterleaved,
-        mBytesPerPacket: 4,
-        mFramesPerPacket: 1,
-        mBytesPerFrame: 4,
-        mChannelsPerFrame: CHANNELS as u32,
-        mBitsPerChannel: 32,
-        mReserved: 0,
-    }
 }

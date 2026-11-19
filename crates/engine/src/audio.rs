@@ -203,6 +203,38 @@ pub(crate) fn stream_configuration(device_id: AudioObjectID, scope: u32) -> Opti
     )
 }
 
+/// Claude: whether the device has input channels, which Core Audio asks
+/// microphone access for before running any IOProc on it.
+pub(crate) fn has_input(device_id: AudioObjectID) -> bool {
+    stream_configuration(device_id, kAudioObjectPropertyScopeInput)
+        .is_some_and(|channels| channels.iter().any(|&count| count > 0))
+}
+
+/// Claude: the most frames the device hands an IOProc in one cycle.
+pub(crate) fn max_buffer_frames(device_id: AudioObjectID) -> Option<u32> {
+    let property_address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyBufferFrameSizeRange,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut range = AudioValueRange {
+        mMinimum: 0.0,
+        mMaximum: 0.0,
+    };
+    let mut size = mem::size_of::<AudioValueRange>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            device_id,
+            &property_address,
+            0,
+            ptr::null(),
+            &mut size,
+            (&mut range as *mut AudioValueRange).cast(),
+        )
+    };
+    (status == 0 && range.mMaximum >= 1.0).then_some(range.mMaximum as u32)
+}
+
 /// Claude: the rate the device runs at.
 pub fn nominal_rate(device_id: AudioObjectID) -> Option<f64> {
     let property_address = AudioObjectPropertyAddress {
