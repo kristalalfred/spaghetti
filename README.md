@@ -1,6 +1,6 @@
 # Spaghetti
 
-Route app audio on macOS and Windows to output devices, to AirPlay receivers, or to other machines over SRT, from the CLI. [weave-adapter-spaghetti](https://github.com/kristalalfred/weave-adapter-spaghetti) adds WebRTC links signaled by open-weave.
+Route app audio on macOS and Windows to output devices, to AirPlay receivers, or to other machines over SRT, from the CLI. [connect-adapter-spaghetti](https://github.com/kristalalfred/connect-adapter-spaghetti) adds WebRTC links signaled by open-connect.
 
 On macOS, requires Rust and Xcode Command Line Tools, and installs a virtual audio driver, the daemon and the CLI:
 
