@@ -110,6 +110,7 @@ pub fn print_sources(sources: &[SourceInfo]) {
         .iter()
         .map(|source| match &source.spec {
             SourceSpec::Tap { mode, .. } => format!("tap ({})", mode.label()),
+            SourceSpec::TapAll { mode, .. } => format!("tap-all ({})", mode.label()),
             SourceSpec::Srt(_) => "srt".to_string(),
             SourceSpec::WebRtc(peer) => format!("webrtc ({})", role_label(peer.role)),
         })
@@ -304,6 +305,15 @@ impl<'a> From<&'a SourceInfo> for SourceJson<'a> {
                     pids,
                     mode: mode.label(),
                 },
+                SourceSpec::TapAll {
+                    except,
+                    device_uid,
+                    mode,
+                } => EndpointJson::TapAll {
+                    except,
+                    device_uid: device_uid.as_deref(),
+                    mode: mode.label(),
+                },
                 SourceSpec::Srt(socket) => EndpointJson::srt(socket),
                 SourceSpec::WebRtc(peer) => EndpointJson::webrtc(peer),
             },
@@ -362,6 +372,12 @@ impl<'a> From<&'a RouteInfo> for RouteJson<'a> {
 enum EndpointJson<'a> {
     Tap {
         pids: &'a [u32],
+        mode: &'static str,
+    },
+    TapAll {
+        except: &'a [u32],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        device_uid: Option<&'a str>,
         mode: &'static str,
     },
     Device {
@@ -521,6 +537,23 @@ mod tests {
             ),
             format!(
                 r#"{{"source_id":3,"label":"Music","tag":"music","kind":"tap","pids":[501,502],"mode":"muted","status":{FLOWING}}}"#
+            ),
+        );
+    }
+
+    #[test]
+    fn a_tap_of_all_apps_lists_those_it_leaves_out_and_its_device() {
+        assert_eq!(
+            source_json(
+                SourceSpec::TapAll {
+                    except: vec![501],
+                    device_uid: Some("Speakers".into()),
+                    mode: TapMode::Mirror,
+                },
+                None,
+            ),
+            format!(
+                r#"{{"source_id":3,"label":"Music","tag":null,"kind":"tap_all","except":[501],"device_uid":"Speakers","mode":"mirror","status":{FLOWING}}}"#
             ),
         );
     }

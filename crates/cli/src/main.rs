@@ -44,6 +44,18 @@ enum Command {
         #[arg(short, long)]
         mute: bool,
     },
+    /// Tap every app but some as a source, all they play or only to one device
+    TapAll {
+        /// Only what the apps play to this output device (UID)
+        #[arg(long)]
+        device: Option<String>,
+        /// Process ID or app name to leave out
+        #[arg(long)]
+        except: Vec<String>,
+        /// Silence the tapped apps while the tap is active (redirect mode)
+        #[arg(short, long)]
+        mute: bool,
+    },
     /// Receive AAC in MPEG-TS over SRT as a source
     Receive {
         /// srt://:PORT to listen, or srt://HOST:PORT to call
@@ -350,23 +362,26 @@ fn run_command(cmd: Command, out: Output) -> Result<(), Box<dyn Error>> {
 
         Command::Tap { target, mute } => {
             let mode = if mute { TapMode::MuteSourceWhenTapped } else { TapMode::Mirror };
-
-            // Try parsing as PID first; fall back to name lookup.
-            let pids = if let Ok(pid) = target.parse::<u32>() {
-                vec![pid]
-            } else {
-                let Response::Apps(apps) = client::request(&mut stream, &Request::ListApps)? else {
-                    return Err(UNEXPECTED.into());
-                };
-                let needle = target.to_lowercase();
-                apps.iter()
-                    .find(|a| a.name.to_lowercase() == needle)
-                    .or_else(|| apps.iter().find(|a| a.name.to_lowercase().contains(&needle)))
-                    .map(|app| app.pids.clone())
-                    .ok_or_else(|| format!("no app matching '{target}' found"))?
-            };
-
+            let pids = app_pids(&mut stream, &target)?;
             create_source(&mut stream, out, SourceSpec::Tap { pids, mode })?;
+        }
+
+        Command::TapAll {
+            device,
+            except,
+            mute,
+        } => {
+            let mode = if mute { TapMode::MuteSourceWhenTapped } else { TapMode::Mirror };
+            let mut pids = Vec::new();
+            for target in &except {
+                pids.extend(app_pids(&mut stream, target)?);
+            }
+            let spec = SourceSpec::TapAll {
+                except: pids,
+                device_uid: device,
+                mode,
+            };
+            create_source(&mut stream, out, spec)?;
         }
 
         Command::Receive { url, srt } => {
@@ -545,6 +560,23 @@ fn run_command(cmd: Command, out: Output) -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+/// Claude: a PID as given, or the processes of the app whose name matches
+/// exactly, else contains the target.
+fn app_pids(stream: &mut client::Stream, target: &str) -> Result<Vec<u32>, Box<dyn Error>> {
+    if let Ok(pid) = target.parse::<u32>() {
+        return Ok(vec![pid]);
+    }
+    let Response::Apps(apps) = client::request(stream, &Request::ListApps)? else {
+        return Err(UNEXPECTED.into());
+    };
+    let needle = target.to_lowercase();
+    apps.iter()
+        .find(|a| a.name.to_lowercase() == needle)
+        .or_else(|| apps.iter().find(|a| a.name.to_lowercase().contains(&needle)))
+        .map(|app| app.pids.clone())
+        .ok_or_else(|| format!("no app matching '{target}' found").into())
 }
 
 fn create_source(

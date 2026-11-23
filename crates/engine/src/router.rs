@@ -37,8 +37,9 @@ enum Source {
 impl Source {
     fn open(source_id: u32, spec: &SourceSpec, programs: &Programs) -> Result<Self, String> {
         match spec {
-            SourceSpec::Tap { pids, mode } => {
-                TapSource::create(source_id, pids, *mode).map(Self::Tap)
+            SourceSpec::Tap { .. } | SourceSpec::TapAll { .. } => {
+                let (tapped, mode) = spec.tap().expect("matched a tap");
+                TapSource::create(source_id, tapped, mode).map(Self::Tap)
             }
             SourceSpec::Srt(socket) => SrtSource::open(socket).map(Self::Srt),
             SourceSpec::WebRtc(peer) => WebRtcSource::open(peer).map(Self::WebRtc),
@@ -279,21 +280,24 @@ impl Router {
         Ok(())
     }
 
+    /// Claude: replaces the processes a tap names: those it mixes, or for a
+    /// `TapAll` those it leaves out.
     pub fn set_tap_processes(&mut self, source_id: u32, pids: Vec<u32>) -> Result<(), String> {
         let entry = self
             .sources
             .get_mut(&source_id)
             .ok_or_else(|| format!("source {source_id} not found"))?;
-        let (Source::Tap(tap), SourceSpec::Tap { pids: tapped, .. }) =
-            (&mut entry.source, &mut entry.spec)
-        else {
+        let Source::Tap(tap) = &mut entry.source else {
             return Err(format!("source {source_id} is not a tap"));
         };
         tap.set_processes(&pids)?;
-        *tapped = pids;
-        let SourceSpec::Tap { pids, mode } = &entry.spec else {
-            unreachable!("matched as a tap above");
-        };
+        match &mut entry.spec {
+            SourceSpec::Tap { pids: named, .. } | SourceSpec::TapAll { except: named, .. } => {
+                *named = pids
+            }
+            _ => unreachable!("a tap source has a tap spec"),
+        }
+        let (tapped, mode) = entry.spec.tap().expect("a tap source has a tap spec");
         for route in self
             .routes
             .values()
@@ -303,7 +307,7 @@ impl Router {
                 (&route.path, &route.destination)
                 && let Some(bus) = self.buses.get(uid)
             {
-                bus.retarget(*slot, pids, *mode)?;
+                bus.retarget(*slot, &tapped, mode)?;
             }
         }
         Ok(())
@@ -366,9 +370,9 @@ impl Router {
 
         validate_schedule_source(&entry.spec, &destination)?;
         let volume = Arc::new(AtomicU32::new(initial_volume.clamp(0.0, 2.0).to_bits()));
-        let path = match (&entry.spec, &destination) {
+        let path = match (entry.spec.tap(), &destination) {
             (
-                SourceSpec::Tap { pids, mode },
+                Some((tapped, mode)),
                 Destination::Device {
                     uid,
                     delay_ms: None,
@@ -382,8 +386,8 @@ impl Router {
                 let meter = Arc::new(FlowMeter::new());
                 let cycles = Arc::new(Cycles::new());
                 let attached = bus.attach(
-                    pids,
-                    *mode,
+                    tapped,
+                    mode,
                     Arc::clone(&volume),
                     Arc::clone(&meter),
                     Arc::clone(&cycles),
@@ -890,6 +894,7 @@ fn validate_schedule_source(source: &SourceSpec, destination: &Destination) -> R
     };
     let dated = match source {
         SourceSpec::Tap { .. }
+        | SourceSpec::TapAll { .. }
         | SourceSpec::WebRtc(_)
         | SourceSpec::Program { .. }
         | SourceSpec::Input { .. } => true,
@@ -1022,6 +1027,12 @@ mod tests {
                 mode: TapMode::Mirror,
             };
             assert!(validate_schedule_source(&tap, &destination).is_ok());
+            let all = SourceSpec::TapAll {
+                except: vec![],
+                device_uid: None,
+                mode: TapMode::Mirror,
+            };
+            assert!(validate_schedule_source(&all, &destination).is_ok());
             let program = SourceSpec::Program {
                 input: "capture".into(),
             };

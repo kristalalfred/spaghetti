@@ -3,22 +3,28 @@
 
 #include <CoreAudio/CoreAudio.h>
 #include <AudioToolbox/AudioToolbox.h>
+#include <stdbool.h>
 
-/// Create a process tap targeting the given PIDs, which may be none.
+/// Create a process tap of the given PIDs, which may be none, or with
+/// `exclusive` of every process but them. With a device UID, the tap takes only
+/// what the processes play to that device's first output stream; Core Audio
+/// ignores a change of device once the tap exists.
 /// mute_behavior: 0 = CATapUnmuted (mirror), 1 = CATapMutedWhenTapped.
 /// Returns the tap's AudioObjectID via out_tap_id.
 OSStatus spaghetti_create_tap(
     const pid_t *pids,
     uint32_t pid_count,
     int mute_behavior,
+    bool exclusive,
+    const char *device_uid,
     AudioObjectID *out_tap_id
 );
 
 /// Destroy a previously created process tap.
 OSStatus spaghetti_destroy_tap(AudioObjectID tap_id);
 
-/// Replace the processes a running tap mixes. PIDs Core Audio does not know are
-/// skipped; it fails when none are left.
+/// Replace the processes a running tap names. PIDs Core Audio does not know are
+/// skipped; a tap that is not exclusive fails when none are left.
 OSStatus spaghetti_set_tap_processes(AudioObjectID tap_id, const pid_t *pids, uint32_t pid_count);
 
 /// Create a private aggregate device that captures from the given tap.
@@ -32,13 +38,15 @@ OSStatus spaghetti_create_aggregate_for_tap(
 /// Destroy an aggregate device.
 OSStatus spaghetti_destroy_aggregate(AudioObjectID aggregate_id);
 
-/// Point a tap at other processes, which may be none, and set how it mutes them.
-/// Unlike changing an aggregate's taps, this does not interrupt the aggregate's IO.
+/// Point a tap at other processes, which may be none, or with `exclusive` at
+/// every process but them, and set how it mutes them. Unlike changing an
+/// aggregate's taps, this does not interrupt the aggregate's IO.
 OSStatus spaghetti_retarget_tap(
     AudioObjectID tap_id,
     const pid_t *pids,
     uint32_t pid_count,
-    int mute_behavior
+    int mute_behavior,
+    bool exclusive
 );
 
 /// Create a private aggregate device whose clock and output are the given

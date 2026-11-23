@@ -31,6 +31,7 @@ use super::sessions;
 use crate::flow::Link;
 use crate::ring::Ring;
 use crate::sinks::SourceTiming;
+use crate::spec::Tapped;
 
 /// Claude: process loopback converts to any format asked of it, so a tap
 /// runs at one rate whatever the devices do.
@@ -65,19 +66,25 @@ fn tree_root(pids: &[u32]) -> Result<u32, String> {
 }
 
 impl TapSource {
-    pub fn create(_source_id: u32, pids: &[u32], mode: TapMode) -> Result<Self, String> {
+    pub fn create(_source_id: u32, tapped: Tapped, mode: TapMode) -> Result<Self, String> {
+        let Tapped::Processes(pids) = tapped else {
+            return Err(
+                "Windows captures one process and those under it, not every process but some"
+                    .into(),
+            );
+        };
         if mode == TapMode::MuteSourceWhenTapped {
             return Err(
                 "Windows silences an app's capture along with its output, so a tap cannot mute the app"
                     .into(),
             );
         }
-        let root = tree_root(pids)?;
+        let root = tree_root(&pids)?;
         Ok(Self {
             shared: Arc::new(Shared::new()),
             capture: None,
             root,
-            pids: pids.to_vec(),
+            pids,
             label: app_label(root),
         })
     }
@@ -393,7 +400,7 @@ mod tests {
         }
         assert!(list_audio_apps().iter().any(|app| app.pids.contains(&pid)));
 
-        let mut tap = TapSource::create(1, &[pid], TapMode::Mirror).unwrap();
+        let mut tap = TapSource::create(1, Tapped::Processes(vec![pid]), TapMode::Mirror).unwrap();
         let ring = Arc::new(Ring::new(f64::from(TAP_RATE)));
         let slot = tap.add_sink(Arc::clone(&ring)).unwrap();
         let (frames, level) = peak(&ring, 1.5);
@@ -404,7 +411,11 @@ mod tests {
 
     #[test]
     fn a_tap_that_mutes_its_app_is_refused() {
-        let refused = TapSource::create(1, &[std::process::id()], TapMode::MuteSourceWhenTapped);
+        let refused = TapSource::create(
+            1,
+            Tapped::Processes(vec![std::process::id()]),
+            TapMode::MuteSourceWhenTapped,
+        );
         assert!(refused.is_err());
     }
 }

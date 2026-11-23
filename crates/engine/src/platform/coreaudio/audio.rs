@@ -55,44 +55,48 @@ fn default_device(selector: AudioObjectPropertySelector) -> Option<AudioObjectID
 
 /// Enumerate all audio devices on the system.
 fn get_all_devices() -> Option<Vec<AudioObjectID>> {
+    Some(object_list(
+        kAudioObjectSystemObject,
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+    ))
+    .filter(|devices| !devices.is_empty())
+}
+
+/// Claude: a property holding a list of objects, empty when it cannot be read.
+pub(crate) fn object_list(
+    object: AudioObjectID,
+    selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope,
+) -> Vec<AudioObjectID> {
     let property_address = AudioObjectPropertyAddress {
-        mSelector: kAudioHardwarePropertyDevices,
-        mScope: kAudioObjectPropertyScopeGlobal,
+        mSelector: selector,
+        mScope: scope,
         mElement: kAudioObjectPropertyElementMain,
     };
-
     let mut data_size: u32 = 0;
     let status = unsafe {
-        AudioObjectGetPropertyDataSize(
-            kAudioObjectSystemObject,
-            &property_address,
-            0,
-            ptr::null(),
-            &mut data_size,
-        )
+        AudioObjectGetPropertyDataSize(object, &property_address, 0, ptr::null(), &mut data_size)
     };
     if status != 0 || data_size == 0 {
-        return None;
+        return Vec::new();
     }
-
-    let device_count = data_size as usize / mem::size_of::<AudioObjectID>();
-    let mut devices = vec![0u32; device_count];
-
+    let mut objects = vec![0; data_size as usize / mem::size_of::<AudioObjectID>()];
     let status = unsafe {
         AudioObjectGetPropertyData(
-            kAudioObjectSystemObject,
+            object,
             &property_address,
             0,
             ptr::null(),
             &mut data_size,
-            devices.as_mut_ptr().cast(),
+            objects.as_mut_ptr().cast(),
         )
     };
     if status != 0 {
-        return None;
+        return Vec::new();
     }
-
-    Some(devices)
+    objects.truncate(data_size as usize / mem::size_of::<AudioObjectID>());
+    objects
 }
 
 /// Claude: every device the system lists but the private aggregates that

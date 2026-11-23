@@ -33,7 +33,8 @@ pub enum Request {
     /// `tag` is the client's own name for the source, listed back with it.
     CreateSource { source: SourceSpec, tag: Option<String> },
     DestroySource { source_id: u32 },
-    /// Replace the processes a tap source mixes, keeping its routes running.
+    /// Replace the processes a tap source names, those it mixes or for a
+    /// `TapAll` those it leaves out, keeping its routes running.
     SetTapProcesses { source_id: u32, pids: Vec<u32> },
     ListSources,
     CreateRoute { source_id: u32, destination: Destination, volume: f32 },
@@ -81,6 +82,14 @@ pub enum Response {
 pub enum SourceSpec {
     /// The audio of these processes, mixed to stereo.
     Tap { pids: Vec<u32>, mode: TapMode },
+    /// What every process but these and the engine's own plays, mixed to
+    /// stereo: to the output device with this UID, or to any device.
+    TapAll {
+        except: Vec<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_uid: Option<String>,
+        mode: TapMode,
+    },
     /// AAC in MPEG-TS received over SRT.
     Srt(SrtSocket),
     /// Opus received from one WebRTC peer, decoded to 48 kHz stereo.

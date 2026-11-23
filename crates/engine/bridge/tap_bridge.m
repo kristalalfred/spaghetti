@@ -57,27 +57,47 @@ static AudioObjectID process_object_for_pid(pid_t pid) {
     return result;
 }
 
+static NSArray<NSNumber *> *process_objects(const pid_t *pids, uint32_t pid_count) {
+    NSMutableArray<NSNumber *> *objects = [NSMutableArray arrayWithCapacity:pid_count];
+    for (uint32_t i = 0; i < pid_count; i++) {
+        AudioObjectID objID = process_object_for_pid(pids[i]);
+        if (objID != kAudioObjectUnknown) {
+            [objects addObject:@(objID)];
+        }
+    }
+    return objects;
+}
+
 OSStatus spaghetti_create_tap(
     const pid_t *pids,
     uint32_t pid_count,
     int mute_behavior,
+    bool exclusive,
+    const char *device_uid,
     AudioObjectID *out_tap_id
 ) {
     if ((!pids && pid_count > 0) || !out_tap_id) {
         return kAudio_ParamError;
     }
 
-    // Convert PIDs to CoreAudio process object IDs
-    NSMutableArray<NSNumber *> *processObjects = [NSMutableArray arrayWithCapacity:pid_count];
-    for (uint32_t i = 0; i < pid_count; i++) {
-        AudioObjectID objID = process_object_for_pid(pids[i]);
-        if (objID == kAudioObjectUnknown) {
-            return kAudio_ParamError;
-        }
-        [processObjects addObject:@(objID)];
+    NSArray<NSNumber *> *processObjects = process_objects(pids, pid_count);
+    if (!exclusive && processObjects.count != pid_count) {
+        return kAudio_ParamError;
     }
 
-    CATapDescription *desc = [[CATapDescription alloc] initStereoMixdownOfProcesses:processObjects];
+    CATapDescription *desc;
+    if (device_uid) {
+        NSString *device = @(device_uid);
+        desc = exclusive
+            ? [[CATapDescription alloc] initExcludingProcesses:processObjects andDeviceUID:device withStream:0]
+            : [[CATapDescription alloc] initWithProcesses:processObjects andDeviceUID:device withStream:0];
+        desc.mixdown = YES;
+        desc.mono = NO;
+    } else {
+        desc = exclusive
+            ? [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:processObjects]
+            : [[CATapDescription alloc] initStereoMixdownOfProcesses:processObjects];
+    }
     desc.muteBehavior = (mute_behavior != 0) ? CATapMutedWhenTapped : CATapUnmuted;
 
     AudioObjectID tapID = kAudioObjectUnknown;
@@ -94,18 +114,7 @@ OSStatus spaghetti_destroy_tap(AudioObjectID tap_id) {
     return AudioHardwareDestroyProcessTap(tap_id);
 }
 
-OSStatus spaghetti_set_tap_processes(AudioObjectID tap_id, const pid_t *pids, uint32_t pid_count) {
-    NSMutableArray<NSNumber *> *processObjects = [NSMutableArray arrayWithCapacity:pid_count];
-    for (uint32_t i = 0; i < pid_count; i++) {
-        AudioObjectID objID = process_object_for_pid(pids[i]);
-        if (objID != kAudioObjectUnknown) {
-            [processObjects addObject:@(objID)];
-        }
-    }
-    if (processObjects.count == 0) {
-        return kAudio_ParamError;
-    }
-
+static CATapDescription *tap_description(AudioObjectID tap_id, OSStatus *status) {
     AudioObjectPropertyAddress addr = {
         .mSelector = kAudioTapPropertyDescription,
         .mScope    = kAudioObjectPropertyScopeGlobal,
@@ -113,15 +122,38 @@ OSStatus spaghetti_set_tap_processes(AudioObjectID tap_id, const pid_t *pids, ui
     };
     CFTypeRef current = NULL;
     UInt32 dataSize = sizeof(CFTypeRef);
-    OSStatus status = AudioObjectGetPropertyData(tap_id, &addr, 0, NULL, &dataSize, &current);
-    if (status != noErr || current == NULL) {
-        return status != noErr ? status : kAudio_ParamError;
+    *status = AudioObjectGetPropertyData(tap_id, &addr, 0, NULL, &dataSize, &current);
+    if (*status != noErr || current == NULL) {
+        if (*status == noErr) {
+            *status = kAudio_ParamError;
+        }
+        return nil;
     }
+    return (__bridge_transfer CATapDescription *)current;
+}
 
-    CATapDescription *desc = (__bridge_transfer CATapDescription *)current;
-    desc.processes = processObjects;
+static OSStatus set_tap_description(AudioObjectID tap_id, CATapDescription *desc) {
+    AudioObjectPropertyAddress addr = {
+        .mSelector = kAudioTapPropertyDescription,
+        .mScope    = kAudioObjectPropertyScopeGlobal,
+        .mElement  = kAudioObjectPropertyElementMain,
+    };
     CFTypeRef updated = (__bridge CFTypeRef)desc;
     return AudioObjectSetPropertyData(tap_id, &addr, 0, NULL, sizeof(CFTypeRef), &updated);
+}
+
+OSStatus spaghetti_set_tap_processes(AudioObjectID tap_id, const pid_t *pids, uint32_t pid_count) {
+    OSStatus status = noErr;
+    CATapDescription *desc = tap_description(tap_id, &status);
+    if (!desc) {
+        return status;
+    }
+    NSArray<NSNumber *> *processObjects = process_objects(pids, pid_count);
+    if (processObjects.count == 0 && !desc.exclusive) {
+        return kAudio_ParamError;
+    }
+    desc.processes = processObjects;
+    return set_tap_description(tap_id, desc);
 }
 
 /// Query the UID of the system default output device, to use as the aggregate's clock source.
@@ -236,33 +268,18 @@ OSStatus spaghetti_retarget_tap(
     AudioObjectID tap_id,
     const pid_t *pids,
     uint32_t pid_count,
-    int mute_behavior
+    int mute_behavior,
+    bool exclusive
 ) {
-    NSMutableArray<NSNumber *> *processObjects = [NSMutableArray arrayWithCapacity:pid_count];
-    for (uint32_t i = 0; i < pid_count; i++) {
-        AudioObjectID objID = process_object_for_pid(pids[i]);
-        if (objID != kAudioObjectUnknown) {
-            [processObjects addObject:@(objID)];
-        }
+    OSStatus status = noErr;
+    CATapDescription *desc = tap_description(tap_id, &status);
+    if (!desc) {
+        return status;
     }
-
-    AudioObjectPropertyAddress addr = {
-        .mSelector = kAudioTapPropertyDescription,
-        .mScope    = kAudioObjectPropertyScopeGlobal,
-        .mElement  = kAudioObjectPropertyElementMain,
-    };
-    CFTypeRef current = NULL;
-    UInt32 dataSize = sizeof(CFTypeRef);
-    OSStatus status = AudioObjectGetPropertyData(tap_id, &addr, 0, NULL, &dataSize, &current);
-    if (status != noErr || current == NULL) {
-        return status != noErr ? status : kAudio_ParamError;
-    }
-
-    CATapDescription *desc = (__bridge_transfer CATapDescription *)current;
-    desc.processes = processObjects;
+    desc.processes = process_objects(pids, pid_count);
+    desc.exclusive = exclusive;
     desc.muteBehavior = (mute_behavior != 0) ? CATapMutedWhenTapped : CATapUnmuted;
-    CFTypeRef updated = (__bridge CFTypeRef)desc;
-    return AudioObjectSetPropertyData(tap_id, &addr, 0, NULL, sizeof(CFTypeRef), &updated);
+    return set_tap_description(tap_id, desc);
 }
 
 OSStatus spaghetti_create_bus_aggregate(

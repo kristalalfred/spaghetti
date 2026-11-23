@@ -14,26 +14,12 @@ use crate::host_time;
 use crate::mixer::{Cycles, Fader, START_LIMIT};
 use crate::ring::CHANNELS;
 use crate::rt_slots::RtSlots;
+use crate::spec::Tapped;
 use super::stereo_out::StereoOut;
-use super::tap::AGGREGATE_UID_PREFIX;
+use super::audio;
+use super::tap::{AGGREGATE_UID_PREFIX, create_tap, destroy_tap, retarget_tap};
 
 unsafe extern "C" {
-    unsafe fn spaghetti_create_tap(
-        pids: *const i32,
-        pid_count: u32,
-        mute_behavior: i32,
-        out_tap_id: *mut AudioObjectID,
-    ) -> i32;
-
-    unsafe fn spaghetti_destroy_tap(tap_id: AudioObjectID) -> i32;
-
-    unsafe fn spaghetti_retarget_tap(
-        tap_id: AudioObjectID,
-        pids: *const i32,
-        pid_count: u32,
-        mute_behavior: i32,
-    ) -> i32;
-
     unsafe fn spaghetti_create_bus_aggregate(
         device_uid: *const i8,
         taps: *const AudioObjectID,
@@ -60,36 +46,49 @@ const QUIET_CHECKS: u32 = 3;
 static NEXT_BUS: AtomicU32 = AtomicU32::new(1);
 
 /// Claude: a process tap that captures nothing until a route points it at
-/// processes.
-struct SlotTap(AudioObjectID);
+/// processes. Core Audio fixes the device a tap listens to when it creates
+/// the tap, so a slot only takes routes that name its device, or none.
+struct SlotTap {
+    id: AudioObjectID,
+    device_uid: Option<String>,
+}
 
 impl SlotTap {
-    fn create() -> Result<Self, String> {
-        let mut tap = 0;
-        let status = unsafe { spaghetti_create_tap(ptr::null(), 0, 0, &mut tap) };
-        if status != 0 {
-            return Err(format!(
-                "AudioHardwareCreateProcessTap failed: OSStatus {status}"
-            ));
+    /// Claude: a tap names a device only as a tap of every process on it, so
+    /// a slot for a device starts as one and is released at once.
+    fn create(device_uid: Option<&str>) -> Result<Self, String> {
+        let tapped = match device_uid {
+            None => Tapped::Processes(Vec::new()),
+            Some(uid) => Tapped::AllBut {
+                except: Vec::new(),
+                device_uid: Some(uid.to_string()),
+            },
+        };
+        let slot = Self {
+            id: create_tap(&tapped, TapMode::Mirror)?,
+            device_uid: device_uid.map(str::to_string),
+        };
+        if device_uid.is_some() {
+            slot.release()?;
         }
-        Ok(Self(tap))
+        Ok(slot)
     }
 
-    fn retarget(&self, pids: &[u32], mode: TapMode) -> Result<(), String> {
-        let pids: Vec<i32> = pids.iter().map(|&pid| pid as i32).collect();
-        let mute = i32::from(mode == TapMode::MuteSourceWhenTapped);
-        let status =
-            unsafe { spaghetti_retarget_tap(self.0, pids.as_ptr(), pids.len() as u32, mute) };
-        if status != 0 {
-            return Err(format!("retargeting a bus tap failed: OSStatus {status}"));
+    fn retarget(&self, tapped: &Tapped, mode: TapMode) -> Result<(), String> {
+        if tapped.device_uid() != self.device_uid.as_deref() {
+            return Err("a bus slot keeps the device its tap was created for".into());
         }
-        Ok(())
+        retarget_tap(self.id, tapped, mode)
+    }
+
+    fn release(&self) -> Result<(), String> {
+        retarget_tap(self.id, &Tapped::Processes(Vec::new()), TapMode::Mirror)
     }
 }
 
 impl Drop for SlotTap {
     fn drop(&mut self) {
-        let status = unsafe { spaghetti_destroy_tap(self.0) };
+        let status = destroy_tap(self.id);
         if status != 0 {
             tracing::warn!(status, "destroying a bus tap failed");
         }
@@ -132,7 +131,7 @@ impl Running {
             NEXT_BUS.fetch_add(1, Ordering::Relaxed)
         );
         let uid = CString::new(uid).expect("the bus UID has no NUL");
-        let ids: Vec<AudioObjectID> = taps.iter().map(|tap| tap.0).collect();
+        let ids: Vec<AudioObjectID> = taps.iter().map(|tap| tap.id).collect();
         let mut aggregate = 0;
         let status = unsafe {
             spaghetti_create_bus_aggregate(
@@ -205,8 +204,8 @@ impl Drop for Running {
 /// Claude: what a bus shares with the thread that idles it.
 struct Watched {
     running: Mutex<Option<Running>>,
-    /// Claude: the processes each slot taps, none for a free slot.
-    pids: Mutex<Vec<Vec<u32>>>,
+    /// Claude: what each slot taps, none for a free slot.
+    tapped: Mutex<Vec<Option<Tapped>>>,
     stop: AtomicBool,
 }
 
@@ -239,7 +238,7 @@ pub struct DeviceBus {
 impl DeviceBus {
     pub fn open(device_uid: &str) -> Result<Self, String> {
         let taps = (0..INITIAL_SLOTS)
-            .map(|_| SlotTap::create())
+            .map(|_| SlotTap::create(None))
             .collect::<Result<Vec<_>, _>>()?;
         let state = Arc::new(BusState {
             mixes: RtSlots::new(),
@@ -248,7 +247,7 @@ impl DeviceBus {
         let running = Running::start(device_uid, &taps, Arc::clone(&state))?;
         let watched = Arc::new(Watched {
             running: Mutex::new(Some(running)),
-            pids: Mutex::new(vec![Vec::new(); taps.len()]),
+            tapped: Mutex::new(vec![None; taps.len()]),
             stop: AtomicBool::new(false),
         });
         let watcher = {
@@ -274,13 +273,13 @@ impl DeviceBus {
         })
     }
 
-    /// Claude: mixes the processes into the device at the route's volume from
-    /// now on, returning the slot that does it. While the processes play, it
-    /// returns once the bus has read the slot, so a tap that mutes them already
-    /// does when it returns.
+    /// Claude: mixes what `tapped` names into the device at the route's
+    /// volume from now on, returning the slot that does it. While those
+    /// processes play, it returns once the bus has read the slot, so a tap that
+    /// mutes them already does when it returns.
     pub fn attach(
         &mut self,
-        pids: &[u32],
+        tapped: Tapped,
         mode: TapMode,
         volume: Arc<AtomicU32>,
         meter: Arc<FlowMeter>,
@@ -289,11 +288,12 @@ impl DeviceBus {
         if lock(&self.watched.running).is_none() {
             self.restart()?;
         }
-        let slot = match self.free_slot() {
+        let device_uid = tapped.device_uid();
+        let slot = match self.free_slot(device_uid) {
             Some(slot) => slot,
             None => {
-                self.grow()?;
-                self.free_slot().expect("growing adds free slots")
+                self.grow(device_uid)?;
+                self.free_slot(device_uid).expect("growing adds a free slot")
             }
         };
         let gain = f32::from_bits(volume.load(Ordering::Relaxed));
@@ -310,29 +310,30 @@ impl DeviceBus {
             .mixes
             .insert(Box::new(mix))
             .map_err(|_| format!("a bus mixes at most {MAX_BUS_ROUTES} routes"))?;
-        if let Err(e) = self.taps[slot].retarget(pids, mode) {
+        if let Err(e) = self.taps[slot].retarget(&tapped, mode) {
             drop(self.state.mixes.remove(index));
             return Err(e);
         }
         self.attached[slot] = Some(index);
-        lock(&self.watched.pids)[slot] = pids.to_vec();
-        if pids.iter().any(|&pid| is_running_output(pid)) {
+        let playing = is_playing(&tapped);
+        lock(&self.watched.tapped)[slot] = Some(tapped);
+        if playing {
             cycles.wait(2, START_LIMIT);
         }
         Ok(slot)
     }
 
-    pub fn retarget(&self, slot: usize, pids: &[u32], mode: TapMode) -> Result<(), String> {
-        self.taps[slot].retarget(pids, mode)?;
-        lock(&self.watched.pids)[slot] = pids.to_vec();
+    pub fn retarget(&self, slot: usize, tapped: &Tapped, mode: TapMode) -> Result<(), String> {
+        self.taps[slot].retarget(tapped, mode)?;
+        lock(&self.watched.tapped)[slot] = Some(tapped.clone());
         Ok(())
     }
 
     pub fn detach(&mut self, slot: usize) {
-        if let Err(e) = self.taps[slot].retarget(&[], TapMode::Mirror) {
+        if let Err(e) = self.taps[slot].release() {
             tracing::warn!(device_uid = self.device_uid, slot, "{e}");
         }
-        lock(&self.watched.pids)[slot].clear();
+        lock(&self.watched.tapped)[slot] = None;
         if let Some(index) = self.attached[slot].take() {
             drop(self.state.mixes.remove(index));
         }
@@ -342,8 +343,13 @@ impl DeviceBus {
         self.attached.iter().all(Option::is_none)
     }
 
-    fn free_slot(&self) -> Option<usize> {
-        self.attached.iter().position(Option::is_none)
+    fn free_slot(&self, device_uid: Option<&str>) -> Option<usize> {
+        self.attached
+            .iter()
+            .zip(&self.taps)
+            .position(|(attached, tap)| {
+                attached.is_none() && tap.device_uid.as_deref() == device_uid
+            })
     }
 
     fn restart(&self) -> Result<(), String> {
@@ -358,19 +364,24 @@ impl DeviceBus {
     }
 
     /// Claude: adding taps interrupts the aggregate's IO anyway, so the bus
-    /// doubles its slots in one rebuild.
-    fn grow(&mut self) -> Result<(), String> {
-        let count = (self.taps.len() * 2).min(MAX_BUS_ROUTES);
+    /// doubles its slots for any device in one rebuild. A slot for one device
+    /// is added on its own.
+    fn grow(&mut self, device_uid: Option<&str>) -> Result<(), String> {
+        let count = match device_uid {
+            None => self.taps.len() * 2,
+            Some(_) => self.taps.len() + 1,
+        }
+        .min(MAX_BUS_ROUTES);
         if count == self.taps.len() {
             return Err(format!("a bus mixes at most {MAX_BUS_ROUTES} routes"));
         }
         let mut added = (self.taps.len()..count)
-            .map(|_| SlotTap::create())
+            .map(|_| SlotTap::create(device_uid))
             .collect::<Result<Vec<_>, _>>()?;
         *lock(&self.watched.running) = None;
         self.taps.append(&mut added);
         self.attached.resize(count, None);
-        lock(&self.watched.pids).resize(count, Vec::new());
+        lock(&self.watched.tapped).resize(count, None);
         self.restart()?;
         tracing::info!(
             device_uid = self.device_uid,
@@ -399,10 +410,7 @@ fn watch(watched: &Watched, device_uid: &str) {
         if watched.stop.load(Ordering::Relaxed) {
             return;
         }
-        let playing = lock(&watched.pids)
-            .iter()
-            .flatten()
-            .any(|&pid| is_running_output(pid));
+        let playing = lock(&watched.tapped).iter().flatten().any(is_playing);
         quiet = if playing { 0 } else { quiet + 1 };
         if quiet == QUIET_CHECKS
             && let Some(running) = lock(&watched.running).as_ref()
@@ -411,6 +419,39 @@ fn watch(watched: &Watched, device_uid: &str) {
             tracing::debug!(device_uid, "bus waits for an app to play");
         }
     }
+}
+
+/// Claude: whether any process `tapped` names plays now, to its device if it
+/// names one.
+pub fn is_playing(tapped: &Tapped) -> bool {
+    let Tapped::AllBut { except, device_uid } = tapped else {
+        return tapped.pids().iter().any(|&pid| is_running_output(pid));
+    };
+    let device = match device_uid {
+        Some(uid) => match audio::find_device_by_uid(uid) {
+            Some(device) => Some(device),
+            None => return false,
+        },
+        None => None,
+    };
+    let own = std::process::id();
+    let global = kAudioObjectPropertyScopeGlobal;
+    audio::object_list(kAudioObjectSystemObject, kAudioHardwarePropertyProcessObjectList, global)
+        .into_iter()
+        .filter(|&process| {
+            audio::get_u32(process, kAudioProcessPropertyPID, global)
+                .is_some_and(|pid| pid != own && !except.contains(&pid))
+        })
+        .filter(|&process| {
+            audio::get_u32(process, kAudioProcessPropertyIsRunningOutput, global)
+                .is_some_and(|running| running != 0)
+        })
+        .any(|process| {
+            device.is_none_or(|device| {
+                audio::object_list(process, kAudioProcessPropertyDevices, kAudioObjectPropertyScopeOutput)
+                    .contains(&device)
+            })
+        })
 }
 
 pub fn is_running_output(pid: u32) -> bool {

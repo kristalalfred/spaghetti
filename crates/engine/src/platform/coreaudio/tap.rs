@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::ffi::CString;
+use std::ffi::{CString, c_char};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -10,19 +10,22 @@ use coreaudio_sys::*;
 use spaghetti_common::ipc_protocol::{AppInfo, FlowStatus, TapMode};
 
 use crate::abl;
-use super::bus::is_running_output;
+use super::bus::is_playing;
 use crate::delivery::DeliverySpan;
 use crate::flow::{FlowMeter, Link};
 use crate::host_time;
 use crate::mixer::{Cycles, START_LIMIT};
 use crate::ring::{CHANNELS, Captured, Ring};
 use crate::sinks::{MAX_SINKS, Sinks, SourceTiming};
+use crate::spec::Tapped;
 
 unsafe extern "C" {
     unsafe fn spaghetti_create_tap(
         pids: *const i32,
         pid_count: u32,
         mute_behavior: i32,
+        exclusive: bool,
+        device_uid: *const c_char,
         out_tap_id: *mut AudioObjectID,
     ) -> i32;
 
@@ -34,6 +37,14 @@ unsafe extern "C" {
         pid_count: u32,
     ) -> i32;
 
+    unsafe fn spaghetti_retarget_tap(
+        tap_id: AudioObjectID,
+        pids: *const i32,
+        pid_count: u32,
+        mute_behavior: i32,
+        exclusive: bool,
+    ) -> i32;
+
     unsafe fn spaghetti_create_aggregate_for_tap(
         tap_id: AudioObjectID,
         aggregate_uid: *const i8,
@@ -41,6 +52,72 @@ unsafe extern "C" {
     ) -> i32;
 
     unsafe fn spaghetti_destroy_aggregate(aggregate_id: AudioObjectID) -> i32;
+}
+
+/// Claude: the processes a tap description names, and whether it captures
+/// every process but them. An all-but tap leaves this process out too, so it
+/// never captures what the engine itself plays.
+fn named_pids(tapped: &Tapped) -> (Vec<i32>, bool) {
+    let mut pids: Vec<i32> = tapped.pids().iter().map(|&pid| pid as i32).collect();
+    let exclusive = matches!(tapped, Tapped::AllBut { .. });
+    if exclusive {
+        pids.push(std::process::id() as i32);
+    }
+    (pids, exclusive)
+}
+
+fn mute_behavior(mode: TapMode) -> i32 {
+    i32::from(mode == TapMode::MuteSourceWhenTapped)
+}
+
+pub(super) fn create_tap(tapped: &Tapped, mode: TapMode) -> Result<AudioObjectID, String> {
+    let (pids, exclusive) = named_pids(tapped);
+    let device = tapped
+        .device_uid()
+        .map(CString::new)
+        .transpose()
+        .map_err(|e| format!("invalid device UID: {e}"))?;
+    let mut tap: AudioObjectID = 0;
+    let status = unsafe {
+        spaghetti_create_tap(
+            pids.as_ptr(),
+            pids.len() as u32,
+            mute_behavior(mode),
+            exclusive,
+            device.as_ref().map_or(std::ptr::null(), |uid| uid.as_ptr()),
+            &mut tap,
+        )
+    };
+    if status != 0 {
+        return Err(format!(
+            "AudioHardwareCreateProcessTap failed: OSStatus {status}"
+        ));
+    }
+    Ok(tap)
+}
+
+pub(super) fn destroy_tap(tap: AudioObjectID) -> i32 {
+    unsafe { spaghetti_destroy_tap(tap) }
+}
+
+/// Claude: points the tap at what `tapped` names without interrupting its
+/// aggregate. Core Audio keeps the device a tap was created for, so the
+/// device `tapped` names has to be that one.
+pub(super) fn retarget_tap(tap: AudioObjectID, tapped: &Tapped, mode: TapMode) -> Result<(), String> {
+    let (pids, exclusive) = named_pids(tapped);
+    let status = unsafe {
+        spaghetti_retarget_tap(
+            tap,
+            pids.as_ptr(),
+            pids.len() as u32,
+            mute_behavior(mode),
+            exclusive,
+        )
+    };
+    if status != 0 {
+        return Err(format!("retargeting a tap failed: OSStatus {status}"));
+    }
+    Ok(())
 }
 
 pub const AGGREGATE_UID_PREFIX: &str = "spaghetti_tap_agg_";
@@ -58,27 +135,15 @@ struct ProcessTap {
 }
 
 impl ProcessTap {
-    fn create(pids: &[u32], mode: TapMode, aggregate_uid: &str) -> Result<Self, String> {
-        let pids: Vec<i32> = pids.iter().map(|&pid| pid as i32).collect();
-        let mut tap: AudioObjectID = 0;
-        let mute_behavior = if mode == TapMode::MuteSourceWhenTapped { 1 } else { 0 };
-
-        let status = unsafe {
-            spaghetti_create_tap(pids.as_ptr(), pids.len() as u32, mute_behavior, &mut tap)
-        };
-        if status != 0 {
-            return Err(format!(
-                "AudioHardwareCreateProcessTap failed: OSStatus {status}"
-            ));
-        }
-
+    fn create(tapped: &Tapped, mode: TapMode, aggregate_uid: &str) -> Result<Self, String> {
+        let tap = create_tap(tapped, mode)?;
         let agg_uid_c = CString::new(aggregate_uid)
             .map_err(|e| format!("invalid aggregate UID: {e}"))?;
         let mut aggregate: AudioObjectID = 0;
         let status =
             unsafe { spaghetti_create_aggregate_for_tap(tap, agg_uid_c.as_ptr(), &mut aggregate) };
         if status != 0 {
-            unsafe { spaghetti_destroy_tap(tap) };
+            destroy_tap(tap);
             return Err(format!(
                 "AudioHardwareCreateAggregateDevice failed: OSStatus {status}"
             ));
@@ -93,7 +158,7 @@ impl Drop for ProcessTap {
         if status != 0 {
             tracing::warn!(status, "spaghetti_destroy_aggregate returned non-zero OSStatus");
         }
-        let status = unsafe { spaghetti_destroy_tap(self.tap) };
+        let status = destroy_tap(self.tap);
         if status != 0 {
             tracing::warn!(status, "spaghetti_destroy_tap returned non-zero OSStatus");
         }
@@ -175,11 +240,11 @@ struct Opened {
 }
 
 impl Opened {
-    fn open(source_id: u32, pids: &[u32], mode: TapMode) -> Result<Self, String> {
+    fn open(source_id: u32, tapped: &Tapped, mode: TapMode) -> Result<Self, String> {
         if let Some(clock) = super::audio::default_output_device() {
             super::microphone::before_opening(clock)?;
         }
-        let process_tap = ProcessTap::create(pids, mode, &aggregate_uid(source_id))?;
+        let process_tap = ProcessTap::create(tapped, mode, &aggregate_uid(source_id))?;
         let format = unsafe { query_device_stream_format(process_tap.aggregate) }?;
         tracing::info!(
             sample_rate = format.mSampleRate,
@@ -202,7 +267,7 @@ impl Opened {
                 format.mSampleRate, format.mFormatID, format.mFormatFlags, format.mBitsPerChannel
             ));
         }
-        tracing::info!(source_id, ?pids, "created process tap");
+        tracing::info!(source_id, ?tapped, "created process tap");
         Ok(Self {
             process_tap,
             sample_rate: format.mSampleRate,
@@ -218,18 +283,35 @@ pub struct TapSource {
     state: Arc<CaptureState>,
     opened: Option<Opened>,
     source_id: u32,
-    pids: Vec<u32>,
+    tapped: Tapped,
     mode: TapMode,
     pub label: String,
 }
 
 impl TapSource {
-    pub fn create(source_id: u32, pids: &[u32], mode: TapMode) -> Result<Self, String> {
-        let &first = pids.first().ok_or("a tap needs at least one process")?;
-        let known = audio_process_pids();
-        if let Some(pid) = pids.iter().find(|pid| !known.contains(pid)) {
-            return Err(format!("process {pid} is not known to Core Audio"));
-        }
+    pub fn create(source_id: u32, tapped: Tapped, mode: TapMode) -> Result<Self, String> {
+        let label = match &tapped {
+            Tapped::Processes(pids) => {
+                let &first = pids.first().ok_or("a tap needs at least one process")?;
+                let known = audio_process_pids();
+                if let Some(pid) = pids.iter().find(|pid| !known.contains(pid)) {
+                    return Err(format!("process {pid} is not known to Core Audio"));
+                }
+                app_label(first)
+            }
+            Tapped::AllBut {
+                device_uid: Some(uid),
+                ..
+            } => {
+                let device = super::audio::find_device_by_uid(uid)
+                    .ok_or_else(|| format!("device '{uid}' not found"))?;
+                let name = super::audio::device_name(device).unwrap_or_else(|| uid.clone());
+                format!("All apps on {name}")
+            }
+            Tapped::AllBut {
+                device_uid: None, ..
+            } => "All apps".to_string(),
+        };
         Ok(Self {
             capture: None,
             state: Arc::new(CaptureState {
@@ -242,15 +324,15 @@ impl TapSource {
             }),
             opened: None,
             source_id,
-            pids: pids.to_vec(),
+            tapped,
             mode,
-            label: app_label(first),
+            label,
         })
     }
 
     fn open(&mut self) -> Result<&Opened, String> {
         if self.opened.is_none() {
-            let opened = Opened::open(self.source_id, &self.pids, self.mode)?;
+            let opened = Opened::open(self.source_id, &self.tapped, self.mode)?;
             self.state
                 .sample_rate
                 .store(opened.sample_rate.to_bits(), Ordering::Relaxed);
@@ -272,11 +354,12 @@ impl TapSource {
         self.state.meter.status(link)
     }
 
-    /// Claude: replaces the processes the running tap mixes, without stopping
-    /// its capture, so an app's helpers can come and go.
+    /// Claude: replaces the processes the running tap names, without
+    /// stopping its capture, so an app's helpers can come and go.
     pub fn set_processes(&mut self, pids: &[u32]) -> Result<(), String> {
+        let tapped = self.tapped.with_pids(pids.to_vec());
         if let Some(opened) = &self.opened {
-            let raw: Vec<i32> = pids.iter().map(|&pid| pid as i32).collect();
+            let (raw, _) = named_pids(&tapped);
             let status = unsafe {
                 spaghetti_set_tap_processes(opened.process_tap.tap, raw.as_ptr(), raw.len() as u32)
             };
@@ -284,7 +367,7 @@ impl TapSource {
                 return Err(format!("set the tap's processes failed: OSStatus {status}"));
             }
         }
-        self.pids = pids.to_vec();
+        self.tapped = tapped;
         tracing::info!(label = self.label, ?pids, "updated tap processes");
         Ok(())
     }
@@ -305,7 +388,7 @@ impl TapSource {
             .insert(Box::new(ring))
             .map_err(|_| format!("a source can feed at most {MAX_SINKS} routes"))?;
         if self.capture.is_none() {
-            let playing = self.pids.iter().any(|&pid| is_running_output(pid));
+            let playing = is_playing(&self.tapped);
             match Capture::start(aggregate, Arc::clone(&self.state), playing) {
                 Ok(capture) => self.capture = Some(capture),
                 Err(e) => {
@@ -627,6 +710,17 @@ fn audio_process_pids() -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tap_of_all_processes_leaves_this_one_out_too() {
+        let own = std::process::id() as i32;
+        let all = Tapped::AllBut {
+            except: vec![7],
+            device_uid: None,
+        };
+        assert_eq!(named_pids(&all), (vec![7, own], true));
+        assert_eq!(named_pids(&Tapped::Processes(vec![7])), (vec![7], false));
+    }
 
     #[test]
     fn helpers_belong_to_the_outermost_app_bundle() {

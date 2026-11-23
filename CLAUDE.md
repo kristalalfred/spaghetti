@@ -46,7 +46,7 @@ target apps
   → destination device
 ```
 
-Changing an aggregate's tap list while it runs drops 20–35 ms of audio for every tap in it, but pointing a tap at other processes does not, so a bus keeps a fixed set of slot taps, points free ones at no process, and doubles them in one rebuild when full. Every tap costs `coreaudiod` CPU each cycle, empty or not. A started aggregate waits for a tapped app to play before it runs but keeps running after the apps stop, so the bus watcher restarts it once no slot's process has played for 3 s.
+Changing an aggregate's tap list while it runs drops 20–35 ms of audio for every tap in it, but pointing a tap at other processes does not, so a bus keeps a fixed set of slot taps, points free ones at no process, and doubles them in one rebuild when full. Core Audio fixes the device a tap listens to when it creates the tap and ignores later changes, so a route of a `TapAll` limited to one device gets a slot created for that device, added in a rebuild of its own when none is free. Every tap costs `coreaudiod` CPU each cycle, empty or not. A started aggregate waits for a tapped app to play before it runs but keeps running after the apps stop, so the bus watcher restarts it once no slot's process has played for 3 s.
 
 Every other route goes through a ring. Flow for a tap routed to SRT, WebRTC or a device on a delay:
 

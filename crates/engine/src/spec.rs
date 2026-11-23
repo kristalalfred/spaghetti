@@ -10,6 +10,13 @@ use spaghetti_common::ipc_protocol::{self as wire, FlowStatus, SrtSocket, TapMod
 pub enum SourceSpec {
     /// Claude: the audio of these processes, mixed to stereo.
     Tap { pids: Vec<u32>, mode: TapMode },
+    /// Claude: what every process but `except` and this one plays, mixed to
+    /// stereo: to the output device `device_uid` names, or to any device.
+    TapAll {
+        except: Vec<u32>,
+        device_uid: Option<String>,
+        mode: TapMode,
+    },
     /// Claude: AAC in MPEG-TS received over SRT, decoded to 48 kHz stereo.
     Srt(SrtSocket),
     /// Claude: Opus received from one WebRTC peer, decoded to 48 kHz stereo.
@@ -21,6 +28,65 @@ pub enum SourceSpec {
     /// is dated by when it reached the device, its input latency counted back
     /// from the device's time stamp, and counted by the device's frame count.
     Input { device_uid: String },
+}
+
+impl SourceSpec {
+    pub(crate) fn tap(&self) -> Option<(Tapped, TapMode)> {
+        match self {
+            Self::Tap { pids, mode } => Some((Tapped::Processes(pids.clone()), *mode)),
+            Self::TapAll {
+                except,
+                device_uid,
+                mode,
+            } => Some((
+                Tapped::AllBut {
+                    except: except.clone(),
+                    device_uid: device_uid.clone(),
+                },
+                *mode,
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// Claude: the processes a tap captures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Tapped {
+    Processes(Vec<u32>),
+    /// Claude: every process but these and this one, playing to the device
+    /// with this UID, or to any device.
+    AllBut {
+        except: Vec<u32>,
+        device_uid: Option<String>,
+    },
+}
+
+impl Tapped {
+    /// Claude: the processes it names: those it captures, or those it leaves
+    /// out.
+    pub(crate) fn pids(&self) -> &[u32] {
+        match self {
+            Self::Processes(pids) | Self::AllBut { except: pids, .. } => pids,
+        }
+    }
+
+    pub(crate) fn with_pids(&self, pids: Vec<u32>) -> Self {
+        match self {
+            Self::Processes(_) => Self::Processes(pids),
+            Self::AllBut { device_uid, .. } => Self::AllBut {
+                except: pids,
+                device_uid: device_uid.clone(),
+            },
+        }
+    }
+
+    pub(crate) fn device_uid(&self) -> Option<&str> {
+        match self {
+            Self::Processes(_) => None,
+            Self::AllBut { device_uid, .. } => device_uid.as_deref(),
+        }
+    }
 }
 
 /// Claude: where a route plays its source.
@@ -105,6 +171,15 @@ impl From<wire::SourceSpec> for SourceSpec {
     fn from(spec: wire::SourceSpec) -> Self {
         match spec {
             wire::SourceSpec::Tap { pids, mode } => Self::Tap { pids, mode },
+            wire::SourceSpec::TapAll {
+                except,
+                device_uid,
+                mode,
+            } => Self::TapAll {
+                except,
+                device_uid,
+                mode,
+            },
             wire::SourceSpec::Srt(socket) => Self::Srt(socket),
             wire::SourceSpec::WebRtc(peer) => Self::WebRtc(peer),
         }
@@ -157,6 +232,15 @@ impl TryFrom<SourceSpec> for wire::SourceSpec {
     fn try_from(spec: SourceSpec) -> Result<Self, InProcess> {
         match spec {
             SourceSpec::Tap { pids, mode } => Ok(Self::Tap { pids, mode }),
+            SourceSpec::TapAll {
+                except,
+                device_uid,
+                mode,
+            } => Ok(Self::TapAll {
+                except,
+                device_uid,
+                mode,
+            }),
             SourceSpec::Srt(socket) => Ok(Self::Srt(socket)),
             SourceSpec::WebRtc(peer) => Ok(Self::WebRtc(peer)),
             SourceSpec::Program { input } => Err(InProcess(format!("program input '{input}'"))),
@@ -259,6 +343,16 @@ mod tests {
                 pids: vec![1, 2],
                 mode: TapMode::Mirror,
             },
+            wire::SourceSpec::TapAll {
+                except: vec![3],
+                device_uid: Some("d".into()),
+                mode: TapMode::MuteSourceWhenTapped,
+            },
+            wire::SourceSpec::TapAll {
+                except: Vec::new(),
+                device_uid: None,
+                mode: TapMode::Mirror,
+            },
             wire::SourceSpec::Srt(srt()),
             wire::SourceSpec::WebRtc(peer.clone()),
         ];
@@ -290,6 +384,26 @@ mod tests {
                 Destination::from(destination.clone()).try_into().unwrap();
             assert_eq!(back, destination);
         }
+    }
+
+    #[test]
+    fn replacing_the_processes_an_all_but_tap_names_keeps_its_device() {
+        let (tapped, mode) = SourceSpec::TapAll {
+            except: vec![1],
+            device_uid: Some("d".into()),
+            mode: TapMode::Mirror,
+        }
+        .tap()
+        .unwrap();
+        assert_eq!(mode, TapMode::Mirror);
+        assert_eq!(
+            tapped.with_pids(vec![2, 3]),
+            Tapped::AllBut {
+                except: vec![2, 3],
+                device_uid: Some("d".into()),
+            }
+        );
+        assert_eq!(Tapped::Processes(vec![1]).with_pids(vec![2]).pids(), [2]);
     }
 
     #[test]

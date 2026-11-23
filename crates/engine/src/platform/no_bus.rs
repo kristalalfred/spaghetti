@@ -9,6 +9,7 @@ use spaghetti_common::ipc_protocol::TapMode;
 
 use crate::flow::FlowMeter;
 use crate::mixer::Cycles;
+use crate::spec::Tapped;
 
 pub const DIRECT: bool = false;
 
@@ -21,7 +22,7 @@ impl DeviceBus {
 
     pub fn attach(
         &mut self,
-        _pids: &[u32],
+        _tapped: Tapped,
         _mode: TapMode,
         _volume: Arc<AtomicU32>,
         _meter: Arc<FlowMeter>,
@@ -30,7 +31,7 @@ impl DeviceBus {
         match self.0 {}
     }
 
-    pub fn retarget(&self, _slot: usize, _pids: &[u32], _mode: TapMode) -> Result<(), String> {
+    pub fn retarget(&self, _slot: usize, _tapped: &Tapped, _mode: TapMode) -> Result<(), String> {
         match self.0 {}
     }
 

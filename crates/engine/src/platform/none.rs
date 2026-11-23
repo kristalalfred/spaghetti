@@ -23,6 +23,7 @@ pub mod tap {
 
     use crate::ring::Ring;
     use crate::sinks::SourceTiming;
+    use crate::spec::Tapped;
 
     pub struct TapSource {
         pub label: String,
@@ -30,7 +31,7 @@ pub mod tap {
     }
 
     impl TapSource {
-        pub fn create(_source_id: u32, _pids: &[u32], _mode: TapMode) -> Result<Self, String> {
+        pub fn create(_source_id: u32, _tapped: Tapped, _mode: TapMode) -> Result<Self, String> {
             Err("process taps need macOS".into())
         }
 
