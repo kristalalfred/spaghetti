@@ -183,6 +183,8 @@ mod tests {
             channels: 2,
             sample_rate: 48_000,
             volume: Volume::Reported,
+            input_from: None,
+            hidden: false,
         };
         DeviceInstance::new(100, 101, 102, 103, 104, &entry, 16)
     }

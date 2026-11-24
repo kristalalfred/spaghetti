@@ -927,8 +927,11 @@ fn get_device_property(
             let running = u32::from(instance.io_running_count.load(Ordering::SeqCst) > 0);
             pw.write_u32(running)
         }
-        x if x == kAudioDevicePropertyDeviceCanBeDefaultDevice => pw.write_u32(1),
-        x if x == kAudioDevicePropertyDeviceCanBeDefaultSystemDevice => pw.write_u32(1),
+        x if x == kAudioDevicePropertyDeviceCanBeDefaultDevice
+            || x == kAudioDevicePropertyDeviceCanBeDefaultSystemDevice =>
+        {
+            pw.write_u32(u32::from(!instance.hidden))
+        }
         x if x == kAudioDevicePropertyLatency => pw.write_u32(0),
         x if x == kAudioDevicePropertyStreams => match scope {
             s if s == kAudioObjectPropertyScopeInput => {
@@ -960,8 +963,7 @@ fn get_device_property(
         }
         x if x == kAudioDevicePropertySafetyOffset => pw.write_u32(0),
         x if x == kAudioDevicePropertyIcon => kAudioHardwareUnknownPropertyError as OSStatus,
-        // Not hidden — coreaudiod queries this directly without checking has_property.
-        x if x == K_AUDIO_DEVICE_PROPERTY_IS_HIDDEN => pw.write_u32(0),
+        x if x == K_AUDIO_DEVICE_PROPERTY_IS_HIDDEN => pw.write_u32(u32::from(instance.hidden)),
         // Volume + mute controls.
         x if x == K_AUDIO_DEVICE_PROPERTY_CONTROL_LIST => {
             pw.write_u32_slice(&[instance.volume_id, instance.mute_id])
@@ -1272,6 +1274,8 @@ pub unsafe extern "C" fn start_io(
             .store(ticks_per_frame.to_bits(), Ordering::SeqCst);
 
         instance.timestamp_count.store(0, Ordering::SeqCst);
+        instance.written_from.store(u64::MAX, Ordering::SeqCst);
+        instance.written_end.store(0, Ordering::SeqCst);
         instance
             .anchor_host_time
             .store(unsafe { mach_absolute_time() }, Ordering::SeqCst);
@@ -1439,6 +1443,12 @@ pub unsafe extern "C" fn do_io_operation(
                 }
                 instance.ring_buffer[ring_idx].store(scaled.to_bits(), Ordering::Relaxed);
             }
+            instance
+                .written_from
+                .fetch_min(sample_time as u64, Ordering::SeqCst);
+            instance
+                .written_end
+                .fetch_max((sample_time + frame_count) as u64, Ordering::SeqCst);
 
             if reports_activity {
                 let activity = ACTIVITY_PTR.load(Ordering::Acquire);
@@ -1457,6 +1467,14 @@ pub unsafe extern "C" fn do_io_operation(
                 }
             }
         }
+        x if x == kAudioServerPlugInIOOperationReadInput && instance.input_from.is_some() => {
+            let output = unsafe { std::slice::from_raw_parts_mut(buf, sample_count) };
+            let sample_time = unsafe { (*io_cycle_info).mInputTime.mSampleTime };
+            match reg.input_source(instance) {
+                Some(source) => read_output_of(source, instance, sample_time, output),
+                None => output.fill(0.0),
+            }
+        }
         x if x == kAudioServerPlugInIOOperationReadInput => {
             let sample_time = unsafe { (*io_cycle_info).mInputTime.mSampleTime } as usize;
             let offset = (sample_time % ring_frames) * channels;
@@ -1471,6 +1489,48 @@ pub unsafe extern "C" fn do_io_operation(
     }
 
     kAudioHardwareNoError as OSStatus
+}
+
+/// Claude: fills `output` with what `source` played at the host time of
+/// `reader`'s `sample_time`, and silence where it played nothing since its IO
+/// started or the ring no longer holds it. Both devices count frames from
+/// their own IO start at the same nominal rate on the host clock, so a
+/// frame's place in one maps onto the other by the difference of their
+/// anchors.
+fn read_output_of(
+    source: &DeviceInstance,
+    reader: &DeviceInstance,
+    sample_time: f64,
+    output: &mut [f32],
+) {
+    let ticks_per_frame = f64::from_bits(source.host_ticks_per_frame.load(Ordering::SeqCst));
+    if source.io_running_count.load(Ordering::SeqCst) == 0 || ticks_per_frame <= 0.0 {
+        output.fill(0.0);
+        return;
+    }
+    let source_anchor = source.anchor_host_time.load(Ordering::SeqCst);
+    let written_from = source
+        .written_from
+        .load(Ordering::SeqCst)
+        .min(i64::MAX as u64) as i64;
+    let written_end = source.written_end.load(Ordering::SeqCst) as i64;
+    let reader_anchor = reader.anchor_host_time.load(Ordering::SeqCst);
+    let offset = ((reader_anchor as f64 - source_anchor as f64) / ticks_per_frame).round() as i64;
+    let first = sample_time as i64 + offset;
+    let channels = source.channels as usize;
+    let ring_frames = source.ring_frames as i64;
+    let held = (written_end - ring_frames).max(written_from)..written_end;
+    for (index, frame) in output.chunks_exact_mut(channels).enumerate() {
+        let time = first + index as i64;
+        if !held.contains(&time) {
+            frame.fill(0.0);
+            continue;
+        }
+        let at = (time % ring_frames) as usize * channels;
+        for (channel, sample) in frame.iter_mut().enumerate() {
+            *sample = f32::from_bits(source.ring_buffer[at + channel].load(Ordering::Relaxed));
+        }
+    }
 }
 
 pub unsafe extern "C" fn end_io_operation(
@@ -1496,6 +1556,8 @@ mod tests {
             channels: 2,
             sample_rate: 48_000,
             volume,
+            input_from: None,
+            hidden: false,
         }
     }
 
@@ -1538,6 +1600,71 @@ mod tests {
         assert_eq!(loop_back(Volume::Applied, true, &samples), [0.0; 4]);
         assert_eq!(loop_back(Volume::Reported, false, &samples), samples);
         assert_eq!(loop_back(Volume::Reported, true, &samples), samples);
+    }
+
+    /// Claude: a device that played `frames` stereo frames from its sample
+    /// time 1000, after stale audio, started 100 frames before the device
+    /// reading it.
+    fn played(frames: &[[f32; 2]]) -> (DeviceInstance, DeviceInstance) {
+        let playing = entry("source", Volume::Applied);
+        let source = DeviceInstance::new(100, 101, 102, 103, 104, &playing, 1024);
+        let mut reading = entry("reader", Volume::Applied);
+        reading.input_from = Some("source".into());
+        let reader = DeviceInstance::new(105, 106, 107, 108, 109, &reading, 1024);
+        let ticks_per_frame = 2.5f64;
+        for device in [&source, &reader] {
+            device.io_running_count.store(1, Ordering::SeqCst);
+            device
+                .host_ticks_per_frame
+                .store(ticks_per_frame.to_bits(), Ordering::SeqCst);
+        }
+        source.anchor_host_time.store(10_000, Ordering::SeqCst);
+        reader.anchor_host_time.store(10_250, Ordering::SeqCst);
+        source.ring_buffer[999 * 2].store(0.7f32.to_bits(), Ordering::Relaxed);
+        for (index, frame) in frames.iter().enumerate() {
+            for (channel, sample) in frame.iter().enumerate() {
+                source.ring_buffer[(1000 + index) * 2 + channel]
+                    .store(sample.to_bits(), Ordering::Relaxed);
+            }
+        }
+        source.written_from.store(1000, Ordering::SeqCst);
+        source
+            .written_end
+            .store(1000 + frames.len() as u64, Ordering::SeqCst);
+        (source, reader)
+    }
+
+    fn read(
+        source: &DeviceInstance,
+        reader: &DeviceInstance,
+        time: f64,
+        frames: usize,
+    ) -> Vec<f32> {
+        let mut output = vec![9.0; frames * 2];
+        read_output_of(source, reader, time, &mut output);
+        output
+    }
+
+    #[test]
+    fn an_input_plays_another_devices_output_at_the_same_host_time() {
+        let (source, reader) = played(&[[0.1, -0.1], [0.2, -0.2]]);
+        assert_eq!(read(&source, &reader, 900.0, 2), [0.1, -0.1, 0.2, -0.2]);
+        assert_eq!(
+            read(&source, &reader, 899.0, 4),
+            [0.0, 0.0, 0.1, -0.1, 0.2, -0.2, 0.0, 0.0],
+            "frames before the first write since IO started and after the last are silent"
+        );
+    }
+
+    #[test]
+    fn an_input_is_silent_where_the_ring_was_overwritten_or_the_other_device_stopped() {
+        let (source, reader) = played(&[[0.5, 0.5]]);
+        source.written_end.store(1001 + 1024, Ordering::SeqCst);
+        assert_eq!(read(&source, &reader, 900.0, 1), [0.0, 0.0]);
+
+        let (source, reader) = played(&[[0.5, 0.5]]);
+        source.io_running_count.store(0, Ordering::SeqCst);
+        assert_eq!(read(&source, &reader, 900.0, 1), [0.0, 0.0]);
     }
 
     #[test]

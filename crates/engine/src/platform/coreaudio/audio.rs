@@ -10,16 +10,31 @@ use std::ptr;
 
 pub type DeviceId = AudioObjectID;
 
-/// Find a CoreAudio device by its UID string.
+/// Claude: finds a Core Audio device by its UID, a hidden one included,
+/// which the system's device list leaves out.
 pub fn find_device_by_uid(target_uid: &str) -> Option<AudioObjectID> {
     #[cfg(test)]
     crate::device_lookup::looking_up(target_uid);
-    let device_ids = get_all_devices()?;
-
-    device_ids
-        .iter()
-        .find(|&&id| get_device_uid(id).as_deref() == Some(target_uid))
-        .copied()
+    let uid = CFString::new(target_uid);
+    let uid_ref = uid.as_concrete_TypeRef();
+    let address = AudioObjectPropertyAddress {
+        mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut device: AudioObjectID = kAudioObjectUnknown;
+    let mut size = mem::size_of::<AudioObjectID>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            kAudioObjectSystemObject,
+            &address,
+            mem::size_of::<CFStringRef>() as u32,
+            (&uid_ref as *const CFStringRef).cast(),
+            &mut size,
+            (&mut device as *mut AudioObjectID).cast(),
+        )
+    };
+    (status == 0 && device != kAudioObjectUnknown).then_some(device)
 }
 
 /// Claude: the UID of the input device the system records from by default.

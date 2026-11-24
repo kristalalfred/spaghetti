@@ -44,6 +44,15 @@ pub struct DeviceConfigEntry {
     /// What the device's volume and mute controls do to its audio.
     #[serde(default)]
     pub volume: Volume,
+    /// Claude: the UID of a device whose output this device's input plays,
+    /// in place of its own. That device must have the same channels and
+    /// sample rate, or the input is silent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_from: Option<String>,
+    /// Claude: hidden from device lists and from being the default device;
+    /// a program still opens it by its UID.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
 }
 
 /// What a virtual device's volume and mute controls do to the audio written

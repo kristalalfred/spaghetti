@@ -1,5 +1,6 @@
 //! Claude: a Core Audio AudioServerPlugIn driver that publishes virtual
-//! loopback devices: what a device plays comes back on its input.
+//! loopback devices: what a device plays comes back on its input, or on the
+//! input of another device that names it as its `input_from`.
 //!
 //! A driver bundle is a `cdylib` that describes itself with a [`Plugin`] and
 //! exports the factory function its `Info.plist` names, which hands over to
@@ -64,6 +65,13 @@ pub struct Device {
     pub channels: u32,
     pub sample_rate: u32,
     pub volume: Volume,
+    /// Claude: the UID of a device of this plugin whose output this device's
+    /// input plays, in place of its own. That device must have the same
+    /// channels and sample rate, or the input is silent.
+    pub input_from: Option<&'static str>,
+    /// Claude: hidden from device lists and from being the default device;
+    /// a program still opens it by its UID.
+    pub hidden: bool,
 }
 
 /// Claude: reports how much a device plays, and how loud, in a POSIX shared

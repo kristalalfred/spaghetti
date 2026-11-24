@@ -135,6 +135,8 @@ impl DeviceManager {
             channels,
             sample_rate: DEFAULT_SAMPLE_RATE,
             volume,
+            input_from: None,
+            hidden: false,
         };
 
         {
@@ -304,6 +306,8 @@ fn default_entry() -> DeviceConfigEntry {
         channels: DEFAULT_CHANNELS,
         sample_rate: DEFAULT_SAMPLE_RATE,
         volume: Volume::Applied,
+        input_from: None,
+        hidden: false,
     }
 }
 
@@ -481,6 +485,8 @@ mod tests {
             channels: 2,
             sample_rate: 48000,
             volume: Volume::Applied,
+            input_from: None,
+            hidden: false,
         };
         {
             let mut cfg = mgr.write_lock();

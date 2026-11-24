@@ -53,6 +53,10 @@ pub struct DeviceInstance {
     pub uid: String,
     /// Human-readable name (e.g. `"Spaghetti"`).
     pub name: String,
+    /// Claude: the UID of the device whose output this device's input plays;
+    /// `None` for its own.
+    pub input_from: Option<String>,
+    pub hidden: bool,
 
     // ---- format -----------------------------------------------------------
     /// Channels per frame.
@@ -83,6 +87,11 @@ pub struct DeviceInstance {
     pub timestamp_count: AtomicU64,
     /// `mach_absolute_time()` captured when IO last transitioned 0 → 1.
     pub anchor_host_time: AtomicU64,
+    /// Claude: the sample times of the first frame written to the ring since
+    /// IO last started, `u64::MAX` before the first write, and of the frame
+    /// just past the last.
+    pub written_from: AtomicU64,
+    pub written_end: AtomicU64,
     /// Mach host ticks per audio frame at this device's sample rate, stored as
     /// `f64::to_bits`. Computed once in `start_io`; zero means uninitialized.
     /// Per-device so devices with different sample rates each get the right
@@ -115,6 +124,8 @@ impl DeviceInstance {
             mute_id,
             uid: entry.uid.clone(),
             name: entry.name.clone(),
+            input_from: entry.input_from.clone(),
+            hidden: entry.hidden,
             channels,
             sample_rate: f64::from(entry.sample_rate),
             ring_buffer: buf.into_boxed_slice(),
@@ -125,6 +136,8 @@ impl DeviceInstance {
             io_running_count: AtomicU32::new(0),
             timestamp_count: AtomicU64::new(0),
             anchor_host_time: AtomicU64::new(0),
+            written_from: AtomicU64::new(u64::MAX),
+            written_end: AtomicU64::new(0),
             host_ticks_per_frame: AtomicU64::new(0),
         }
     }
@@ -160,6 +173,8 @@ mod tests {
             channels,
             sample_rate,
             volume: Volume::Applied,
+            input_from: None,
+            hidden: false,
         };
         DeviceInstance::new(100, 101, 102, 103, 104, &entry, ring_frames)
     }

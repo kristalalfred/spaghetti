@@ -45,6 +45,9 @@ pub struct DeviceRegistry {
     pub by_object_role: HashMap<u32, (u32, DeviceRole)>,
     /// UID string → device-ID for `TranslateUIDToDevice`.
     pub by_uid: HashMap<String, u32>,
+    /// Claude: device-ID → the device-ID whose output its input plays, for
+    /// each device with an `input_from` that names a device it can play.
+    pub inputs: HashMap<u32, u32>,
     /// Next object ID to hand out. Monotonic across swaps.
     pub next_id: u32,
 }
@@ -56,6 +59,7 @@ impl DeviceRegistry {
             by_id: HashMap::new(),
             by_object_role: HashMap::new(),
             by_uid: HashMap::new(),
+            inputs: HashMap::new(),
             next_id: FIRST_OBJECT_ID,
         }
     }
@@ -150,6 +154,40 @@ impl DeviceRegistry {
         let device_id = self.by_uid.get(uid)?;
         self.by_id.get(device_id)
     }
+
+    /// Claude: the device whose output `device`'s input plays, when it plays
+    /// another's.
+    pub fn input_source(&self, device: &DeviceInstance) -> Option<&Arc<DeviceInstance>> {
+        self.by_id.get(self.inputs.get(&device.device_id)?)
+    }
+
+    /// Claude: resolves each device's `input_from`. One naming a device that
+    /// is missing or has another format gets none, so its input is silent.
+    fn link_inputs(&mut self) {
+        let mut inputs = HashMap::new();
+        for device in self.by_id.values() {
+            let Some(uid) = &device.input_from else {
+                continue;
+            };
+            match self.device(uid) {
+                Some(source)
+                    if source.channels == device.channels
+                        && source.sample_rate == device.sample_rate =>
+                {
+                    inputs.insert(device.device_id, source.device_id);
+                }
+                Some(_) => log(&format!(
+                    "{}: its input is silent, since {uid} has another format",
+                    device.uid
+                )),
+                None => log(&format!(
+                    "{}: its input is silent, since there is no {uid}",
+                    device.uid
+                )),
+            }
+        }
+        self.inputs = inputs;
+    }
 }
 
 /// Singleton registry. Initialized to an empty registry at load time and
@@ -178,6 +216,8 @@ pub fn builtin_entries() -> Vec<DeviceConfigEntry> {
             channels: device.channels,
             sample_rate: device.sample_rate,
             volume: device.volume,
+            input_from: device.input_from.map(str::to_string),
+            hidden: device.hidden,
         })
         .collect()
 }
@@ -203,6 +243,7 @@ pub fn rebuild_from_entries(
     for entry in builtin.iter().chain(entries) {
         add_entry(&mut reg, previous, entry);
     }
+    reg.link_inputs();
 
     reg
 }
@@ -249,6 +290,8 @@ mod tests {
             channels: 2,
             sample_rate: 48_000,
             volume: Volume::Applied,
+            input_from: None,
+            hidden: false,
         }
     }
 
@@ -304,6 +347,31 @@ mod tests {
         assert!(!second.by_uid.contains_key("b"));
         assert!(second.by_uid["c"] > first.by_uid["b"]);
         assert!(second.resolve(first.by_uid["b"] + 2).is_none());
+    }
+
+    #[test]
+    fn an_input_plays_the_device_it_names_when_their_formats_match() {
+        let mut listening = entry("listening");
+        listening.input_from = Some("played".into());
+        let mut mono = entry("mono");
+        mono.channels = 1;
+        let mut mismatched = entry("mismatched");
+        mismatched.input_from = Some("mono".into());
+        let mut dangling = entry("dangling");
+        dangling.input_from = Some("missing".into());
+        let reg = rebuild(
+            &DeviceRegistry::empty(),
+            &[listening, entry("played"), mono, mismatched, dangling],
+        );
+
+        let source = |uid: &str| {
+            reg.input_source(reg.device(uid).unwrap())
+                .map(|source| source.uid.as_str())
+        };
+        assert_eq!(source("listening"), Some("played"));
+        assert_eq!(source("played"), None);
+        assert_eq!(source("mismatched"), None);
+        assert_eq!(source("dangling"), None);
     }
 
     #[test]

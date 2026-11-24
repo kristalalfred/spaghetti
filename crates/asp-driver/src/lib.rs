@@ -22,6 +22,8 @@ static PLUGIN: Plugin = Plugin {
         channels: CHANNELS,
         sample_rate: SAMPLE_RATE as u32,
         volume: Volume::Applied,
+        input_from: None,
+        hidden: false,
     }],
     config_paths: &[DEVICE_CONFIG_PATH, FALLBACK_DEVICE_CONFIG_PATH],
     activity: Some(Activity {
