@@ -27,6 +27,7 @@ mod devices;
 pub(crate) mod driver;
 mod iface;
 pub(crate) mod registry;
+mod settle;
 mod storage;
 #[cfg(test)]
 mod test_host;

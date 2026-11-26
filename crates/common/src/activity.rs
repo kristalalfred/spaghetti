@@ -30,8 +30,12 @@ pub struct ActivityRegion {
     pub volume_bits: AtomicU32,
     /// Claude: `1` while the device is muted, written as soon as it is set.
     pub muted: AtomicU32,
+    /// Claude: counts changes of the volume and mute. The driver raises it
+    /// after writing them and wakes every process waiting on its address
+    /// (`os_sync_wait_on_address`, shared).
+    pub level_changes: AtomicU32,
     /// Reserved padding — keeps the struct at 64 bytes for future fields.
-    pub _pad: [u8; 32],
+    pub _pad: [u8; 28],
 }
 
 impl ActivityRegion {
@@ -44,8 +48,91 @@ impl ActivityRegion {
             io_running: AtomicU32::new(0),
             volume_bits: AtomicU32::new(0x3f80_0000),
             muted: AtomicU32::new(0),
-            _pad: [0; 32],
+            level_changes: AtomicU32::new(0),
+            _pad: [0; 28],
         }
+    }
+}
+
+/// Claude: raising and waiting on `level_changes` across processes. The wait
+/// and wake calls arrived in macOS 14.4, so they are looked up when first used;
+/// without them a wait polls.
+#[cfg(target_os = "macos")]
+impl ActivityRegion {
+    /// Counts a volume or mute change, written before this, and wakes every
+    /// process waiting for one.
+    pub fn count_level_change(&self) {
+        use std::sync::atomic::Ordering;
+        self.level_changes.fetch_add(1, Ordering::Release);
+        if let Some(wake) = sync::wake() {
+            unsafe { wake(self.level_changes_address(), 4, sync::SHARED) };
+        }
+    }
+
+    /// Blocks until `level_changes` moves past `seen`, or `timeout` passes,
+    /// and returns it then.
+    pub fn wait_for_level_change(&self, seen: u32, timeout: std::time::Duration) -> u32 {
+        use std::sync::atomic::Ordering;
+        if self.level_changes.load(Ordering::Acquire) == seen {
+            match sync::wait() {
+                Some(wait) => {
+                    let timeout_ns = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX).max(1);
+                    unsafe {
+                        wait(
+                            self.level_changes_address(),
+                            u64::from(seen),
+                            4,
+                            sync::SHARED,
+                            sync::MACH_ABSOLUTE_TIME,
+                            timeout_ns,
+                        )
+                    };
+                }
+                None => std::thread::sleep(timeout.min(sync::POLL)),
+            }
+        }
+        self.level_changes.load(Ordering::Acquire)
+    }
+
+    fn level_changes_address(&self) -> *mut std::ffi::c_void {
+        std::ptr::from_ref(&self.level_changes).cast_mut().cast()
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod sync {
+    use std::ffi::{c_char, c_void};
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    pub const SHARED: u32 = 1;
+    pub const MACH_ABSOLUTE_TIME: u32 = 32;
+    pub const POLL: Duration = Duration::from_millis(5);
+
+    pub type Wait = unsafe extern "C" fn(*mut c_void, u64, usize, u32, u32, u64) -> i32;
+    pub type Wake = unsafe extern "C" fn(*mut c_void, usize, u32) -> i32;
+
+    const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
+
+    unsafe extern "C" {
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+
+    fn lookup(symbol: &std::ffi::CStr) -> Option<usize> {
+        let address = unsafe { dlsym(RTLD_DEFAULT, symbol.as_ptr()) };
+        (!address.is_null()).then_some(address as usize)
+    }
+
+    pub fn wait() -> Option<Wait> {
+        static WAIT: OnceLock<Option<usize>> = OnceLock::new();
+        let address = (*WAIT.get_or_init(|| lookup(c"os_sync_wait_on_address_with_timeout")))?;
+        Some(unsafe { std::mem::transmute::<usize, Wait>(address) })
+    }
+
+    pub fn wake() -> Option<Wake> {
+        static WAKE: OnceLock<Option<usize>> = OnceLock::new();
+        let address = (*WAKE.get_or_init(|| lookup(c"os_sync_wake_by_address_all")))?;
+        Some(unsafe { std::mem::transmute::<usize, Wake>(address) })
     }
 }
 

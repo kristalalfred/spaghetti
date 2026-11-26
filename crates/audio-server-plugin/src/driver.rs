@@ -420,6 +420,7 @@ pub(crate) fn publish_level(instance: &DeviceInstance) {
     region
         .muted
         .store(instance.mute.load(Ordering::Relaxed), Ordering::Relaxed);
+    region.count_level_change();
 }
 
 pub unsafe extern "C" fn create_device(
@@ -1194,6 +1195,10 @@ fn set_volume(instance: &DeviceInstance, scalar: f32, control_id: u32) {
     }
     publish_level(instance);
     crate::storage::save(instance);
+    crate::settle::report_level_change(control_id);
+}
+
+pub(crate) fn report_level_changed(control_id: u32) {
     notify_host_properties_changed(
         control_id,
         &[
@@ -1640,7 +1645,7 @@ mod tests {
     }
 
     #[test]
-    fn a_volume_or_mute_change_is_reported_once_and_a_set_that_keeps_it_not_at_all() {
+    fn volume_changes_are_reported_once_they_settle_and_mute_changes_at_once() {
         crate::test_host::install();
         let mut reg = registry::DeviceRegistry::empty();
         let device_id = reg.insert_device(&entry("reported", Volume::Reported), 16);
@@ -1662,8 +1667,15 @@ mod tests {
         set(kAudioLevelControlPropertyScalarValue, volume, 0.5f32.to_ne_bytes());
         set(kAudioLevelControlPropertyScalarValue, volume, 0.5f32.to_ne_bytes());
         set(kAudioLevelControlPropertyDecibelValue, volume, 0.0f32.to_ne_bytes());
-        assert_eq!(crate::test_host::changes(volume), [level.clone(), level]);
         assert_eq!(f32::from_bits(instance.volume.load(Ordering::Relaxed)), 1.0);
+        assert!(crate::test_host::changes(volume).is_empty());
+        let started = std::time::Instant::now();
+        while crate::test_host::changes(volume).is_empty() {
+            assert!(started.elapsed().as_secs() < 2, "the volume change was never reported");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(crate::test_host::changes(volume), [level]);
 
         set(kAudioBooleanControlPropertyValue, mute, 1u32.to_ne_bytes());
         set(kAudioBooleanControlPropertyValue, mute, 7u32.to_ne_bytes());
@@ -1712,6 +1724,7 @@ mod tests {
             0.25
         );
         assert_eq!(region.muted.load(Ordering::Relaxed), 1);
+        assert_eq!(region.level_changes.load(Ordering::Relaxed), 2);
     }
 
     #[test]
