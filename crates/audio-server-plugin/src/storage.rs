@@ -103,78 +103,9 @@ unsafe fn read(host: *mut AudioServerPlugInHostInterface, key: &str) -> Option<f
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::{LazyLock, Mutex};
-
-    use core_foundation_sys::base::CFRetain;
-    use core_foundation_sys::string::{CFStringGetCString, kCFStringEncodingUTF8};
-    use coreaudio_sys::{
-        AudioObjectID, AudioObjectPropertyAddress, AudioServerPlugInHostRef, CFPropertyListRef,
-        CFStringRef, OSStatus,
-    };
     use spaghetti_common::device_config::{DeviceConfigEntry, Volume};
 
     use super::*;
-
-    struct Stored(*const c_void);
-    unsafe impl Send for Stored {}
-
-    static STORAGE: LazyLock<Mutex<HashMap<String, Stored>>> = LazyLock::new(Default::default);
-
-    fn key_string(key: CFStringRef) -> String {
-        let mut buffer = [0i8; 256];
-        unsafe { CFStringGetCString(key.cast(), buffer.as_mut_ptr(), 256, kCFStringEncodingUTF8) };
-        unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) }
-            .to_string_lossy()
-            .into_owned()
-    }
-
-    unsafe extern "C" fn write(
-        _host: AudioServerPlugInHostRef,
-        key: CFStringRef,
-        data: CFPropertyListRef,
-    ) -> OSStatus {
-        unsafe { CFRetain(data) };
-        STORAGE
-            .lock()
-            .unwrap()
-            .insert(key_string(key), Stored(data));
-        0
-    }
-
-    unsafe extern "C" fn copy(
-        _host: AudioServerPlugInHostRef,
-        key: CFStringRef,
-        out: *mut CFPropertyListRef,
-    ) -> OSStatus {
-        match STORAGE.lock().unwrap().get(&key_string(key)) {
-            Some(stored) => {
-                unsafe {
-                    CFRetain(stored.0);
-                    *out = stored.0;
-                }
-                0
-            }
-            None => 1,
-        }
-    }
-
-    unsafe extern "C" fn changed(
-        _host: AudioServerPlugInHostRef,
-        _object: AudioObjectID,
-        _count: u32,
-        _addresses: *const AudioObjectPropertyAddress,
-    ) -> OSStatus {
-        0
-    }
-
-    static HOST: AudioServerPlugInHostInterface = AudioServerPlugInHostInterface {
-        PropertiesChanged: Some(changed),
-        CopyFromStorage: Some(copy),
-        WriteToStorage: Some(write),
-        DeleteFromStorage: None,
-        RequestDeviceConfigurationChange: None,
-    };
 
     fn instance(uid: &str) -> DeviceInstance {
         let entry = DeviceConfigEntry {
@@ -191,10 +122,7 @@ mod tests {
 
     #[test]
     fn a_device_comes_back_with_its_stored_volume_and_mute() {
-        DRIVER.host.store(
-            (&HOST as *const AudioServerPlugInHostInterface).cast_mut(),
-            Ordering::SeqCst,
-        );
+        crate::test_host::install();
         let before = instance("kept");
         before.volume.store(0.3f32.to_bits(), Ordering::Relaxed);
         before.mute.store(1, Ordering::Relaxed);

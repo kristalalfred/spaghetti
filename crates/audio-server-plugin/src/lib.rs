@@ -28,6 +28,8 @@ pub(crate) mod driver;
 mod iface;
 pub(crate) mod registry;
 mod storage;
+#[cfg(test)]
+mod test_host;
 mod watcher;
 
 use std::ffi::c_void;

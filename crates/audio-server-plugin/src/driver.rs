@@ -1145,13 +1145,8 @@ unsafe fn set_volume_property(
             if data_size < 4 {
                 return kAudioHardwareBadObjectError as OSStatus;
             }
-            let new_scalar = unsafe { *(data as *const f32) }.clamp(0.0, 1.0);
-            instance
-                .volume
-                .store(new_scalar.to_bits(), Ordering::Relaxed);
-            crate::storage::save(instance);
-            notify_host_property_changed(control_id, kAudioLevelControlPropertyScalarValue);
-            notify_host_property_changed(control_id, kAudioLevelControlPropertyDecibelValue);
+            let scalar = unsafe { *(data as *const f32) }.clamp(0.0, 1.0);
+            set_volume(instance, scalar, control_id);
             kAudioHardwareNoError as OSStatus
         }
         x if x == kAudioLevelControlPropertyDecibelValue => {
@@ -1160,14 +1155,29 @@ unsafe fn set_volume_property(
             }
             let db = unsafe { *(data as *const f32) }.clamp(-96.0, 0.0);
             let scalar = db_to_scalar(db).clamp(0.0, 1.0);
-            instance.volume.store(scalar.to_bits(), Ordering::Relaxed);
-            crate::storage::save(instance);
-            notify_host_property_changed(control_id, kAudioLevelControlPropertyScalarValue);
-            notify_host_property_changed(control_id, kAudioLevelControlPropertyDecibelValue);
+            set_volume(instance, scalar, control_id);
             kAudioHardwareNoError as OSStatus
         }
         _ => UNSUPPORTED,
     }
+}
+
+/// Claude: Core Audio spends tens of milliseconds on every reported change of
+/// a level control, during which it holds up every client of the device, so a
+/// volume change is reported once, scalar and decibels together, and a set
+/// that keeps the volume is not reported at all.
+fn set_volume(instance: &DeviceInstance, scalar: f32, control_id: u32) {
+    if instance.volume.swap(scalar.to_bits(), Ordering::Relaxed) == scalar.to_bits() {
+        return;
+    }
+    crate::storage::save(instance);
+    notify_host_properties_changed(
+        control_id,
+        &[
+            kAudioLevelControlPropertyScalarValue,
+            kAudioLevelControlPropertyDecibelValue,
+        ],
+    );
 }
 
 unsafe fn set_mute_property(
@@ -1182,12 +1192,11 @@ unsafe fn set_mute_property(
             if data_size < 4 {
                 return kAudioHardwareBadObjectError as OSStatus;
             }
-            let v = unsafe { *(data as *const u32) };
-            instance
-                .mute
-                .store(if v != 0 { 1 } else { 0 }, Ordering::Relaxed);
-            crate::storage::save(instance);
-            notify_host_property_changed(control_id, kAudioBooleanControlPropertyValue);
+            let muted = u32::from(unsafe { *(data as *const u32) } != 0);
+            if instance.mute.swap(muted, Ordering::Relaxed) != muted {
+                crate::storage::save(instance);
+                notify_host_properties_changed(control_id, &[kAudioBooleanControlPropertyValue]);
+            }
             kAudioHardwareNoError as OSStatus
         }
         _ => UNSUPPORTED,
@@ -1198,14 +1207,19 @@ unsafe fn set_mute_property(
 /// changed. Called by the config-file watcher after a registry swap; Core
 /// Audio responds by re-querying `kAudioPlugInPropertyDeviceList`.
 pub(crate) fn notify_device_list_changed() {
-    notify_host_property_changed(OBJECT_ID_PLUGIN, kAudioPlugInPropertyDeviceList);
-    notify_host_property_changed(OBJECT_ID_PLUGIN, kAudioObjectPropertyOwnedObjects);
+    notify_host_properties_changed(
+        OBJECT_ID_PLUGIN,
+        &[
+            kAudioPlugInPropertyDeviceList,
+            kAudioObjectPropertyOwnedObjects,
+        ],
+    );
 }
 
 /// Notify the HAL host that a property on an object changed so clients re-read
 /// it. Safe to call from non-realtime property handlers; never call from the
 /// IO callback.
-fn notify_host_property_changed(object_id: u32, selector: u32) {
+fn notify_host_properties_changed(object_id: u32, selectors: &[u32]) {
     let host_ptr = DRIVER.host.load(Ordering::SeqCst);
     if host_ptr.is_null() {
         return;
@@ -1213,12 +1227,20 @@ fn notify_host_property_changed(object_id: u32, selector: u32) {
     unsafe {
         let host = &*host_ptr;
         if let Some(props_changed) = host.PropertiesChanged {
-            let addr = AudioObjectPropertyAddress {
-                mSelector: selector,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain,
-            };
-            let _ = props_changed(host_ptr, object_id, 1, &addr);
+            let addresses: Vec<_> = selectors
+                .iter()
+                .map(|&selector| AudioObjectPropertyAddress {
+                    mSelector: selector,
+                    mScope: kAudioObjectPropertyScopeGlobal,
+                    mElement: kAudioObjectPropertyElementMain,
+                })
+                .collect();
+            let _ = props_changed(
+                host_ptr,
+                object_id,
+                addresses.len() as u32,
+                addresses.as_ptr(),
+            );
         }
     }
 }
@@ -1591,6 +1613,40 @@ mod tests {
         let mut read = vec![0.0; samples.len()];
         assert_eq!(io(kAudioServerPlugInIOOperationReadInput, &mut read), 0);
         read
+    }
+
+    #[test]
+    fn a_volume_or_mute_change_is_reported_once_and_a_set_that_keeps_it_not_at_all() {
+        crate::test_host::install();
+        let mut reg = registry::DeviceRegistry::empty();
+        let device_id = reg.insert_device(&entry("reported", Volume::Reported), 16);
+        let instance = std::sync::Arc::clone(&reg.by_id[&device_id]);
+        let set = |selector: u32, control: u32, value: [u8; 4]| unsafe {
+            if selector == kAudioBooleanControlPropertyValue {
+                set_mute_property(selector, 4, value.as_ptr().cast(), &instance, control)
+            } else {
+                set_volume_property(selector, 4, value.as_ptr().cast(), &instance, control)
+            }
+        };
+        let volume = 9_001;
+        let mute = 9_002;
+        let level = vec![
+            kAudioLevelControlPropertyScalarValue,
+            kAudioLevelControlPropertyDecibelValue,
+        ];
+
+        set(kAudioLevelControlPropertyScalarValue, volume, 0.5f32.to_ne_bytes());
+        set(kAudioLevelControlPropertyScalarValue, volume, 0.5f32.to_ne_bytes());
+        set(kAudioLevelControlPropertyDecibelValue, volume, 0.0f32.to_ne_bytes());
+        assert_eq!(crate::test_host::changes(volume), [level.clone(), level]);
+        assert_eq!(f32::from_bits(instance.volume.load(Ordering::Relaxed)), 1.0);
+
+        set(kAudioBooleanControlPropertyValue, mute, 1u32.to_ne_bytes());
+        set(kAudioBooleanControlPropertyValue, mute, 7u32.to_ne_bytes());
+        assert_eq!(
+            crate::test_host::changes(mute),
+            [vec![kAudioBooleanControlPropertyValue]]
+        );
     }
 
     #[test]
