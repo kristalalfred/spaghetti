@@ -398,6 +398,28 @@ fn init_activity_region(shm_name: &str) {
         ACTIVITY_PTR.store(ptr as *mut ActivityRegion, Ordering::Release);
         log(&format!("activity: mapped region at {ptr:p}"));
     }
+    registry::current().devices().for_each(|device| publish_level(device));
+}
+
+/// Claude: writes the activity device's volume and mute into the activity
+/// region; leaves it alone for any other device.
+pub(crate) fn publish_level(instance: &DeviceInstance) {
+    let activity = ACTIVITY_PTR.load(Ordering::Acquire);
+    if activity.is_null()
+        || !plugin()
+            .activity
+            .as_ref()
+            .is_some_and(|activity| activity.device_uid == instance.uid)
+    {
+        return;
+    }
+    let region = unsafe { &*activity };
+    region
+        .volume_bits
+        .store(instance.volume.load(Ordering::Relaxed), Ordering::Relaxed);
+    region
+        .muted
+        .store(instance.mute.load(Ordering::Relaxed), Ordering::Relaxed);
 }
 
 pub unsafe extern "C" fn create_device(
@@ -1170,6 +1192,7 @@ fn set_volume(instance: &DeviceInstance, scalar: f32, control_id: u32) {
     if instance.volume.swap(scalar.to_bits(), Ordering::Relaxed) == scalar.to_bits() {
         return;
     }
+    publish_level(instance);
     crate::storage::save(instance);
     notify_host_properties_changed(
         control_id,
@@ -1194,6 +1217,7 @@ unsafe fn set_mute_property(
             }
             let muted = u32::from(unsafe { *(data as *const u32) } != 0);
             if instance.mute.swap(muted, Ordering::Relaxed) != muted {
+                publish_level(instance);
                 crate::storage::save(instance);
                 notify_host_properties_changed(control_id, &[kAudioBooleanControlPropertyValue]);
             }
@@ -1647,6 +1671,47 @@ mod tests {
             crate::test_host::changes(mute),
             [vec![kAudioBooleanControlPropertyValue]]
         );
+    }
+
+    #[test]
+    fn the_activity_device_publishes_its_volume_and_mute_as_they_are_set() {
+        static LEVELS: crate::Plugin = crate::Plugin {
+            manufacturer: "Test",
+            model_uid: "test",
+            devices: &[],
+            config_paths: &[],
+            activity: Some(crate::Activity {
+                device_uid: "levels",
+                shm_name: "/unused",
+            }),
+            log_path: None,
+        };
+        assert!(crate::PLUGIN.set(&LEVELS).is_ok());
+        let region: &'static ActivityRegion = Box::leak(Box::new(ActivityRegion::new()));
+        ACTIVITY_PTR.store(std::ptr::from_ref(region).cast_mut(), Ordering::Release);
+        let mut reg = registry::DeviceRegistry::empty();
+        let levels = reg.insert_device(&entry("levels", Volume::Reported), 16);
+        let other = reg.insert_device(&entry("other", Volume::Reported), 16);
+        let set = |device: u32, selector: u32, value: [u8; 4]| {
+            let instance = &reg.by_id[&device];
+            unsafe {
+                if selector == kAudioBooleanControlPropertyValue {
+                    set_mute_property(selector, 4, value.as_ptr().cast(), instance, 0)
+                } else {
+                    set_volume_property(selector, 4, value.as_ptr().cast(), instance, 0)
+                }
+            }
+        };
+
+        set(levels, kAudioLevelControlPropertyScalarValue, 0.25f32.to_ne_bytes());
+        set(levels, kAudioBooleanControlPropertyValue, 1u32.to_ne_bytes());
+        set(other, kAudioLevelControlPropertyScalarValue, 0.75f32.to_ne_bytes());
+        set(other, kAudioBooleanControlPropertyValue, 0u32.to_ne_bytes());
+        assert_eq!(
+            f32::from_bits(region.volume_bits.load(Ordering::Relaxed)),
+            0.25
+        );
+        assert_eq!(region.muted.load(Ordering::Relaxed), 1);
     }
 
     #[test]

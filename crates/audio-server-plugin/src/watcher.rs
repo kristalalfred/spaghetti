@@ -154,6 +154,7 @@ fn apply_config(file: &DeviceConfigFile) {
     for uid in &added {
         if let Some(device) = new.device(uid) {
             storage::restore(device);
+            crate::driver::publish_level(device);
         }
     }
     drop(previous);

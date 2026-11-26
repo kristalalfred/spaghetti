@@ -24,8 +24,14 @@ pub struct ActivityRegion {
     pub peak_bits: AtomicU32,
     /// `1` when the driver's IO is active, `0` otherwise.
     pub io_running: AtomicU32,
+    /// Claude: the device's volume scalar, as `f32::to_bits`, written as soon
+    /// as it is set. Core Audio holds up clients reading a driver's volume for
+    /// tens of milliseconds after each change; this does not wait for it.
+    pub volume_bits: AtomicU32,
+    /// Claude: `1` while the device is muted, written as soon as it is set.
+    pub muted: AtomicU32,
     /// Reserved padding — keeps the struct at 64 bytes for future fields.
-    pub _pad: [u8; 40],
+    pub _pad: [u8; 32],
 }
 
 impl ActivityRegion {
@@ -36,7 +42,9 @@ impl ActivityRegion {
             last_write_host_time: AtomicU64::new(0),
             peak_bits: AtomicU32::new(0),
             io_running: AtomicU32::new(0),
-            _pad: [0; 40],
+            volume_bits: AtomicU32::new(0x3f80_0000),
+            muted: AtomicU32::new(0),
+            _pad: [0; 32],
         }
     }
 }

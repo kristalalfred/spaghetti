@@ -43,7 +43,7 @@ mod imp {
 
             // Activity shm is a soft dependency — daemon keeps running if the driver's
             // shm region is unavailable (reads will just return defaults).
-            let reader = match ActivityReader::open() {
+            let reader = match ActivityReader::open(spaghetti_common::ACTIVITY_SHM_NAME) {
                 Ok(r) => {
                     tracing::info!(
                         "activity shm opened: {}",
@@ -117,7 +117,7 @@ mod imp {
 
             // Lazy attach: try opening now if we don't have a reader yet.
             if guard.is_none() {
-                match ActivityReader::open() {
+                match ActivityReader::open(spaghetti_common::ACTIVITY_SHM_NAME) {
                     Ok(r) => {
                         tracing::info!("activity shm attached (lazy)");
                         *guard = Some(r);

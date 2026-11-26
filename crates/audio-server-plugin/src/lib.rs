@@ -76,8 +76,8 @@ pub struct Device {
     pub hidden: bool,
 }
 
-/// Claude: reports how much a device plays, and how loud, in a POSIX shared
-/// memory region (`spaghetti_common::activity::ActivityRegion`) that other
+/// Claude: reports how much a device plays, how loud, and its volume and
+/// mute, in a POSIX shared memory region (`spaghetti_common::activity::ActivityRegion`) that other
 /// processes map by name. Creating the region replaces any of that name.
 pub struct Activity {
     pub device_uid: &'static str,

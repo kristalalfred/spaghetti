@@ -1,7 +1,8 @@
 //! Reader for the driver/daemon shared-memory activity region.
 //!
-//! The driver creates `/spaghetti.activity` exclusively on each load. The
-//! daemon opens it read-write without creating; if the driver hasn't loaded
+//! The driver creates its region (`/spaghetti.activity` for spaghetti's own
+//! driver) exclusively on each load. The daemon opens it read-write without
+//! creating; if the driver hasn't loaded
 //! yet, `open` returns an error and callers retry lazily. Atomic reads use
 //! `Relaxed` — values are advisory and only drive UI display and staleness
 //! checks.
@@ -13,7 +14,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use spaghetti_common::activity::{ActivityRegion, ACTIVITY_SHM_NAME};
+use spaghetti_common::activity::ActivityRegion;
 
 #[repr(C)]
 struct MachTimebaseInfo {
@@ -33,6 +34,8 @@ pub struct ActivitySnapshot {
     pub last_write_host_time: u64,
     pub peak: f32,
     pub io_running: bool,
+    pub volume: f32,
+    pub muted: bool,
 }
 
 /// Mapped handle onto the driver's activity region. Safe to share across threads —
@@ -50,10 +53,11 @@ unsafe impl Send for ActivityReader {}
 unsafe impl Sync for ActivityReader {}
 
 impl ActivityReader {
-    /// Open the driver's shared activity region. Returns an error if the
-    /// driver hasn't created it yet; callers should retry lazily.
-    pub fn open() -> io::Result<Self> {
-        let name = CString::new(ACTIVITY_SHM_NAME)
+    /// Open the shared activity region a driver created under `name`. Returns
+    /// an error if the driver hasn't created it yet; callers should retry
+    /// lazily.
+    pub fn open(name: &str) -> io::Result<Self> {
+        let name = CString::new(name)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let size = std::mem::size_of::<ActivityRegion>();
 
@@ -109,6 +113,8 @@ impl ActivityReader {
             last_write_host_time: region.last_write_host_time.load(Ordering::Relaxed),
             peak: f32::from_bits(region.peak_bits.load(Ordering::Relaxed)),
             io_running: region.io_running.load(Ordering::Relaxed) == 1,
+            volume: f32::from_bits(region.volume_bits.load(Ordering::Relaxed)),
+            muted: region.muted.load(Ordering::Relaxed) == 1,
         }
     }
 
