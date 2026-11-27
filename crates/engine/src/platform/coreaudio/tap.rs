@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{CString, c_char};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use core_foundation::bundle::CFBundle;
 use core_foundation::string::CFString;
@@ -52,6 +52,12 @@ unsafe extern "C" {
     ) -> i32;
 
     unsafe fn spaghetti_destroy_aggregate(aggregate_id: AudioObjectID) -> i32;
+
+    unsafe fn spaghetti_read_last_inputs_only(
+        device: AudioObjectID,
+        ioproc: AudioDeviceIOProcID,
+        count: u32,
+    ) -> i32;
 }
 
 /// Claude: the processes a tap description names, and whether it captures
@@ -170,6 +176,9 @@ impl Drop for ProcessTap {
 /// them, so the IOProc publishes its buffer as the tap's delivery span.
 struct CaptureState {
     sample_rate: AtomicU64,
+    /// Claude: how many of the last buffers in each input list are the
+    /// tap's; the aggregate's clock device may add inputs of its own first.
+    tap_buffers: AtomicUsize,
     sinks: Sinks,
     meter: FlowMeter,
     delivery: Arc<DeliverySpan>,
@@ -207,6 +216,10 @@ impl Capture {
         if status != 0 || ioproc_id.is_none() {
             return Err(format!("AudioDeviceCreateIOProcID failed: {status:#010x}"));
         }
+        let status = unsafe { spaghetti_read_last_inputs_only(device, ioproc_id, 1) };
+        if status != 0 {
+            tracing::warn!(status, "could not turn off the tap clock device's own inputs");
+        }
         let capture = Self {
             device,
             ioproc_id,
@@ -237,6 +250,7 @@ impl Drop for Capture {
 struct Opened {
     process_tap: ProcessTap,
     sample_rate: f64,
+    tap_buffers: usize,
 }
 
 impl Opened {
@@ -245,7 +259,7 @@ impl Opened {
             super::microphone::before_opening(clock)?;
         }
         let process_tap = ProcessTap::create(tapped, mode, &aggregate_uid(source_id))?;
-        let format = unsafe { query_device_stream_format(process_tap.aggregate) }?;
+        let format = unsafe { query_tap_stream_format(process_tap.aggregate) }?;
         tracing::info!(
             sample_rate = format.mSampleRate,
             channels_per_frame = format.mChannelsPerFrame,
@@ -255,7 +269,7 @@ impl Opened {
             format_flags = format.mFormatFlags,
             is_float = (format.mFormatFlags & kAudioFormatFlagIsFloat) != 0,
             is_non_interleaved = (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0,
-            "tap ASBD (source aggregate device input scope)"
+            "tap ASBD (the aggregate's last input stream)"
         );
         if format.mSampleRate <= 0.0
             || format.mFormatID != kAudioFormatLinearPCM
@@ -268,9 +282,15 @@ impl Opened {
             ));
         }
         tracing::info!(source_id, ?tapped, "created process tap");
+        let tap_buffers = if format.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0 {
+            format.mChannelsPerFrame.max(1) as usize
+        } else {
+            1
+        };
         Ok(Self {
             process_tap,
             sample_rate: format.mSampleRate,
+            tap_buffers,
         })
     }
 }
@@ -316,6 +336,7 @@ impl TapSource {
             capture: None,
             state: Arc::new(CaptureState {
                 sample_rate: AtomicU64::new(0),
+                tap_buffers: AtomicUsize::new(1),
                 sinks: Sinks::new(),
                 meter: FlowMeter::new(),
                 delivery: Arc::new(DeliverySpan::new(0.0)),
@@ -336,6 +357,9 @@ impl TapSource {
             self.state
                 .sample_rate
                 .store(opened.sample_rate.to_bits(), Ordering::Relaxed);
+            self.state
+                .tap_buffers
+                .store(opened.tap_buffers, Ordering::Relaxed);
             self.opened = Some(opened);
         }
         Ok(self.opened.as_ref().expect("opened above"))
@@ -411,30 +435,62 @@ impl TapSource {
     }
 }
 
-unsafe fn query_device_stream_format(
-    device: AudioObjectID,
+/// Claude: the format of the tap's stream. An aggregate lists its clock
+/// device's input streams before its taps', so the tap's is the last.
+unsafe fn query_tap_stream_format(
+    aggregate: AudioObjectID,
 ) -> Result<AudioStreamBasicDescription, String> {
-    let mut format: AudioStreamBasicDescription = unsafe { std::mem::zeroed() };
-    let mut size = std::mem::size_of::<AudioStreamBasicDescription>() as u32;
-    let address = AudioObjectPropertyAddress {
-        mSelector: kAudioDevicePropertyStreamFormat,
-        mScope: kAudioDevicePropertyScopeInput,
+    let mut address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyStreams,
+        mScope: kAudioObjectPropertyScopeInput,
         mElement: kAudioObjectPropertyElementMain,
     };
+    let mut size = 0u32;
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(aggregate, &address, 0, std::ptr::null(), &mut size)
+    };
+    if status != 0 {
+        return Err(format!("get the aggregate's input streams failed: {status:#010x}"));
+    }
+    let mut streams = vec![0 as AudioObjectID; size as usize / size_of::<AudioObjectID>()];
     let status = unsafe {
         AudioObjectGetPropertyData(
-            device,
+            aggregate,
             &address,
             0,
             std::ptr::null(),
             &mut size,
-            &mut format as *mut _ as *mut _,
+            streams.as_mut_ptr().cast(),
         )
     };
     if status != 0 {
-        return Err(format!("get device stream format failed: {status:#010x}"));
+        return Err(format!("get the aggregate's input streams failed: {status:#010x}"));
+    }
+    let stream = *streams.last().ok_or("the tap's aggregate has no input stream")?;
+    let mut format: AudioStreamBasicDescription = unsafe { std::mem::zeroed() };
+    let mut size = size_of::<AudioStreamBasicDescription>() as u32;
+    address.mSelector = kAudioStreamPropertyVirtualFormat;
+    address.mScope = kAudioObjectPropertyScopeGlobal;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            stream,
+            &address,
+            0,
+            std::ptr::null(),
+            &mut size,
+            (&raw mut format).cast(),
+        )
+    };
+    if status != 0 {
+        return Err(format!("get the tap stream's format failed: {status:#010x}"));
     }
     Ok(format)
+}
+
+/// Claude: the last `count` buffers of an IOProc's input list, which are the
+/// tap's.
+fn tap_buffers(buffers: &[AudioBuffer], count: usize) -> &[AudioBuffer] {
+    &buffers[buffers.len().saturating_sub(count.max(1))..]
 }
 
 /// Claude: `buffers` must be the ABL the HAL handed to the IOProc. Taps deliver
@@ -490,7 +546,10 @@ unsafe extern "C" fn capture_ioproc(
         .filter(|time| time.mFlags & kAudioTimeStampHostTimeValid != 0)
         .map_or(now, |time| time.mHostTime);
     let state = unsafe { &*(in_client_data as *const CaptureState) };
-    let buffers = unsafe { abl::buffers(in_input_data) };
+    let buffers = tap_buffers(
+        unsafe { abl::buffers(in_input_data) },
+        state.tap_buffers.load(Ordering::Relaxed),
+    );
     let frames = buffer_frames(buffers);
     if frames > 0 {
         state.delivery.publish(frames as f64);
@@ -720,6 +779,28 @@ mod tests {
         };
         assert_eq!(named_pids(&all), (vec![7, own], true));
         assert_eq!(named_pids(&Tapped::Processes(vec![7])), (vec![7], false));
+    }
+
+    fn buffer(channels: u32, frames: u32) -> AudioBuffer {
+        AudioBuffer {
+            mNumberChannels: channels,
+            mDataByteSize: channels * frames * size_of::<f32>() as u32,
+            mData: std::ptr::null_mut(),
+        }
+    }
+
+    #[test]
+    fn a_tap_reads_its_own_buffers_after_its_clock_devices_inputs() {
+        let interleaved = [buffer(2, 512), buffer(2, 512)];
+        let tap = tap_buffers(&interleaved, 1);
+        assert_eq!(tap.len(), 1);
+        assert_eq!(buffer_frames(tap), 512);
+        let planar = [buffer(2, 512), buffer(1, 256), buffer(1, 256)];
+        let tap = tap_buffers(&planar, 2);
+        assert_eq!(tap.len(), 2);
+        assert_eq!(buffer_frames(tap), 256);
+        assert_eq!(tap_buffers(&[buffer(2, 512)], 1).len(), 1);
+        assert!(tap_buffers(&[], 1).is_empty());
     }
 
     #[test]
